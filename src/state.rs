@@ -210,7 +210,10 @@ impl AppState {
 }
 
 fn insert(headers: &mut HeaderMap, name: &'static str, value: &str) {
-    if let (Ok(n), Ok(v)) = (HeaderName::from_bytes(name.as_bytes()), HeaderValue::from_str(value)) {
+    if let (Ok(n), Ok(v)) = (
+        HeaderName::from_bytes(name.as_bytes()),
+        HeaderValue::from_str(value),
+    ) {
         headers.insert(n, v);
     }
 }
