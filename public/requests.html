@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ghc-proxy · Requests</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; padding: 2rem; background: #0d1117; color: #e6edf3; }
+    h1 { font-size: 1.4rem; margin: 0 0 1rem; }
+    a { color: #58a6ff; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+    th, td { text-align: left; padding: 0.5rem 0.75rem; border-bottom: 1px solid #30363d; white-space: nowrap; }
+    th { color: #8b949e; text-transform: uppercase; font-size: 0.7rem; letter-spacing: 0.05em; }
+    .status-ok { color: #3fb950; }
+    .status-err { color: #f85149; }
+    .pager { margin-top: 1rem; display: flex; gap: 0.5rem; align-items: center; }
+    button { background: #21262d; color: #e6edf3; border: 1px solid #30363d; border-radius: 6px; padding: 0.35rem 0.75rem; cursor: pointer; }
+    button:disabled { opacity: 0.5; cursor: default; }
+  </style>
+</head>
+<body>
+  <h1>Requests <a href="/" style="font-size:0.8rem">← Dashboard</a></h1>
+  <table>
+    <thead>
+      <tr>
+        <th>Time</th><th>Endpoint</th><th>Model</th><th>Status</th>
+        <th>In</th><th>Out</th><th>Duration</th>
+      </tr>
+    </thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <div class="pager">
+    <button id="prev">Prev</button>
+    <span id="info"></span>
+    <button id="next">Next</button>
+  </div>
+  <script>
+    let page = 1;
+    const perPage = 50;
+    async function load() {
+      const res = await fetch(`/api/requests?page=${page}&per_page=${perPage}`);
+      const data = await res.json();
+      document.getElementById('rows').innerHTML = (data.items || []).map(r => {
+        const ok = r.status_code >= 200 && r.status_code < 400;
+        const model = r.translated_model ? `${r.model} → ${r.translated_model}` : r.model;
+        return `<tr>
+          <td>${r.timestamp}</td>
+          <td>${r.endpoint}</td>
+          <td>${model}</td>
+          <td class="${ok ? 'status-ok' : 'status-err'}">${r.status_code}</td>
+          <td>${r.input_tokens}</td>
+          <td>${r.output_tokens}</td>
+          <td>${r.duration}s</td>
+        </tr>`;
+      }).join('');
+      document.getElementById('info').textContent = `Page ${data.page} / ${data.total_pages || 1} (${data.total} total)`;
+      document.getElementById('prev').disabled = page <= 1;
+      document.getElementById('next').disabled = page >= (data.total_pages || 1);
+    }
+    document.getElementById('prev').onclick = () => { if (page > 1) { page--; load(); } };
+    document.getElementById('next').onclick = () => { page++; load(); };
+    load();
+    setInterval(load, 5000);
+  </script>
+</body>
+</html>
