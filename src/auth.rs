@@ -74,7 +74,10 @@ pub async fn device_flow(client: &reqwest::Client) -> Option<String> {
     let resp = client
         .post("https://github.com/login/device/code")
         .header("Accept", "application/json")
-        .form(&[("client_id", GITHUB_CLIENT_ID), ("scope", "read:user copilot")])
+        .form(&[
+            ("client_id", GITHUB_CLIENT_ID),
+            ("scope", "read:user copilot"),
+        ])
         .send()
         .await;
 

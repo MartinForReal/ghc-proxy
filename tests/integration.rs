@@ -19,7 +19,10 @@ fn default_config_has_model_mappings_and_base_url() {
         account_type: "business".into(),
         ..config::Config::default()
     };
-    assert_eq!(biz.copilot_base_url(), "https://api.business.githubcopilot.com");
+    assert_eq!(
+        biz.copilot_base_url(),
+        "https://api.business.githubcopilot.com"
+    );
 }
 
 #[test]
@@ -28,7 +31,10 @@ fn default_config_yaml_parses_back() {
     let cfg: config::Config = serde_norway::from_str(&yaml).expect("default yaml should parse");
     assert_eq!(cfg.port, config::DEFAULT_PORT);
     assert_eq!(cfg.address, config::DEFAULT_ADDRESS);
-    assert_eq!(cfg.model_mappings.exact.get("opus").map(String::as_str), Some(config::DEFAULT_OPUS));
+    assert_eq!(
+        cfg.model_mappings.exact.get("opus").map(String::as_str),
+        Some(config::DEFAULT_OPUS)
+    );
 }
 
 #[test]
@@ -77,13 +83,23 @@ async fn router_builds_and_serves_dashboard() {
 
     let resp = app
         .clone()
-        .oneshot(Request::builder().uri("/api/stats").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/api/stats")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
     let resp = app
-        .oneshot(Request::builder().uri("/does-not-exist").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/does-not-exist")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);

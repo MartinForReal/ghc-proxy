@@ -56,7 +56,10 @@ fn elapsed_secs(start: Instant) -> f64 {
 /// SSE response headers.
 fn sse_headers() -> HeaderMap {
     let mut h = HeaderMap::new();
-    h.insert("Content-Type", HeaderValue::from_static("text/event-stream"));
+    h.insert(
+        "Content-Type",
+        HeaderValue::from_static("text/event-stream"),
+    );
     h.insert("Cache-Control", HeaderValue::from_static("no-cache"));
     h.insert("Connection", HeaderValue::from_static("keep-alive"));
     h.insert("X-Accel-Buffering", HeaderValue::from_static("no"));
@@ -81,7 +84,11 @@ fn log_error(endpoint: &str, request: &Value, response: &str, status: u16) {
     });
     let path = dir.join("error.log");
     use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
         let _ = writeln!(f, "{entry}");
     }
 }
@@ -165,15 +172,26 @@ async fn chat_completions(State(state): State<SharedState>, body: Bytes) -> Resp
         req["model"] = Value::String(translated.clone());
     }
 
-    let messages = req.get("messages").and_then(|m| m.as_array()).cloned().unwrap_or_default();
+    let messages = req
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .cloned()
+        .unwrap_or_default();
     let vision = messages.iter().any(|m| {
         m.get("content")
             .and_then(|c| c.as_array())
-            .map(|blocks| blocks.iter().any(|b| b.get("type").and_then(|t| t.as_str()) == Some("image_url")))
+            .map(|blocks| {
+                blocks
+                    .iter()
+                    .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("image_url"))
+            })
             .unwrap_or(false)
     });
     let agent = messages.iter().any(|m| {
-        matches!(m.get("role").and_then(|r| r.as_str()), Some("assistant") | Some("tool"))
+        matches!(
+            m.get("role").and_then(|r| r.as_str()),
+            Some("assistant") | Some("tool")
+        )
     });
 
     let mut headers = state.copilot_headers(vision).await;
@@ -224,8 +242,14 @@ async fn chat_completions(State(state): State<SharedState>, body: Bytes) -> Resp
             status_code: status.as_u16(),
             request_size: req_size,
             response_size: resp_size,
-            input_tokens: usage.get("prompt_tokens").and_then(|t| t.as_u64()).unwrap_or(0),
-            output_tokens: usage.get("completion_tokens").and_then(|t| t.as_u64()).unwrap_or(0),
+            input_tokens: usage
+                .get("prompt_tokens")
+                .and_then(|t| t.as_u64())
+                .unwrap_or(0),
+            output_tokens: usage
+                .get("completion_tokens")
+                .and_then(|t| t.as_u64())
+                .unwrap_or(0),
             duration: elapsed_secs(start),
         });
         Json(parsed).into_response()
@@ -258,7 +282,10 @@ async fn responses(State(state): State<SharedState>, body: Bytes) -> Response {
         req["model"] = Value::String(translated.clone());
     }
 
-    if !state.model_supports_endpoint(&translated, "/responses").await {
+    if !state
+        .model_supports_endpoint(&translated, "/responses")
+        .await
+    {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({
@@ -332,8 +359,14 @@ async fn responses(State(state): State<SharedState>, body: Bytes) -> Response {
             status_code: status.as_u16(),
             request_size: req_size,
             response_size: resp_size,
-            input_tokens: usage.get("input_tokens").and_then(|t| t.as_u64()).unwrap_or(0),
-            output_tokens: usage.get("output_tokens").and_then(|t| t.as_u64()).unwrap_or(0),
+            input_tokens: usage
+                .get("input_tokens")
+                .and_then(|t| t.as_u64())
+                .unwrap_or(0),
+            output_tokens: usage
+                .get("output_tokens")
+                .and_then(|t| t.as_u64())
+                .unwrap_or(0),
             duration: elapsed_secs(start),
         });
         Json(parsed).into_response()
@@ -386,7 +419,10 @@ async fn messages_direct(
     let agent = req
         .get("messages")
         .and_then(|m| m.as_array())
-        .map(|arr| arr.iter().any(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant")))
+        .map(|arr| {
+            arr.iter()
+                .any(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"))
+        })
         .unwrap_or(false);
     let mut headers = state.copilot_headers(vision).await;
     headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
@@ -419,7 +455,10 @@ async fn messages_direct(
         let resp =
             util::post_with_retry(&state, &url, headers.clone(), payload, "/v1/messages").await;
         let Some(resp) = resp else {
-            return anthropic_error(StatusCode::GATEWAY_TIMEOUT, "Upstream connection error".into());
+            return anthropic_error(
+                StatusCode::GATEWAY_TIMEOUT,
+                "Upstream connection error".into(),
+            );
         };
         let status = resp.status();
         if status.is_success() {
@@ -434,8 +473,14 @@ async fn messages_direct(
                 status_code: status.as_u16(),
                 request_size: req_size,
                 response_size: serde_json::to_vec(&parsed).map(|v| v.len()).unwrap_or(0),
-                input_tokens: usage.get("input_tokens").and_then(|t| t.as_u64()).unwrap_or(0),
-                output_tokens: usage.get("output_tokens").and_then(|t| t.as_u64()).unwrap_or(0),
+                input_tokens: usage
+                    .get("input_tokens")
+                    .and_then(|t| t.as_u64())
+                    .unwrap_or(0),
+                output_tokens: usage
+                    .get("output_tokens")
+                    .and_then(|t| t.as_u64())
+                    .unwrap_or(0),
                 duration: elapsed_secs(start),
             });
             return Json(parsed).into_response();
@@ -477,7 +522,10 @@ async fn messages_translated(
             .and_then(|m| m.as_array())
             .map(|arr| {
                 arr.iter().any(|m| {
-                    matches!(m.get("role").and_then(|r| r.as_str()), Some("assistant") | Some("tool"))
+                    matches!(
+                        m.get("role").and_then(|r| r.as_str()),
+                        Some("assistant") | Some("tool")
+                    )
                 })
             })
             .unwrap_or(false);
@@ -500,9 +548,14 @@ async fn messages_translated(
             .await;
         }
 
-        let resp = util::post_with_retry(&state, &url, headers, payload, "/v1/messages (translated)").await;
+        let resp =
+            util::post_with_retry(&state, &url, headers, payload, "/v1/messages (translated)")
+                .await;
         let Some(resp) = resp else {
-            return anthropic_error(StatusCode::GATEWAY_TIMEOUT, "Upstream connection error".into());
+            return anthropic_error(
+                StatusCode::GATEWAY_TIMEOUT,
+                "Upstream connection error".into(),
+            );
         };
         let status = resp.status();
         if status.is_success() {
@@ -517,9 +570,17 @@ async fn messages_translated(
                 translated_model: (translated != original_model).then_some(translated.clone()),
                 status_code: status.as_u16(),
                 request_size: req_size,
-                response_size: serde_json::to_vec(&anthropic_resp).map(|v| v.len()).unwrap_or(0),
-                input_tokens: usage.get("prompt_tokens").and_then(|t| t.as_u64()).unwrap_or(0),
-                output_tokens: usage.get("completion_tokens").and_then(|t| t.as_u64()).unwrap_or(0),
+                response_size: serde_json::to_vec(&anthropic_resp)
+                    .map(|v| v.len())
+                    .unwrap_or(0),
+                input_tokens: usage
+                    .get("prompt_tokens")
+                    .and_then(|t| t.as_u64())
+                    .unwrap_or(0),
+                output_tokens: usage
+                    .get("completion_tokens")
+                    .and_then(|t| t.as_u64())
+                    .unwrap_or(0),
                 duration: elapsed_secs(start),
             });
             return Json(anthropic_resp).into_response();
@@ -580,13 +641,20 @@ async fn count_tokens(State(state): State<SharedState>, body: Bytes) -> Response
         }
         _ => {}
     }
-    for msg in req.get("messages").and_then(|m| m.as_array()).cloned().unwrap_or_default() {
+    for msg in req
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .cloned()
+        .unwrap_or_default()
+    {
         match msg.get("content") {
             Some(Value::String(s)) => total += est(s),
             Some(Value::Array(blocks)) => {
                 for b in blocks {
                     match b.get("type").and_then(|t| t.as_str()) {
-                        Some("text") => total += est(b.get("text").and_then(|t| t.as_str()).unwrap_or("")),
+                        Some("text") => {
+                            total += est(b.get("text").and_then(|t| t.as_str()).unwrap_or(""))
+                        }
                         Some("tool_result") => {
                             if let Some(s) = b.get("content").and_then(|c| c.as_str()) {
                                 total += est(s);
@@ -614,9 +682,16 @@ async fn count_tokens(State(state): State<SharedState>, body: Bytes) -> Response
             }
         }
     }
-    let vendor = model_meta.get("vendor").and_then(|v| v.as_str()).unwrap_or("");
+    let vendor = model_meta
+        .get("vendor")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     if vendor != "Anthropic" {
-        let factor = if model.starts_with("grok") { 1.03 } else { 1.05 };
+        let factor = if model.starts_with("grok") {
+            1.03
+        } else {
+            1.05
+        };
         total = ((total as f64) * factor).ceil() as u64;
     }
     Json(json!({"input_tokens": total})).into_response()
@@ -987,11 +1062,22 @@ async fn api_requests(
     State(state): State<SharedState>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
-    let page: usize = params.get("page").and_then(|p| p.parse().ok()).unwrap_or(1).max(1);
-    let per_page: usize = params.get("per_page").and_then(|p| p.parse().ok()).unwrap_or(50);
+    let page: usize = params
+        .get("page")
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(1)
+        .max(1);
+    let per_page: usize = params
+        .get("per_page")
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(50);
     let offset = (page - 1) * per_page;
     let (items, total) = state.store.recent(per_page, offset);
-    let total_pages = if per_page > 0 { total.div_ceil(per_page) } else { 0 };
+    let total_pages = if per_page > 0 {
+        total.div_ceil(per_page)
+    } else {
+        0
+    };
     Json(json!({
         "items": items,
         "total": total,
@@ -1001,4 +1087,3 @@ async fn api_requests(
     }))
     .into_response()
 }
-
