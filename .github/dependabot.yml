@@ -7,6 +7,10 @@ updates:
     open-pull-requests-limit: 10
     labels:
       - dependencies
+    groups:
+      all-dependencies:
+        patterns:
+          - "*"
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
@@ -14,3 +18,7 @@ updates:
     labels:
       - dependencies
       - github-actions
+    groups:
+      all-dependencies:
+        patterns:
+          - "*"

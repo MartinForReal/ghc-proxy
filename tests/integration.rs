@@ -25,7 +25,7 @@ fn default_config_has_model_mappings_and_base_url() {
 #[test]
 fn default_config_yaml_parses_back() {
     let yaml = config::default_config_yaml();
-    let cfg: config::Config = serde_yaml::from_str(&yaml).expect("default yaml should parse");
+    let cfg: config::Config = serde_norway::from_str(&yaml).expect("default yaml should parse");
     assert_eq!(cfg.port, config::DEFAULT_PORT);
     assert_eq!(cfg.address, config::DEFAULT_ADDRESS);
     assert_eq!(cfg.model_mappings.exact.get("opus").map(String::as_str), Some(config::DEFAULT_OPUS));

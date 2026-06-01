@@ -283,7 +283,7 @@ pub fn load_config() -> Config {
         }
     }
     match std::fs::read_to_string(&path) {
-        Ok(contents) => match serde_yaml::from_str::<Config>(&contents) {
+        Ok(contents) => match serde_norway::from_str::<Config>(&contents) {
             Ok(mut cfg) => {
                 if cfg.model_mappings.exact.is_empty() && cfg.model_mappings.prefix.is_empty() {
                     cfg.model_mappings = default_model_mappings();
