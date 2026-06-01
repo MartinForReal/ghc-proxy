@@ -1,0 +1,65 @@
+name: Bug Report
+description: Report a problem with ghc-proxy
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug report! Please fill out the
+        sections below so we can reproduce and fix the issue.
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: A clear and concise description of what the bug is.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: How can we reproduce the behavior?
+      placeholder: |
+        1. Run `ghc-proxy ...`
+        2. Send request `...`
+        3. See error
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What did you expect to happen?
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs / output
+      description: Paste any relevant log output. This will be rendered as code.
+      render: shell
+    validations:
+      required: false
+  - type: input
+    id: version
+    attributes:
+      label: ghc-proxy version
+      description: Output of `ghc-proxy --version`.
+      placeholder: "1.0.0"
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: "macOS 14 / Ubuntu 24.04 / Windows 11"
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Add any other context about the problem here.
+    validations:
+      required: false
