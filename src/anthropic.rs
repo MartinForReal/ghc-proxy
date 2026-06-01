@@ -59,15 +59,20 @@ pub fn anthropic_to_openai(req: &Value, cfg: &Config) -> Value {
         match role {
             "user" => {
                 if let Value::Array(blocks) = &content {
-                    let tool_results: Vec<&Value> =
-                        blocks.iter().filter(|b| type_of(b) == "tool_result").collect();
+                    let tool_results: Vec<&Value> = blocks
+                        .iter()
+                        .filter(|b| type_of(b) == "tool_result")
+                        .collect();
                     let others: Vec<Value> = blocks
                         .iter()
                         .filter(|b| type_of(b) != "tool_result")
                         .cloned()
                         .collect();
                     for tr in tool_results {
-                        let mut c = tr.get("content").cloned().unwrap_or(Value::String(String::new()));
+                        let mut c = tr
+                            .get("content")
+                            .cloned()
+                            .unwrap_or(Value::String(String::new()));
                         if let Value::String(s) = &c {
                             c = Value::String(strip_tool_result_suffix(
                                 s,
@@ -97,8 +102,15 @@ pub fn anthropic_to_openai(req: &Value, cfg: &Config) -> Value {
                         .iter()
                         .filter(|b| matches!(type_of(b), "text" | "thinking"))
                         .map(|b| {
-                            let key = if type_of(b) == "text" { "text" } else { "thinking" };
-                            b.get(key).and_then(|t| t.as_str()).unwrap_or("").to_string()
+                            let key = if type_of(b) == "text" {
+                                "text"
+                            } else {
+                                "thinking"
+                            };
+                            b.get(key)
+                                .and_then(|t| t.as_str())
+                                .unwrap_or("")
+                                .to_string()
                         })
                         .collect::<Vec<_>>()
                         .join("\n\n");
@@ -210,9 +222,17 @@ fn extract_user_content(blocks: &[Value]) -> Option<Value> {
         let parts: Vec<String> = blocks
             .iter()
             .filter_map(|b| match type_of(b) {
-                "text" => Some(b.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string()),
+                "text" => Some(
+                    b.get("text")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                ),
                 "thinking" => Some(
-                    b.get("thinking").and_then(|t| t.as_str()).unwrap_or("").to_string(),
+                    b.get("thinking")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("")
+                        .to_string(),
                 ),
                 _ => None,
             })
@@ -306,7 +326,10 @@ pub fn openai_to_anthropic(resp: &Value) -> Value {
         .and_then(|d| d.get("cached_tokens"))
         .and_then(|c| c.as_u64())
         .unwrap_or(0);
-    let prompt = usage.get("prompt_tokens").and_then(|p| p.as_u64()).unwrap_or(0);
+    let prompt = usage
+        .get("prompt_tokens")
+        .and_then(|p| p.as_u64())
+        .unwrap_or(0);
     let input_tokens = prompt.saturating_sub(cached);
     let output_tokens = usage
         .get("completion_tokens")
@@ -454,7 +477,10 @@ impl AnthropicStreamState {
                 .and_then(|d| d.get("cached_tokens"))
                 .and_then(|c| c.as_u64())
                 .unwrap_or(0);
-            let prompt = usage.get("prompt_tokens").and_then(|p| p.as_u64()).unwrap_or(0);
+            let prompt = usage
+                .get("prompt_tokens")
+                .and_then(|p| p.as_u64())
+                .unwrap_or(0);
             let mut usage_out = json!({
                 "input_tokens": prompt.saturating_sub(cached),
                 "output_tokens": 0
@@ -482,9 +508,13 @@ impl AnthropicStreamState {
         if let Some(text) = delta.get("content").and_then(|c| c.as_str()) {
             // If a tool-use block is currently open, close it first.
             if self.content_block_open
-                && self.tool_calls.values().any(|&i| i == self.content_block_index)
+                && self
+                    .tool_calls
+                    .values()
+                    .any(|&i| i == self.content_block_index)
             {
-                events.push(json!({"type": "content_block_stop", "index": self.content_block_index}));
+                events
+                    .push(json!({"type": "content_block_stop", "index": self.content_block_index}));
                 self.content_block_index += 1;
                 self.content_block_open = false;
             }
@@ -508,7 +538,10 @@ impl AnthropicStreamState {
             for tc in tcs {
                 let idx = tc.get("index").and_then(|i| i.as_i64()).unwrap_or(0);
                 let id = tc.get("id").and_then(|i| i.as_str());
-                let name = tc.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str());
+                let name = tc
+                    .get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str());
                 if let (Some(id), Some(name)) = (id, name) {
                     if self.content_block_open {
                         events.push(json!({"type": "content_block_stop", "index": self.content_block_index}));
@@ -543,7 +576,8 @@ impl AnthropicStreamState {
         // Finish.
         if let Some(fr) = choice.get("finish_reason").and_then(|f| f.as_str()) {
             if self.content_block_open {
-                events.push(json!({"type": "content_block_stop", "index": self.content_block_index}));
+                events
+                    .push(json!({"type": "content_block_stop", "index": self.content_block_index}));
                 self.content_block_open = false;
             }
             let usage = chunk.get("usage").cloned().unwrap_or(json!({}));
@@ -552,8 +586,14 @@ impl AnthropicStreamState {
                 .and_then(|d| d.get("cached_tokens"))
                 .and_then(|c| c.as_u64())
                 .unwrap_or(0);
-            let prompt = usage.get("prompt_tokens").and_then(|p| p.as_u64()).unwrap_or(0);
-            let output = usage.get("completion_tokens").and_then(|c| c.as_u64()).unwrap_or(0);
+            let prompt = usage
+                .get("prompt_tokens")
+                .and_then(|p| p.as_u64())
+                .unwrap_or(0);
+            let output = usage
+                .get("completion_tokens")
+                .and_then(|c| c.as_u64())
+                .unwrap_or(0);
             let mut usage_out = json!({
                 "input_tokens": prompt.saturating_sub(cached),
                 "output_tokens": output
@@ -871,7 +911,8 @@ mod tests {
     #[test]
     fn stream_state_emits_message_start_and_stop() {
         let mut st = AnthropicStreamState::new();
-        let start = st.process(&json!({"id": "1", "model": "m", "choices": [{"delta": {"content": "hi"}}]}));
+        let start = st
+            .process(&json!({"id": "1", "model": "m", "choices": [{"delta": {"content": "hi"}}]}));
         assert_eq!(start[0]["type"], "message_start");
         let end = st.process(&json!({"choices": [{"delta": {}, "finish_reason": "stop"}]}));
         assert!(end.iter().any(|e| e["type"] == "message_stop"));

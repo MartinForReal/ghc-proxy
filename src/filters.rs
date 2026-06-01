@@ -42,7 +42,10 @@ mod tests {
     fn strips_suffix_only() {
         let s = vec!["\n[done]".to_string()];
         assert_eq!(strip_tool_result_suffix("result\n[done]", &s), "result");
-        assert_eq!(strip_tool_result_suffix("[done]\nresult", &s), "[done]\nresult");
+        assert_eq!(
+            strip_tool_result_suffix("[done]\nresult", &s),
+            "[done]\nresult"
+        );
     }
 
     #[test]

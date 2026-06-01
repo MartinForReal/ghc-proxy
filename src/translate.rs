@@ -33,8 +33,14 @@ mod tests {
     #[test]
     fn prefix_mapping_applies() {
         let m = default_model_mappings();
-        assert_eq!(translate(&m, "claude-sonnet-4-20250101"), "claude-opus-4.7-1m");
-        assert_eq!(translate(&m, "claude-haiku-4.5-20250101"), "claude-haiku-4.5");
+        assert_eq!(
+            translate(&m, "claude-sonnet-4-20250101"),
+            "claude-opus-4.7-1m"
+        );
+        assert_eq!(
+            translate(&m, "claude-haiku-4.5-20250101"),
+            "claude-haiku-4.5"
+        );
     }
 
     #[test]

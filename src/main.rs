@@ -134,7 +134,10 @@ async fn main() {
             eprintln!("ERROR: No GitHub token available!");
             eprintln!("Options:");
             eprintln!("  1. Set GITHUB_TOKEN environment variable");
-            eprintln!("  2. Create github_token.txt in {}", config::config_dir().display());
+            eprintln!(
+                "  2. Create github_token.txt in {}",
+                config::config_dir().display()
+            );
             eprintln!("  3. Run again for interactive Device Flow auth");
             eprintln!("{}", "=".repeat(60));
             std::process::exit(1);

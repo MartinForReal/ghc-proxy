@@ -122,7 +122,8 @@ mod tests {
 
     #[test]
     fn unsupported_tools_stripped() {
-        let mut req = json!({"tools": [{"type": "image_generation"}, {"type": "function", "name": "x"}]});
+        let mut req =
+            json!({"tools": [{"type": "image_generation"}, {"type": "function", "name": "x"}]});
         adapt_tools(&mut req);
         assert_eq!(req["tools"].as_array().unwrap().len(), 1);
     }
