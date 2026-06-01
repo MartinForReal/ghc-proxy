@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Question / Discussion
+    url: https://github.com/MartinForReal/ghc-proxy/discussions
+    about: Ask questions and discuss ghc-proxy with the community.
