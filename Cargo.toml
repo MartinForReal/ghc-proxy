@@ -16,7 +16,7 @@ name = "ghc-proxy"
 path = "src/main.rs"
 
 [dependencies]
-axum = { version = "0.7", features = ["json"] }
+axum = { version = "0.8", features = ["json"] }
 tokio = { version = "1", features = ["full"] }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["fs"] }
