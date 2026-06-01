@@ -59,7 +59,7 @@ jobs:
           } >> .cargo/config.toml
 
       - name: Cache cargo registry and build
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
