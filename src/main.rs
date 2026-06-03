@@ -14,6 +14,8 @@ struct Cli {
     defaults: bool,
     port: Option<u16>,
     address: Option<String>,
+    debug: Option<bool>,
+    account_type: Option<String>,
     config: bool,
     version: bool,
     help: bool,
@@ -38,6 +40,15 @@ fn parse_args() -> Cli {
             "-a" | "--address" => {
                 cli.address = args.next();
             }
+            "--debug" => {
+                cli.debug = Some(true);
+            }
+            "--no-debug" => {
+                cli.debug = Some(false);
+            }
+            "--account-type" => {
+                cli.account_type = args.next();
+            }
             other => {
                 eprintln!("Unknown option: {other}");
             }
@@ -58,9 +69,25 @@ Options:
   -d, --default           Use defaults for setup prompts
   -p, --port <port>       Port to listen on (default: {port})
   -a, --address <addr>    Address to listen on (default: {addr})
+      --debug             Enable debug mode
+      --no-debug          Disable debug mode
+      --account-type <type> Set account type (individual/business/enterprise)
   -c, --config            Generate default config file
   -v, --version           Show version
-  -h, --help              Show this help",
+  -h, --help              Show this help
+
+Environment Variables:
+  GHC_PROXY_ADDRESS                 Override listen address
+  GHC_PROXY_PORT                    Override listen port
+  GHC_PROXY_DEBUG                   Enable debug mode (true/1)
+  GHC_PROXY_ACCOUNT_TYPE            Set account type
+  GHC_PROXY_VSCODE_VERSION          Override VS Code version
+  GHC_PROXY_API_VERSION             Override API version
+  GHC_PROXY_COPILOT_VERSION         Override Copilot version
+  GHC_PROXY_MAX_CONNECTION_RETRIES  Set max connection retries
+  GHC_PROXY_REDIRECT_ANTHROPIC      Redirect Anthropic requests (true/1)
+
+Priority: CLI flags > Environment variables > Config file > Defaults",
         port = config::DEFAULT_PORT,
         addr = config::DEFAULT_ADDRESS,
     );
@@ -113,12 +140,25 @@ async fn main() {
 
     // Load configuration (generates a default file on first run).
     let mut cfg = config::load_config();
-    if let Some(addr) = cli.address.clone() {
+
+    // Apply CLI overrides (highest priority)
+    if let Some(addr) = cli.address {
+        tracing::info!("✓ Overriding address from CLI: {}", addr);
         cfg.address = addr;
     }
     if let Some(port) = cli.port {
+        tracing::info!("✓ Overriding port from CLI: {}", port);
         cfg.port = port;
     }
+    if let Some(debug) = cli.debug {
+        tracing::info!("✓ Overriding debug from CLI: {}", debug);
+        cfg.debug = debug;
+    }
+    if let Some(account_type) = cli.account_type {
+        tracing::info!("✓ Overriding account_type from CLI: {}", account_type);
+        cfg.account_type = account_type;
+    }
+
     let host = cfg.address.clone();
     let port = cfg.port;
     if cfg.debug {

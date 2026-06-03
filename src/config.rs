@@ -275,6 +275,7 @@ pub fn generate_default_config() -> std::io::Result<Option<PathBuf>> {
 
 /// Loads configuration from `config.yaml`, generating a default file first if
 /// none exists. Falls back to built-in defaults on any parse error.
+/// Environment variables can override config file values with the prefix `GHC_PROXY_`.
 pub fn load_config() -> Config {
     let path = config_path();
     if !path.exists() {
@@ -282,20 +283,73 @@ pub fn load_config() -> Config {
             tracing::warn!("Failed to generate default config: {e}");
         }
     }
-    match std::fs::read_to_string(&path) {
+    let mut cfg = match std::fs::read_to_string(&path) {
         Ok(contents) => match serde_norway::from_str::<Config>(&contents) {
             Ok(mut cfg) => {
                 if cfg.model_mappings.exact.is_empty() && cfg.model_mappings.prefix.is_empty() {
                     cfg.model_mappings = default_model_mappings();
                 }
-                tracing::info!("Loaded configuration from: {}", path.display());
+                tracing::info!("✓ Configuration loaded from: {}", path.display());
                 cfg
             }
             Err(e) => {
-                tracing::warn!("Error loading config: {e}");
+                tracing::error!("Failed to parse config file at {}: {}", path.display(), e);
+                tracing::warn!("Using default configuration values. Fix the config file to use custom settings.");
                 Config::default()
             }
         },
-        Err(_) => Config::default(),
+        Err(e) => {
+            tracing::debug!("Could not read config file at {}: {}", path.display(), e);
+            tracing::info!("Using default configuration values");
+            Config::default()
+        }
+    };
+
+    // Apply environment variable overrides
+    if let Ok(val) = std::env::var("GHC_PROXY_ADDRESS") {
+        tracing::info!("✓ Overriding address from GHC_PROXY_ADDRESS: {}", val);
+        cfg.address = val;
     }
+    if let Ok(val) = std::env::var("GHC_PROXY_PORT") {
+        if let Ok(port) = val.parse::<u16>() {
+            tracing::info!("✓ Overriding port from GHC_PROXY_PORT: {}", port);
+            cfg.port = port;
+        } else {
+            tracing::warn!("Invalid GHC_PROXY_PORT value '{}': expected a number between 1-65535", val);
+        }
+    }
+    if let Ok(val) = std::env::var("GHC_PROXY_DEBUG") {
+        cfg.debug = val.eq_ignore_ascii_case("true") || val == "1";
+        tracing::info!("✓ Overriding debug from GHC_PROXY_DEBUG: {}", cfg.debug);
+    }
+    if let Ok(val) = std::env::var("GHC_PROXY_ACCOUNT_TYPE") {
+        tracing::info!("✓ Overriding account_type from GHC_PROXY_ACCOUNT_TYPE: {}", val);
+        cfg.account_type = val;
+    }
+    if let Ok(val) = std::env::var("GHC_PROXY_VSCODE_VERSION") {
+        tracing::info!("✓ Overriding vscode_version from GHC_PROXY_VSCODE_VERSION: {}", val);
+        cfg.vscode_version = val;
+    }
+    if let Ok(val) = std::env::var("GHC_PROXY_API_VERSION") {
+        tracing::info!("✓ Overriding api_version from GHC_PROXY_API_VERSION: {}", val);
+        cfg.api_version = val;
+    }
+    if let Ok(val) = std::env::var("GHC_PROXY_COPILOT_VERSION") {
+        tracing::info!("✓ Overriding copilot_version from GHC_PROXY_COPILOT_VERSION: {}", val);
+        cfg.copilot_version = val;
+    }
+    if let Ok(val) = std::env::var("GHC_PROXY_MAX_CONNECTION_RETRIES") {
+        if let Ok(retries) = val.parse::<u32>() {
+            tracing::info!("✓ Overriding max_connection_retries from GHC_PROXY_MAX_CONNECTION_RETRIES: {}", retries);
+            cfg.max_connection_retries = retries;
+        } else {
+            tracing::warn!("Invalid GHC_PROXY_MAX_CONNECTION_RETRIES value '{}': expected a positive number", val);
+        }
+    }
+    if let Ok(val) = std::env::var("GHC_PROXY_REDIRECT_ANTHROPIC") {
+        cfg.redirect_anthropic = val.eq_ignore_ascii_case("true") || val == "1";
+        tracing::info!("✓ Overriding redirect_anthropic from GHC_PROXY_REDIRECT_ANTHROPIC: {}", cfg.redirect_anthropic);
+    }
+
+    cfg
 }
