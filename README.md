@@ -45,9 +45,9 @@ On first run the proxy initiates **GitHub Device Flow** authentication if no
 ```
 ghc-proxy [options]
 
-  -s, --setup             Generate default config (setup)
-      --claudecode        Update Claude Code settings only (use with --setup)
-  -d, --default           Use defaults for setup prompts
+  -s, --setup             Show the setup guide and write/update the config file
+      --claudecode        Include Claude Code setup instructions (use with --setup)
+  -d, --default           Reset config to defaults during setup
   -p, --port <port>       Port to listen on (default: 8314)
   -a, --address <addr>    Address to listen on (default: 127.0.0.1)
   -c, --config            Generate default config file
@@ -103,6 +103,7 @@ max_connection_retries: 3
 | `POST /v1/messages/count_tokens` | Anthropic token counting |
 | `GET /` | Web dashboard |
 | `GET /requests` | Request browser |
+| `GET /api/models` | All supported models (used by the dashboard) |
 
 ## Example Usage
 
@@ -170,8 +171,12 @@ management, model translation, all four API surfaces with streaming, content
 filtering, retry, the CLI, and the dashboard. The following `ghc-tunnel`
 auxiliary features are intentionally **not** ported: the fully interactive
 setup wizard, OneDrive config sync, the ACP code agent, Codex config
-auto-repair, and the persistent on-disk analytics database. `--setup` /
-`--claudecode` generate a default config and print integration guidance.
+auto-repair, and the persistent on-disk analytics database. `--setup` prints a
+setup guide and writes/updates the config file (re-rendering it with the current
+values, applying any CLI overrides, or resetting to defaults with `--default`),
+even when a config file already exists; `--claudecode` adds Claude Code
+integration guidance. The dashboard lists all supported models alongside the
+request statistics.
 
 ## License
 
