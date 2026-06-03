@@ -37,7 +37,7 @@ pub fn router(state: SharedState) -> Router {
         .route("/api/stats", get(api_stats))
         .route("/api/requests", get(api_requests))
         .fallback(not_found)
-        .layer(DefaultBodyLimit::max(50 * 1024 * 1024)) // 50 MB limit
+        .layer(DefaultBodyLimit::max(20 * 1024 * 1024 * 1024)) // 20 GB limit
         .with_state(state)
 }
 
