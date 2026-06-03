@@ -150,9 +150,9 @@ async fn main() {
         tracing::info!("✓ Overriding port from CLI: {}", port);
         cfg.port = port;
     }
-    if let Some(debug) = cli.debug {
-        tracing::info!("✓ Overriding debug from CLI: {}", debug);
-        cfg.debug = debug;
+    if let Some(debug_mode) = cli.debug {
+        tracing::info!("✓ Overriding debug from CLI: {}", debug_mode);
+        cfg.debug = debug_mode;
     }
     if let Some(account_type) = cli.account_type {
         tracing::info!("✓ Overriding account_type from CLI: {}", account_type);

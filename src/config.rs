@@ -315,7 +315,10 @@ pub fn load_config() -> Config {
             tracing::info!("✓ Overriding port from GHC_PROXY_PORT: {}", port);
             cfg.port = port;
         } else {
-            tracing::warn!("Invalid GHC_PROXY_PORT value '{}': expected a number between 1-65535", val);
+            tracing::warn!(
+                "Invalid GHC_PROXY_PORT value '{}': expected a number between 1-65535",
+                val
+            );
         }
     }
     if let Ok(val) = std::env::var("GHC_PROXY_DEBUG") {
@@ -323,32 +326,53 @@ pub fn load_config() -> Config {
         tracing::info!("✓ Overriding debug from GHC_PROXY_DEBUG: {}", cfg.debug);
     }
     if let Ok(val) = std::env::var("GHC_PROXY_ACCOUNT_TYPE") {
-        tracing::info!("✓ Overriding account_type from GHC_PROXY_ACCOUNT_TYPE: {}", val);
+        tracing::info!(
+            "✓ Overriding account_type from GHC_PROXY_ACCOUNT_TYPE: {}",
+            val
+        );
         cfg.account_type = val;
     }
     if let Ok(val) = std::env::var("GHC_PROXY_VSCODE_VERSION") {
-        tracing::info!("✓ Overriding vscode_version from GHC_PROXY_VSCODE_VERSION: {}", val);
+        tracing::info!(
+            "✓ Overriding vscode_version from GHC_PROXY_VSCODE_VERSION: {}",
+            val
+        );
         cfg.vscode_version = val;
     }
     if let Ok(val) = std::env::var("GHC_PROXY_API_VERSION") {
-        tracing::info!("✓ Overriding api_version from GHC_PROXY_API_VERSION: {}", val);
+        tracing::info!(
+            "✓ Overriding api_version from GHC_PROXY_API_VERSION: {}",
+            val
+        );
         cfg.api_version = val;
     }
     if let Ok(val) = std::env::var("GHC_PROXY_COPILOT_VERSION") {
-        tracing::info!("✓ Overriding copilot_version from GHC_PROXY_COPILOT_VERSION: {}", val);
+        tracing::info!(
+            "✓ Overriding copilot_version from GHC_PROXY_COPILOT_VERSION: {}",
+            val
+        );
         cfg.copilot_version = val;
     }
     if let Ok(val) = std::env::var("GHC_PROXY_MAX_CONNECTION_RETRIES") {
         if let Ok(retries) = val.parse::<u32>() {
-            tracing::info!("✓ Overriding max_connection_retries from GHC_PROXY_MAX_CONNECTION_RETRIES: {}", retries);
+            tracing::info!(
+                "✓ Overriding max_connection_retries from GHC_PROXY_MAX_CONNECTION_RETRIES: {}",
+                retries
+            );
             cfg.max_connection_retries = retries;
         } else {
-            tracing::warn!("Invalid GHC_PROXY_MAX_CONNECTION_RETRIES value '{}': expected a positive number", val);
+            tracing::warn!(
+                "Invalid GHC_PROXY_MAX_CONNECTION_RETRIES value '{}': expected a positive number",
+                val
+            );
         }
     }
     if let Ok(val) = std::env::var("GHC_PROXY_REDIRECT_ANTHROPIC") {
         cfg.redirect_anthropic = val.eq_ignore_ascii_case("true") || val == "1";
-        tracing::info!("✓ Overriding redirect_anthropic from GHC_PROXY_REDIRECT_ANTHROPIC: {}", cfg.redirect_anthropic);
+        tracing::info!(
+            "✓ Overriding redirect_anthropic from GHC_PROXY_REDIRECT_ANTHROPIC: {}",
+            cfg.redirect_anthropic
+        );
     }
 
     cfg
