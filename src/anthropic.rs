@@ -703,7 +703,9 @@ pub fn adjust_thinking_budget(req: &Value) -> Value {
 }
 
 /// Maps a legacy `thinking.budget_tokens` value to an `output_config.effort`
-/// level accepted by adaptive-thinking models.
+/// level accepted by adaptive-thinking models. Thresholds approximate the
+/// previous budget tiers: up to ~8k tokens is treated as low effort, up to ~24k
+/// as medium, and anything larger as high.
 fn effort_for_budget(budget: u64) -> &'static str {
     match budget {
         0..=8_191 => "low",
