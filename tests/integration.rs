@@ -135,3 +135,43 @@ async fn router_builds_and_serves_dashboard() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn copilot_headers_mimic_latest_client() {
+    let cfg = config::Config::default();
+    let state = ghc_proxy::state::AppState::new(cfg, "dummy-token".into());
+
+    let h = state.copilot_headers(false).await;
+
+    // Identity headers the upstream Copilot API expects from the VS Code client.
+    assert_eq!(h.get("Copilot-Integration-Id").unwrap(), "vscode-chat");
+    assert_eq!(
+        h.get("Editor-Version").unwrap(),
+        &format!("vscode/{}", config::VSCODE_VERSION)
+    );
+    assert_eq!(
+        h.get("Editor-Plugin-Version").unwrap(),
+        &format!("copilot-chat/{}", config::COPILOT_VERSION)
+    );
+    assert_eq!(
+        h.get("User-Agent").unwrap(),
+        &format!("GitHubCopilotChat/{}", config::COPILOT_VERSION)
+    );
+    assert_eq!(h.get("X-GitHub-Api-Version").unwrap(), config::API_VERSION);
+    assert_eq!(h.get("OpenAI-Intent").unwrap(), "conversation-panel");
+    assert_eq!(h.get("X-Interaction-Type").unwrap(), "conversation-panel");
+    assert_eq!(
+        h.get("X-VSCode-User-Agent-Library-Version").unwrap(),
+        "electron-fetch"
+    );
+
+    // X-Request-Id and X-Agent-Task-Id must be present and share the same value.
+    let request_id = h.get("X-Request-Id").unwrap();
+    assert_eq!(h.get("X-Agent-Task-Id").unwrap(), request_id);
+    assert!(!request_id.is_empty());
+
+    // Vision header is only present when requested.
+    assert!(h.get("Copilot-Vision-Request").is_none());
+    let hv = state.copilot_headers(true).await;
+    assert_eq!(hv.get("Copilot-Vision-Request").unwrap(), "true");
+}

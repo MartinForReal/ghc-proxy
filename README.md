@@ -77,9 +77,9 @@ address: 127.0.0.1
 port: 8314
 debug: false
 account_type: individual            # individual | business | enterprise
-vscode_version: "1.93.0"
-api_version: "2025-04-01"
-copilot_version: "0.26.7"
+vscode_version: "1.115.0"
+api_version: "2025-05-01"
+copilot_version: "0.44.0"
 model_mappings:
   exact:
     opus: claude-opus-4.7-1m
@@ -163,6 +163,32 @@ cargo clippy     # lint
 | `src/util.rs` | Retry-with-backoff and orphaned tool-result handling |
 | `src/server.rs` | Axum router and all HTTP handlers |
 | `src/store.rs` | In-memory request store for the dashboard |
+
+## Mimicking the Copilot Client
+
+The proxy authenticates to GitHub Copilot by impersonating the official
+**VS Code Copilot Chat** client. To do this faithfully it sends the same
+identity headers that the real client sends to `api.githubcopilot.com`
+(`Editor-Version`, `Editor-Plugin-Version`, `User-Agent`,
+`Copilot-Integration-Id`, `OpenAI-Intent`, `X-Interaction-Type`,
+`X-GitHub-Api-Version`, etc.). These are built in
+`AppState::copilot_headers` / `github_headers` (`src/state.rs`) from the
+version strings in `src/config.rs`.
+
+GitHub may reject requests that report stale client versions, so these values
+occasionally need refreshing. The source of truth is the now open-source
+[`microsoft/vscode-copilot-chat`](https://github.com/microsoft/vscode-copilot-chat)
+repository:
+
+| Config value | Where to read it |
+|--------------|------------------|
+| `copilot_version` | `version` field in the extension's `package.json` |
+| `vscode_version` | `engines.vscode` baseline in `package.json` |
+| `api_version` | `X-GitHub-Api-Version` constant in `src/platform/networking/common/networking.ts` |
+
+After updating the constants in `src/config.rs`, run the test suite (the header
+test in `tests/integration.rs` guards the expected header set) and bump the
+example values in this README.
 
 ## Notes on Parity with `ghc-tunnel`
 
