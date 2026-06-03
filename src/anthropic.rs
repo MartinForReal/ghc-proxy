@@ -628,6 +628,7 @@ const ALLOWED_ANTHROPIC_KEYS: &[&str] = &[
     "tools",
     "tool_choice",
     "thinking",
+    "output_config",
     "service_tier",
 ];
 
@@ -699,6 +700,39 @@ pub fn adjust_thinking_budget(req: &Value) -> Value {
         return out;
     }
     req.clone()
+}
+
+/// Maps a legacy `thinking.budget_tokens` value to an `output_config.effort`
+/// level accepted by adaptive-thinking models.
+fn effort_for_budget(budget: u64) -> &'static str {
+    match budget {
+        0..=8_191 => "low",
+        8_192..=24_575 => "medium",
+        _ => "high",
+    }
+}
+
+/// Rewrites a legacy `thinking: {type: "enabled", budget_tokens: N}` block into
+/// the adaptive form required by newer models such as `claude-opus-4.8`:
+/// `thinking: {type: "adaptive"}` plus `output_config: {effort: ...}`, where the
+/// effort level is derived from the original token budget.
+///
+/// Returns `None` when there is no enabled-style thinking block to transform, so
+/// callers can leave requests for models that still accept `enabled` untouched.
+pub fn adapt_thinking_to_adaptive(req: &Value) -> Option<Value> {
+    let thinking = req.get("thinking")?;
+    if thinking.get("type").and_then(|t| t.as_str()) != Some("enabled") {
+        return None;
+    }
+    let budget = thinking
+        .get("budget_tokens")
+        .and_then(|b| b.as_u64())
+        .unwrap_or(0);
+    let effort = effort_for_budget(budget);
+    let mut out = req.clone();
+    out["thinking"] = json!({ "type": "adaptive" });
+    out["output_config"] = json!({ "effort": effort });
+    Some(out)
 }
 
 /// Applies `system_prompt_add` / `system_prompt_remove` to a direct Anthropic
@@ -924,5 +958,48 @@ mod tests {
         let out = sanitize_anthropic_request(&req);
         assert!(out.get("foo").is_none());
         assert_eq!(out["model"], "m");
+    }
+
+    #[test]
+    fn sanitize_keeps_output_config() {
+        let req = json!({"model": "m", "messages": [], "output_config": {"effort": "high"}});
+        let out = sanitize_anthropic_request(&req);
+        assert_eq!(out["output_config"]["effort"], "high");
+    }
+
+    #[test]
+    fn adapt_thinking_rewrites_enabled_to_adaptive() {
+        let req = json!({
+            "model": "claude-opus-4.8",
+            "thinking": {"type": "enabled", "budget_tokens": 16000},
+            "messages": []
+        });
+        let out = adapt_thinking_to_adaptive(&req).expect("should transform");
+        assert_eq!(out["thinking"]["type"], "adaptive");
+        assert!(out["thinking"].get("budget_tokens").is_none());
+        assert_eq!(out["output_config"]["effort"], "medium");
+    }
+
+    #[test]
+    fn adapt_thinking_effort_thresholds() {
+        let low = json!({"thinking": {"type": "enabled", "budget_tokens": 4000}});
+        assert_eq!(
+            adapt_thinking_to_adaptive(&low).unwrap()["output_config"]["effort"],
+            "low"
+        );
+        let high = json!({"thinking": {"type": "enabled", "budget_tokens": 32000}});
+        assert_eq!(
+            adapt_thinking_to_adaptive(&high).unwrap()["output_config"]["effort"],
+            "high"
+        );
+    }
+
+    #[test]
+    fn adapt_thinking_ignores_non_enabled() {
+        // No thinking block at all.
+        assert!(adapt_thinking_to_adaptive(&json!({"model": "m"})).is_none());
+        // Already adaptive.
+        let adaptive = json!({"thinking": {"type": "adaptive"}});
+        assert!(adapt_thinking_to_adaptive(&adaptive).is_none());
     }
 }

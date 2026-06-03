@@ -11,6 +11,13 @@ pub fn is_orphaned_tool_error(status: u16, body: &str) -> bool {
     status == 400 && body.contains("tool_use_id") && body.contains("tool_result")
 }
 
+/// Detects the upstream 400 error returned by models that no longer accept
+/// `thinking.type: "enabled"` and instead require the adaptive thinking format
+/// (`thinking.type: "adaptive"` plus `output_config.effort`).
+pub fn is_thinking_enabled_unsupported_error(status: u16, body: &str) -> bool {
+    status == 400 && body.contains("thinking.type.enabled") && body.contains("adaptive")
+}
+
 /// Extracts orphaned tool-use ids referenced in an error message.
 pub fn extract_orphaned_ids(body: &str) -> Vec<String> {
     let mut ids: Vec<String> = Vec::new();
@@ -121,5 +128,24 @@ pub async fn post_with_retry(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_thinking_enabled_unsupported_error() {
+        let body = "\"thinking.type.enabled\" is not supported for this model. \
+            Use \"thinking.type.adaptive\" and \"output_config.effort\" to control thinking behavior.";
+        assert!(is_thinking_enabled_unsupported_error(400, body));
+        // Wrong status code.
+        assert!(!is_thinking_enabled_unsupported_error(200, body));
+        // Unrelated 400 error.
+        assert!(!is_thinking_enabled_unsupported_error(
+            400,
+            "some other validation error"
+        ));
     }
 }
