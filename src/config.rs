@@ -6,11 +6,17 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 /// Default VS Code version string sent in upstream request headers.
-pub const VSCODE_VERSION: &str = "1.93.0";
-/// Default GitHub Copilot API version header value.
-pub const API_VERSION: &str = "2025-04-01";
-/// Default Copilot Chat plugin version string.
-pub const COPILOT_VERSION: &str = "0.26.7";
+///
+/// Kept in sync with the `engines.vscode` baseline of the latest
+/// `microsoft/vscode-copilot-chat` release (see "Mimicking the Copilot client"
+/// in the README for how to refresh these values).
+pub const VSCODE_VERSION: &str = "1.115.0";
+/// Default GitHub Copilot API version header value (`X-GitHub-Api-Version`),
+/// matching the value sent by the latest Copilot Chat client.
+pub const API_VERSION: &str = "2025-05-01";
+/// Default Copilot Chat plugin version string, matching the `version` field of
+/// the latest `microsoft/vscode-copilot-chat` release.
+pub const COPILOT_VERSION: &str = "0.44.0";
 
 /// Default model name that Claude "opus"/"sonnet" requests are mapped to.
 pub const DEFAULT_OPUS: &str = "claude-opus-4.7-1m";

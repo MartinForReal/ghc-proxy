@@ -113,7 +113,17 @@ impl AppState {
             HeaderValue::from_static("conversation-panel"),
         );
         insert(&mut h, "X-GitHub-Api-Version", &self.config.api_version);
-        insert(&mut h, "X-Request-Id", &uuid::Uuid::new_v4().to_string());
+        // The latest Copilot client mirrors the request intent in the
+        // `X-Interaction-Type` header for non-subagent/background requests.
+        h.insert(
+            "X-Interaction-Type",
+            HeaderValue::from_static("conversation-panel"),
+        );
+        // A single request id is shared between `X-Request-Id` and
+        // `X-Agent-Task-Id`, matching the latest Copilot client behavior.
+        let request_id = uuid::Uuid::new_v4().to_string();
+        insert(&mut h, "X-Request-Id", &request_id);
+        insert(&mut h, "X-Agent-Task-Id", &request_id);
         h.insert(
             "X-VSCode-User-Agent-Library-Version",
             HeaderValue::from_static("electron-fetch"),

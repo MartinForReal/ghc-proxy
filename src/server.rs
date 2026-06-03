@@ -434,6 +434,7 @@ async fn messages_direct(
     let is_stream = req.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
 
     let mut current = req.clone();
+    let mut thinking_adapted = false;
     for _ in 0..4 {
         let mut sanitized = anthropic::sanitize_anthropic_request(&current);
         sanitized = anthropic::adjust_thinking_budget(&sanitized);
@@ -441,11 +442,38 @@ async fn messages_direct(
         let payload = serde_json::to_vec(&sanitized).unwrap_or_default();
 
         if is_stream {
+            let upstream = state
+                .http
+                .post(&url)
+                .headers(headers.clone())
+                .body(payload)
+                .send()
+                .await;
+            let upstream = match upstream {
+                Ok(r) => r,
+                Err(e) => return anthropic_error(StatusCode::GATEWAY_TIMEOUT, e.to_string()),
+            };
+            let status = upstream.status();
+            // Inspect 400 responses so we can transparently recover from the
+            // adaptive-thinking migration before committing to the SSE stream.
+            if status == StatusCode::BAD_REQUEST {
+                let text = upstream.text().await.unwrap_or_default();
+                log_error("/v1/messages", &current, &text, status.as_u16());
+                if !thinking_adapted
+                    && util::is_thinking_enabled_unsupported_error(status.as_u16(), &text)
+                {
+                    if let Some(adapted) = anthropic::adapt_thinking_to_adaptive(&current) {
+                        tracing::info!("[Direct Anthropic] adapting thinking to adaptive format");
+                        current = adapted;
+                        thinking_adapted = true;
+                        continue;
+                    }
+                }
+                return passthrough_error(status, text);
+            }
             return stream_anthropic_direct(
                 state.clone(),
-                &url,
-                headers.clone(),
-                payload,
+                upstream,
                 original_model,
                 translated,
                 req_size,
@@ -498,6 +526,15 @@ async fn messages_direct(
                     current["messages"] = Value::Array(cleaned);
                     continue;
                 }
+            }
+        }
+        if !thinking_adapted && util::is_thinking_enabled_unsupported_error(status.as_u16(), &text)
+        {
+            if let Some(adapted) = anthropic::adapt_thinking_to_adaptive(&current) {
+                tracing::info!("[Direct Anthropic] adapting thinking to adaptive format");
+                current = adapted;
+                thinking_adapted = true;
+                continue;
             }
         }
         return passthrough_error(status, text);
@@ -868,28 +905,14 @@ async fn stream_responses(
 }
 
 /// Streams a direct Anthropic SSE response back to the client verbatim.
-#[allow(clippy::too_many_arguments)]
 async fn stream_anthropic_direct(
     state: SharedState,
-    url: &str,
-    headers: HeaderMap,
-    payload: Vec<u8>,
+    upstream: reqwest::Response,
     original_model: String,
     translated: String,
     req_size: usize,
     start: Instant,
 ) -> Response {
-    let upstream = state
-        .http
-        .post(url)
-        .headers(headers)
-        .body(payload)
-        .send()
-        .await;
-    let upstream = match upstream {
-        Ok(r) => r,
-        Err(e) => return anthropic_error(StatusCode::GATEWAY_TIMEOUT, e.to_string()),
-    };
     let status = upstream.status().as_u16();
     let stream = async_stream::stream! {
         use futures_util::StreamExt;
