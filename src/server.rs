@@ -9,7 +9,7 @@ use crate::translate;
 use crate::util;
 use axum::{
     body::{Body, Bytes},
-    extract::{Query, State},
+    extract::{DefaultBodyLimit, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -37,6 +37,7 @@ pub fn router(state: SharedState) -> Router {
         .route("/api/stats", get(api_stats))
         .route("/api/requests", get(api_requests))
         .fallback(not_found)
+        .layer(DefaultBodyLimit::max(20 * 1024 * 1024 * 1024)) // 20 GB limit
         .with_state(state)
 }
 
