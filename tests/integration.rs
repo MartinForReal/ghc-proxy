@@ -10,6 +10,37 @@ fn config_dir_is_named_ghc_tunnel() {
 }
 
 #[test]
+fn rendered_config_round_trips_with_overrides() {
+    let cfg = config::Config {
+        address: "0.0.0.0".into(),
+        port: 9000,
+        debug: true,
+        account_type: "business".into(),
+        system_prompt_add: vec!["be concise".into()],
+        redirect_anthropic: true,
+        ..config::Config::default()
+    };
+    let yaml = config::render_config_yaml(&cfg);
+    let parsed: config::Config =
+        serde_norway::from_str(&yaml).expect("rendered yaml should parse back");
+    assert_eq!(parsed.port, 9000);
+    assert_eq!(parsed.address, "0.0.0.0");
+    assert!(parsed.debug);
+    assert_eq!(parsed.account_type, "business");
+    assert_eq!(parsed.system_prompt_add, vec!["be concise".to_string()]);
+    assert!(parsed.redirect_anthropic);
+    // Mappings with bracketed keys must survive the round trip.
+    assert_eq!(
+        parsed
+            .model_mappings
+            .exact
+            .get("4-7[1m]")
+            .map(String::as_str),
+        Some(config::DEFAULT_OPUS)
+    );
+}
+
+#[test]
 fn default_config_has_model_mappings_and_base_url() {
     let cfg = config::Config::default();
     assert!(!cfg.model_mappings.exact.is_empty());

@@ -64,9 +64,9 @@ fn print_help() {
 Usage: ghc-proxy [options]
 
 Options:
-  -s, --setup             Generate default config (setup)
-      --claudecode        Update Claude Code settings only (use with --setup)
-  -d, --default           Use defaults for setup prompts
+  -s, --setup             Show the setup guide and write/update the config file
+      --claudecode        Include Claude Code setup instructions (use with --setup)
+  -d, --default           Reset config to defaults during setup
   -p, --port <port>       Port to listen on (default: {port})
   -a, --address <addr>    Address to listen on (default: {addr})
       --debug             Enable debug mode
@@ -93,6 +93,58 @@ Priority: CLI flags > Environment variables > Config file > Defaults",
     );
 }
 
+/// Prints an interactive-style setup guide after the configuration file has
+/// been written/updated. Always shown for `--setup`, even when a config file
+/// already existed.
+fn print_setup_guide(cfg: &ghc_proxy::config::Config, path: &std::path::Path, claudecode: bool) {
+    let bar = "=".repeat(60);
+    println!("\n{bar}");
+    println!("ghc-proxy setup");
+    println!("{bar}");
+    println!("\nConfiguration file updated at:\n  {}", path.display());
+    println!("\nCurrent settings:");
+    println!("  address:        {}", cfg.address);
+    println!("  port:           {}", cfg.port);
+    println!("  debug:          {}", cfg.debug);
+    println!("  account_type:   {}", cfg.account_type);
+    println!(
+        "  model mappings: {} exact, {} prefix",
+        cfg.model_mappings.exact.len(),
+        cfg.model_mappings.prefix.len()
+    );
+
+    println!("\nNext steps:");
+    println!("  1. Authenticate with GitHub. A token is resolved from, in order:");
+    println!("       - the GITHUB_TOKEN environment variable,");
+    println!(
+        "       - the saved token file at {},",
+        config::config_dir().join("github_token.txt").display()
+    );
+    println!("       - interactive GitHub Device Flow on first run.");
+    println!(
+        "  2. Edit {} to customise model mappings and filters.",
+        path.display()
+    );
+    println!(
+        "  3. Start the proxy:  ghc-proxy --port {} --address {}",
+        cfg.port, cfg.address
+    );
+    println!(
+        "  4. Open the dashboard at http://{}:{}/ to view stats and the",
+        cfg.address, cfg.port
+    );
+    println!("     full list of supported models.");
+
+    if claudecode {
+        println!("\nClaude Code:");
+        println!(
+            "  Set ANTHROPIC_BASE_URL in ~/.claude/settings.json to point at\n  http://{}:{} so Claude Code routes through this proxy.",
+            cfg.address, cfg.port
+        );
+    }
+    println!("{bar}");
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -103,7 +155,7 @@ async fn main() {
         .with_target(false)
         .init();
 
-    let cli = parse_args();
+    let mut cli = parse_args();
 
     if cli.help {
         print_help();
@@ -125,17 +177,32 @@ async fn main() {
         return;
     }
     if cli.setup {
-        // The interactive wizard from ghc-tunnel is not reproduced; we ensure a
-        // default config exists and continue to start the server.
-        if let Ok(Some(path)) = config::generate_default_config() {
-            println!("Configuration file generated at: {}", path.display());
+        // Build the configuration that setup should persist: start from the
+        // existing config (or built-in defaults when `--default` is given) and
+        // layer any CLI overrides on top.
+        let mut cfg = if cli.defaults {
+            config::Config::default()
+        } else {
+            config::load_config()
+        };
+        if let Some(addr) = cli.address.take() {
+            cfg.address = addr;
         }
-        if cli.claudecode {
-            println!(
-                "Configure ~/.claude/settings.json with ANTHROPIC_BASE_URL pointing at this proxy."
-            );
-            return;
+        if let Some(port) = cli.port {
+            cfg.port = port;
         }
+        if let Some(debug_mode) = cli.debug {
+            cfg.debug = debug_mode;
+        }
+        if let Some(account_type) = cli.account_type.take() {
+            cfg.account_type = account_type;
+        }
+
+        match config::write_config(&cfg) {
+            Ok(path) => print_setup_guide(&cfg, &path, cli.claudecode),
+            Err(e) => eprintln!("Failed to write config: {e}"),
+        }
+        return;
     }
 
     // Load configuration (generates a default file on first run).

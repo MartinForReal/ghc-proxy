@@ -187,76 +187,117 @@ pub fn config_path() -> PathBuf {
     config_dir().join("config.yaml")
 }
 
+/// Renders a YAML scalar, quoting it only when necessary so that values such as
+/// `4-7[1m]` or `claude-opus-4.7` round-trip cleanly through the YAML parser.
+fn yaml_scalar(s: &str) -> String {
+    let safe = s
+        .chars()
+        .next()
+        .map(|c| c.is_ascii_alphabetic())
+        .unwrap_or(false)
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | '/'));
+    if safe {
+        s.to_string()
+    } else {
+        serde_json::to_string(s).unwrap_or_else(|_| format!("\"{s}\""))
+    }
+}
+
+/// Renders a YAML list, using the inline `[]` form when empty.
+fn yaml_list(items: &[String]) -> String {
+    if items.is_empty() {
+        return "[]".to_string();
+    }
+    let mut out = String::from("\n");
+    for item in items {
+        out.push_str(&format!("  - {}\n", yaml_scalar(item)));
+    }
+    out.pop();
+    out
+}
+
+/// Renders a fully-commented `config.yaml` document from the given config,
+/// reflecting all of its current values (server settings, account type, header
+/// versions, model mappings, content filters and retry settings).
+pub fn render_config_yaml(cfg: &Config) -> String {
+    use std::fmt::Write;
+    let mut s = String::new();
+    s.push_str("# GitHub Copilot API Proxy Configuration\n");
+    s.push_str("# ========================================\n\n");
+    s.push_str("# Server Settings\n");
+    let _ = writeln!(s, "address: {}", cfg.address);
+    let _ = writeln!(s, "port: {}", cfg.port);
+    let _ = writeln!(s, "debug: {}", cfg.debug);
+    s.push('\n');
+    s.push_str("# GitHub Copilot Account Type\n");
+    s.push_str("# Options: \"individual\" | \"business\" | \"enterprise\"\n");
+    let _ = writeln!(s, "account_type: {}", cfg.account_type);
+    s.push('\n');
+    s.push_str("# Header version strings (only affect request headers to Copilot API)\n");
+    let _ = writeln!(s, "vscode_version: \"{}\"", cfg.vscode_version);
+    let _ = writeln!(s, "api_version: \"{}\"", cfg.api_version);
+    let _ = writeln!(s, "copilot_version: \"{}\"", cfg.copilot_version);
+    s.push('\n');
+    s.push_str("# Model Name Mappings\n");
+    s.push_str("# Two types: exact (full name match) and prefix (starts-with match)\n");
+    s.push_str("model_mappings:\n");
+    s.push_str("  exact:\n");
+    for (k, v) in &cfg.model_mappings.exact {
+        let _ = writeln!(s, "    {}: {}", yaml_scalar(k), yaml_scalar(v));
+    }
+    s.push_str("  prefix:\n");
+    for (k, v) in &cfg.model_mappings.prefix {
+        let _ = writeln!(s, "    {}: {}", yaml_scalar(k), yaml_scalar(v));
+    }
+    s.push('\n');
+    s.push_str("# Content Filtering\n");
+    s.push_str("# system_prompt_remove: strings to strip from system prompts\n");
+    s.push_str("# system_prompt_add: strings to append to system prompts\n");
+    s.push_str("# tool_result_suffix_remove: trailing strings to strip from tool results\n");
+    let _ = writeln!(
+        s,
+        "system_prompt_remove: {}",
+        yaml_list(&cfg.system_prompt_remove)
+    );
+    let _ = writeln!(
+        s,
+        "system_prompt_add: {}",
+        yaml_list(&cfg.system_prompt_add)
+    );
+    let _ = writeln!(
+        s,
+        "tool_result_suffix_remove: {}",
+        yaml_list(&cfg.tool_result_suffix_remove)
+    );
+    s.push('\n');
+    s.push_str("# Retry Settings\n");
+    s.push_str("# Max retries for upstream connection errors (0 = no retries)\n");
+    let _ = writeln!(s, "max_connection_retries: {}", cfg.max_connection_retries);
+    if cfg.redirect_anthropic {
+        s.push('\n');
+        s.push_str(
+            "# Always translate Anthropic requests through the OpenAI chat completions API\n",
+        );
+        let _ = writeln!(s, "redirect_anthropic: {}", cfg.redirect_anthropic);
+    }
+    s
+}
+
 /// Default `config.yaml` contents.
 pub fn default_config_yaml() -> String {
-    format!(
-        r#"# GitHub Copilot API Proxy Configuration
-# ========================================
+    render_config_yaml(&Config::default())
+}
 
-# Server Settings
-address: {addr}
-port: {port}
-debug: false
-
-# GitHub Copilot Account Type
-# Options: "individual" | "business" | "enterprise"
-account_type: individual
-
-# Header version strings (only affect request headers to Copilot API)
-vscode_version: "{vscode}"
-api_version: "{api}"
-copilot_version: "{copilot}"
-
-# Model Name Mappings
-# Two types: exact (full name match) and prefix (starts-with match)
-model_mappings:
-  exact:
-    opus: {opus}
-    sonnet: {opus}
-    opus4-7: {opus}
-    "4-7[1m]": {opus}
-    haiku: {haiku}
-  prefix:
-    claude-sonnet-4-: {opus}
-    claude-opus-4.5-: {opus}
-    claude-opus-4.6-: {opus}
-    claude-opus-4.7-: {opus}
-    claude-opus-4-5-: {opus}
-    claude-opus-4-6-: {opus}
-    claude-opus-4-7-: {opus}
-    "claude-opus-4.5": {opus}
-    "claude-opus-4.6": {opus}
-    "claude-opus-4.7": {opus}
-    "claude-opus-4-6": {opus}
-    "claude-opus-4-7": {opus}
-    "claude-opus-4-6[1m]": {opus}
-    "claude-opus-4-7[1m]": {opus}
-    claude-sonnet-4-7: {opus}
-    claude-sonnet-4-6: {opus}
-    claude-sonnet-4-5: {opus}
-    claude-haiku-4.5-: {haiku}
-    claude-haiku-4-5-: {haiku}
-
-# Content Filtering
-# system_prompt_remove: strings to strip from system prompts
-# system_prompt_add: strings to append to system prompts
-# tool_result_suffix_remove: trailing strings to strip from tool results
-system_prompt_remove: []
-system_prompt_add: []
-tool_result_suffix_remove: []
-
-# Retry Settings
-# Max retries for upstream connection errors (0 = no retries)
-max_connection_retries: 3
-"#,
-        addr = DEFAULT_ADDRESS,
-        port = DEFAULT_PORT,
-        vscode = VSCODE_VERSION,
-        api = API_VERSION,
-        copilot = COPILOT_VERSION,
-        opus = DEFAULT_OPUS,
-        haiku = DEFAULT_HAIKU,
-    )
+/// Writes the given configuration to `config.yaml`, creating the configuration
+/// directory if necessary and overwriting any existing file. Returns the path
+/// that was written.
+pub fn write_config(cfg: &Config) -> std::io::Result<PathBuf> {
+    let dir = config_dir();
+    std::fs::create_dir_all(&dir)?;
+    let path = config_path();
+    std::fs::write(&path, render_config_yaml(cfg))?;
+    Ok(path)
 }
 
 /// Ensures the config directory exists and writes the default `config.yaml`
