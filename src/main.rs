@@ -19,6 +19,15 @@ struct Cli {
     config: bool,
     version: bool,
     help: bool,
+    auth: bool,
+    info: bool,
+    check_usage: bool,
+    json: bool,
+    show_token: bool,
+    rate_limit: Option<u64>,
+    wait: bool,
+    manual: bool,
+    fetch_version: Option<bool>,
 }
 
 fn parse_args() -> Cli {
@@ -32,6 +41,20 @@ fn parse_args() -> Cli {
             "-c" | "--config" => cli.config = true,
             "-v" | "--version" => cli.version = true,
             "-h" | "--help" => cli.help = true,
+            "auth" | "--auth" => cli.auth = true,
+            "info" | "debug" | "--info" => cli.info = true,
+            "check-usage" | "--check-usage" => cli.check_usage = true,
+            "--json" => cli.json = true,
+            "--show-token" => cli.show_token = true,
+            "--wait" => cli.wait = true,
+            "--manual" => cli.manual = true,
+            "--fetch-version" => cli.fetch_version = Some(true),
+            "--no-fetch-version" => cli.fetch_version = Some(false),
+            "--rate-limit" => {
+                if let Some(v) = args.next() {
+                    cli.rate_limit = v.parse().ok();
+                }
+            }
             "-p" | "--port" => {
                 if let Some(v) = args.next() {
                     cli.port = v.parse().ok();
@@ -73,6 +96,16 @@ Options:
       --no-debug          Disable debug mode
       --account-type <type> Set account type (individual/business/enterprise)
   -c, --config            Generate default config file
+      auth                Authenticate with GitHub and exit (CI/headless flows)
+      check-usage         Print Copilot quota/usage and exit
+      info                Print diagnostic info (version, paths, token) and exit
+      --json              Emit machine-readable JSON (use with info)
+      --show-token        Log GitHub and Copilot tokens on refresh
+      --rate-limit <secs> Minimum seconds between forwarded requests
+      --wait              When rate limited, wait instead of returning HTTP 429
+      --manual            Require interactive approval before each request
+      --fetch-version     Fetch the latest VS Code version at startup
+      --no-fetch-version  Disable dynamic VS Code version fetching
   -v, --version           Show version
   -h, --help              Show this help
 
@@ -86,11 +119,63 @@ Environment Variables:
   GHC_PROXY_COPILOT_VERSION         Override Copilot version
   GHC_PROXY_MAX_CONNECTION_RETRIES  Set max connection retries
   GHC_PROXY_REDIRECT_ANTHROPIC      Redirect Anthropic requests (true/1)
+  GHC_PROXY_SHOW_TOKEN              Log tokens on refresh (true/1)
+  GHC_PROXY_DYNAMIC_VSCODE_VERSION  Fetch latest VS Code version (true/1)
+  GHC_PROXY_RATE_LIMIT_SECONDS      Minimum seconds between requests
+  GHC_PROXY_RATE_LIMIT_WAIT         Wait instead of rejecting when limited (true/1)
+  GHC_PROXY_MANUAL_APPROVE          Require manual approval per request (true/1)
 
 Priority: CLI flags > Environment variables > Config file > Defaults",
         port = config::DEFAULT_PORT,
         addr = config::DEFAULT_ADDRESS,
     );
+}
+
+/// Prints diagnostic information about the runtime and configuration. When
+/// `as_json` is true the output is a single JSON object suitable for tooling.
+fn print_info(as_json: bool) {
+    let config_dir = config::config_dir();
+    let config_path = config::config_path();
+    let token_path = auth::token_file_path();
+    let token_exists = std::env::var("GITHUB_TOKEN")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
+        || token_path.exists();
+    if as_json {
+        let info = serde_json::json!({
+            "version": VERSION,
+            "os": std::env::consts::OS,
+            "arch": std::env::consts::ARCH,
+            "config_dir": config_dir.display().to_string(),
+            "config_path": config_path.display().to_string(),
+            "config_exists": config_path.exists(),
+            "token_path": token_path.display().to_string(),
+            "token_exists": token_exists,
+        });
+        println!("{}", serde_json::to_string_pretty(&info).unwrap_or_default());
+    } else {
+        println!("ghc-proxy {VERSION}");
+        println!(
+            "os:            {} ({})",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        );
+        println!("config_dir:    {}", config_dir.display());
+        println!(
+            "config:        {} ({})",
+            config_path.display(),
+            if config_path.exists() {
+                "exists"
+            } else {
+                "missing"
+            }
+        );
+        println!(
+            "github_token:  {} ({})",
+            token_path.display(),
+            if token_exists { "available" } else { "missing" }
+        );
+    }
 }
 
 /// Prints an interactive-style setup guide after the configuration file has
@@ -176,6 +261,49 @@ async fn main() {
         }
         return;
     }
+    if cli.info {
+        print_info(cli.json);
+        return;
+    }
+    if cli.auth {
+        let client = reqwest::Client::new();
+        match auth::resolve_github_token(&client).await {
+            Some(token) => {
+                println!("Authenticated. Token saved to:");
+                println!("  {}", auth::token_file_path().display());
+                if cli.show_token {
+                    println!("  token: {token}");
+                }
+            }
+            None => {
+                eprintln!("Authentication failed.");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+    if cli.check_usage {
+        let mut cfg = config::load_config();
+        cfg.show_token = cfg.show_token || cli.show_token;
+        let client = reqwest::Client::new();
+        let Some(github_token) = auth::resolve_github_token(&client).await else {
+            eprintln!("No GitHub token available.");
+            std::process::exit(1);
+        };
+        let state = Arc::new(AppState::new(cfg, github_token));
+        match state.fetch_usage().await {
+            Ok(v) => println!(
+                "{}",
+                serde_json::to_string_pretty(&ghc_proxy::state::summarize_usage(&v))
+                    .unwrap_or_default()
+            ),
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     if cli.setup {
         // Build the configuration that setup should persist: start from the
         // existing config (or built-in defaults when `--default` is given) and
@@ -224,6 +352,36 @@ async fn main() {
     if let Some(account_type) = cli.account_type {
         tracing::info!("✓ Overriding account_type from CLI: {}", account_type);
         cfg.account_type = account_type;
+    }
+    if cli.show_token {
+        cfg.show_token = true;
+    }
+    if let Some(secs) = cli.rate_limit {
+        cfg.rate_limit_seconds = Some(secs);
+    }
+    if cli.wait {
+        cfg.rate_limit_wait = true;
+    }
+    if cli.manual {
+        cfg.manual_approve = true;
+    }
+    if let Some(fetch) = cli.fetch_version {
+        cfg.dynamic_vscode_version = fetch;
+    }
+
+    // Optionally refresh the VS Code version used in upstream headers.
+    if cfg.dynamic_vscode_version {
+        let client = reqwest::Client::new();
+        match ghc_proxy::util::fetch_latest_vscode_version(&client).await {
+            Some(ver) => {
+                tracing::info!("✓ Using latest VS Code version: {ver}");
+                cfg.vscode_version = ver;
+            }
+            None => tracing::warn!(
+                "Could not fetch latest VS Code version; using {}",
+                cfg.vscode_version
+            ),
+        }
     }
 
     let host = cfg.address.clone();

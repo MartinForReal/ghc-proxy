@@ -32,6 +32,9 @@ pub fn router(state: SharedState) -> Router {
         .route("/responses", post(responses))
         .route("/v1/messages", post(messages))
         .route("/v1/messages/count_tokens", post(count_tokens))
+        .route("/v1/embeddings", post(embeddings))
+        .route("/embeddings", post(embeddings))
+        .route("/usage", get(usage))
         .route("/", get(dashboard))
         .route("/requests", get(requests_page))
         .route("/api/stats", get(api_stats))
@@ -160,6 +163,9 @@ async fn chat_completions(State(state): State<SharedState>, body: Bytes) -> Resp
     if let Err(e) = state.ensure_copilot_token().await {
         return error_response(StatusCode::INTERNAL_SERVER_ERROR, e);
     }
+    if let Err(e) = state.apply_request_gate("/v1/chat/completions").await {
+        return error_response(StatusCode::TOO_MANY_REQUESTS, e);
+    }
     let mut req = match parse_body(&body) {
         Ok(v) => v,
         Err(r) => return r,
@@ -269,6 +275,9 @@ async fn responses(State(state): State<SharedState>, body: Bytes) -> Response {
     let start = Instant::now();
     if let Err(e) = state.ensure_copilot_token().await {
         return error_response(StatusCode::INTERNAL_SERVER_ERROR, e);
+    }
+    if let Err(e) = state.apply_request_gate("/v1/responses").await {
+        return error_response(StatusCode::TOO_MANY_REQUESTS, e);
     }
     let mut req = match parse_body(&body) {
         Ok(v) => v,
@@ -386,6 +395,9 @@ async fn messages(State(state): State<SharedState>, body: Bytes) -> Response {
     let start = Instant::now();
     if let Err(e) = state.ensure_copilot_token().await {
         return anthropic_error(StatusCode::INTERNAL_SERVER_ERROR, e);
+    }
+    if let Err(e) = state.apply_request_gate("/v1/messages").await {
+        return anthropic_error(StatusCode::TOO_MANY_REQUESTS, e);
     }
     let mut req = match parse_body(&body) {
         Ok(v) => v,
@@ -650,7 +662,6 @@ async fn count_tokens(State(state): State<SharedState>, body: Bytes) -> Response
         Err(_) => return Json(json!({"input_tokens": 1})).into_response(),
     };
     let model = req.get("model").and_then(|m| m.as_str()).unwrap_or("");
-    let est = crate::filters::estimate_tokens;
 
     let model_meta = {
         let models = state.models.read().await;
@@ -667,6 +678,16 @@ async fn count_tokens(State(state): State<SharedState>, body: Bytes) -> Response
     let Some(model_meta) = model_meta else {
         return Json(json!({"input_tokens": 1})).into_response();
     };
+
+    // Select the BPE tokenizer advertised by the model, falling back to
+    // `cl100k_base` when the capability is absent.
+    let tokenizer = model_meta
+        .get("capabilities")
+        .and_then(|c| c.get("tokenizer"))
+        .and_then(|t| t.as_str())
+        .unwrap_or("cl100k_base")
+        .to_string();
+    let est = |s: &str| crate::filters::count_tokens(s, &tokenizer);
 
     let mut total: u64 = 0;
     match req.get("system") {
@@ -725,15 +746,97 @@ async fn count_tokens(State(state): State<SharedState>, body: Bytes) -> Response
         .get("vendor")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    if vendor != "Anthropic" {
-        let factor = if model.starts_with("grok") {
-            1.03
-        } else {
-            1.05
-        };
-        total = ((total as f64) * factor).ceil() as u64;
-    }
+    // The BPE encoders are an approximation of each model's real tokenizer, so
+    // apply the same correction factors copilot-api uses: Claude counts run
+    // ~15% higher than cl100k/o200k, Grok ~3%, other vendors ~5%.
+    let factor = if vendor == "Anthropic" {
+        1.15
+    } else if model.starts_with("grok") {
+        1.03
+    } else {
+        1.05
+    };
+    total = ((total as f64) * factor).ceil() as u64;
     Json(json!({"input_tokens": total})).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Embeddings
+// ---------------------------------------------------------------------------
+
+async fn embeddings(State(state): State<SharedState>, body: Bytes) -> Response {
+    let start = Instant::now();
+    if let Err(e) = state.ensure_copilot_token().await {
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, e);
+    }
+    if let Err(e) = state.apply_request_gate("/v1/embeddings").await {
+        return error_response(StatusCode::TOO_MANY_REQUESTS, e);
+    }
+    let req = match parse_body(&body) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let model = req
+        .get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let req_size = body.len();
+    let headers = state.copilot_headers(false).await;
+    let url = format!("{}/embeddings", state.config.copilot_base_url());
+    let payload = serde_json::to_vec(&req).unwrap_or_default();
+
+    let resp = util::post_with_retry(&state, &url, headers, payload, "/v1/embeddings").await;
+    let Some(resp) = resp else {
+        return error_response(
+            StatusCode::GATEWAY_TIMEOUT,
+            format!(
+                "Upstream connection error after {} attempts",
+                state.config.max_connection_retries + 1
+            ),
+        );
+    };
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    let resp_size = text.len();
+    if status.is_success() {
+        let parsed: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+        let usage = parsed.get("usage").cloned().unwrap_or(json!({}));
+        state.store.add(RequestRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            timestamp: now_iso(),
+            endpoint: "/v1/embeddings".into(),
+            model,
+            translated_model: None,
+            status_code: status.as_u16(),
+            request_size: req_size,
+            response_size: resp_size,
+            input_tokens: usage
+                .get("prompt_tokens")
+                .and_then(|t| t.as_u64())
+                .unwrap_or(0),
+            output_tokens: 0,
+            duration: elapsed_secs(start),
+        });
+        Json(parsed).into_response()
+    } else {
+        log_error("/v1/embeddings", &req, &text, status.as_u16());
+        passthrough_error(status, text)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Usage / quota
+// ---------------------------------------------------------------------------
+
+async fn usage(State(state): State<SharedState>) -> Response {
+    if let Err(e) = state.ensure_copilot_token().await {
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, e);
+    }
+    match state.fetch_usage().await {
+        Ok(v) => Json(crate::state::summarize_usage(&v)).into_response(),
+        Err(e) => error_response(StatusCode::BAD_GATEWAY, e),
+    }
 }
 
 // ---------------------------------------------------------------------------

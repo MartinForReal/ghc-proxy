@@ -18,6 +18,35 @@ pub fn is_thinking_enabled_unsupported_error(status: u16, body: &str) -> bool {
     status == 400 && body.contains("thinking.type.enabled") && body.contains("adaptive")
 }
 
+/// Fetches the latest stable VS Code version from the Arch User Repository
+/// `visual-studio-code-bin` PKGBUILD, parsing the `pkgver=` line. Returns
+/// `None` on any network or parse error so callers can fall back to a
+/// configured default.
+pub async fn fetch_latest_vscode_version(client: &reqwest::Client) -> Option<String> {
+    const URL: &str =
+        "https://aur.archlinux.org/cgit/aur.git/plain/PKGBUILD?h=visual-studio-code-bin";
+    let resp = client
+        .get(URL)
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body = resp.text().await.ok()?;
+    for line in body.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("pkgver=") {
+            let ver = rest.trim().trim_matches(|c| c == '"' || c == '\'');
+            if !ver.is_empty() {
+                return Some(ver.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// Extracts orphaned tool-use ids referenced in an error message.
 pub fn extract_orphaned_ids(body: &str) -> Vec<String> {
     let mut ids: Vec<String> = Vec::new();

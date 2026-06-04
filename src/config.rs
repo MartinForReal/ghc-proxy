@@ -12,8 +12,8 @@ use std::path::PathBuf;
 /// in the README for how to refresh these values).
 pub const VSCODE_VERSION: &str = "1.115.0";
 /// Default GitHub Copilot API version header value (`X-GitHub-Api-Version`),
-/// matching the value sent by the latest Copilot Chat client.
-pub const API_VERSION: &str = "2025-05-01";
+/// matching the latest documented Copilot REST API version.
+pub const API_VERSION: &str = "2026-03-10";
 /// Default Copilot Chat plugin version string, matching the `version` field of
 /// the latest `microsoft/vscode-copilot-chat` release.
 pub const COPILOT_VERSION: &str = "0.44.0";
@@ -74,6 +74,26 @@ pub struct Config {
     /// translate Anthropic requests through the OpenAI chat completions API.
     #[serde(default)]
     pub redirect_anthropic: bool,
+    /// When true, log the GitHub and Copilot tokens whenever they are resolved
+    /// or refreshed. Useful for debugging; keep disabled in shared environments.
+    #[serde(default)]
+    pub show_token: bool,
+    /// When true, fetch the latest VS Code version at startup and use it for
+    /// the `Editor-Version` header (falling back to `vscode_version`).
+    #[serde(default)]
+    pub dynamic_vscode_version: bool,
+    /// Minimum number of seconds between successive proxied requests. `None`
+    /// disables rate limiting.
+    #[serde(default)]
+    pub rate_limit_seconds: Option<u64>,
+    /// When rate limiting is active, wait for the interval to elapse instead of
+    /// rejecting the request with HTTP 429.
+    #[serde(default)]
+    pub rate_limit_wait: bool,
+    /// When true, require interactive approval (Enter on the console) before
+    /// each proxied request is forwarded upstream.
+    #[serde(default)]
+    pub manual_approve: bool,
 }
 
 fn default_address() -> String {
@@ -114,6 +134,11 @@ impl Default for Config {
             tool_result_suffix_remove: Vec::new(),
             max_connection_retries: default_max_retries(),
             redirect_anthropic: false,
+            show_token: false,
+            dynamic_vscode_version: false,
+            rate_limit_seconds: None,
+            rate_limit_wait: false,
+            manual_approve: false,
         }
     }
 }
@@ -287,6 +312,30 @@ pub fn render_config_yaml(cfg: &Config) -> String {
         );
         let _ = writeln!(s, "redirect_anthropic: {}", cfg.redirect_anthropic);
     }
+    if cfg.show_token
+        || cfg.dynamic_vscode_version
+        || cfg.rate_limit_seconds.is_some()
+        || cfg.rate_limit_wait
+        || cfg.manual_approve
+    {
+        s.push('\n');
+        s.push_str("# Diagnostics & request controls\n");
+        if cfg.show_token {
+            let _ = writeln!(s, "show_token: {}", cfg.show_token);
+        }
+        if cfg.dynamic_vscode_version {
+            let _ = writeln!(s, "dynamic_vscode_version: {}", cfg.dynamic_vscode_version);
+        }
+        if let Some(secs) = cfg.rate_limit_seconds {
+            let _ = writeln!(s, "rate_limit_seconds: {secs}");
+        }
+        if cfg.rate_limit_wait {
+            let _ = writeln!(s, "rate_limit_wait: {}", cfg.rate_limit_wait);
+        }
+        if cfg.manual_approve {
+            let _ = writeln!(s, "manual_approve: {}", cfg.manual_approve);
+        }
+    }
     s
 }
 
@@ -419,6 +468,49 @@ pub fn load_config() -> Config {
         tracing::info!(
             "✓ Overriding redirect_anthropic from GHC_PROXY_REDIRECT_ANTHROPIC: {}",
             cfg.redirect_anthropic
+        );
+    }
+    if let Ok(val) = std::env::var("GHC_PROXY_SHOW_TOKEN") {
+        cfg.show_token = val.eq_ignore_ascii_case("true") || val == "1";
+        tracing::info!(
+            "✓ Overriding show_token from GHC_PROXY_SHOW_TOKEN: {}",
+            cfg.show_token
+        );
+    }
+    if let Ok(val) = std::env::var("GHC_PROXY_DYNAMIC_VSCODE_VERSION") {
+        cfg.dynamic_vscode_version = val.eq_ignore_ascii_case("true") || val == "1";
+        tracing::info!(
+            "✓ Overriding dynamic_vscode_version from GHC_PROXY_DYNAMIC_VSCODE_VERSION: {}",
+            cfg.dynamic_vscode_version
+        );
+    }
+    if let Ok(val) = std::env::var("GHC_PROXY_RATE_LIMIT_SECONDS") {
+        match val.parse::<u64>() {
+            Ok(secs) => {
+                cfg.rate_limit_seconds = Some(secs);
+                tracing::info!(
+                    "✓ Overriding rate_limit_seconds from GHC_PROXY_RATE_LIMIT_SECONDS: {}",
+                    secs
+                );
+            }
+            Err(_) => tracing::warn!(
+                "Invalid GHC_PROXY_RATE_LIMIT_SECONDS value '{}': expected a number",
+                val
+            ),
+        }
+    }
+    if let Ok(val) = std::env::var("GHC_PROXY_RATE_LIMIT_WAIT") {
+        cfg.rate_limit_wait = val.eq_ignore_ascii_case("true") || val == "1";
+        tracing::info!(
+            "✓ Overriding rate_limit_wait from GHC_PROXY_RATE_LIMIT_WAIT: {}",
+            cfg.rate_limit_wait
+        );
+    }
+    if let Ok(val) = std::env::var("GHC_PROXY_MANUAL_APPROVE") {
+        cfg.manual_approve = val.eq_ignore_ascii_case("true") || val == "1";
+        tracing::info!(
+            "✓ Overriding manual_approve from GHC_PROXY_MANUAL_APPROVE: {}",
+            cfg.manual_approve
         );
     }
 

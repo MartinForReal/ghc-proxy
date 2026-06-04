@@ -170,8 +170,52 @@ async fn copilot_headers_mimic_latest_client() {
     assert_eq!(h.get("X-Agent-Task-Id").unwrap(), request_id);
     assert!(!request_id.is_empty());
 
+    // Disguise headers that the genuine Copilot client sends.
+    assert_eq!(h.get("openai-organization").unwrap(), "github-copilot");
+    let machine_id = h.get("vscode-machineid").unwrap().to_str().unwrap();
+    assert_eq!(machine_id.len(), 64);
+    assert!(machine_id.chars().all(|c| c.is_ascii_hexdigit()));
+    assert!(!h.get("vscode-sessionid").unwrap().is_empty());
+
     // Vision header is only present when requested.
     assert!(h.get("Copilot-Vision-Request").is_none());
     let hv = state.copilot_headers(true).await;
     assert_eq!(hv.get("Copilot-Vision-Request").unwrap(), "true");
+}
+
+#[test]
+fn usage_summary_extracts_quota_snapshots() {
+    use serde_json::json;
+    let raw = json!({
+        "copilot_plan": "individual",
+        "quota_reset_date": "2026-07-01",
+        "quota_snapshots": {
+            "chat": {
+                "entitlement": 0,
+                "remaining": 0,
+                "percent_remaining": 100.0,
+                "unlimited": true
+            },
+            "premium_interactions": {
+                "entitlement": 300,
+                "remaining": 270,
+                "percent_remaining": 90.0,
+                "unlimited": false
+            }
+        }
+    });
+    let summary = ghc_proxy::state::summarize_usage(&raw);
+    assert_eq!(summary["plan"], "individual");
+    assert_eq!(summary["quota_reset_date"], "2026-07-01");
+    assert_eq!(summary["quotas"]["chat"]["unlimited"], true);
+    assert_eq!(
+        summary["quotas"]["premium_interactions"]["remaining"],
+        270.0
+    );
+    assert_eq!(
+        summary["quotas"]["premium_interactions"]["percent_remaining"],
+        90.0
+    );
+    // The original payload is preserved verbatim under `raw`.
+    assert_eq!(summary["raw"], raw);
 }

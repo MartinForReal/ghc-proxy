@@ -11,6 +11,38 @@ pub fn token_file_path() -> PathBuf {
     config_dir().join("github_token.txt")
 }
 
+/// Path to the persisted machine-id file inside the config directory.
+fn machine_id_path() -> PathBuf {
+    config_dir().join("machine_id.txt")
+}
+
+/// Returns a stable 64-hex-character machine id, persisted across runs to mimic
+/// the `vscode-machineid` header sent by the real Copilot client. The value is
+/// created on first use and reused thereafter.
+pub fn load_or_create_machine_id() -> String {
+    let path = machine_id_path();
+    if let Ok(contents) = std::fs::read_to_string(&path) {
+        let trimmed = contents.trim().to_string();
+        if trimmed.len() == 64 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+            return trimmed;
+        }
+    }
+    // 64 hex chars = two simple (dashless) UUIDs concatenated.
+    let id = format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    );
+    if let Err(e) = std::fs::create_dir_all(config_dir()) {
+        tracing::warn!("Failed to create config dir: {e}");
+    } else if let Err(e) = std::fs::write(&path, &id) {
+        tracing::warn!("Failed to save machine id file: {e}");
+    } else {
+        restrict_token_permissions(&path);
+    }
+    id
+}
+
 /// Reads a previously saved GitHub token from disk, if present.
 pub fn load_saved_token() -> Option<String> {
     let path = token_file_path();
@@ -33,10 +65,26 @@ pub fn save_token(token: &str) {
     }
     let path = token_file_path();
     match std::fs::write(&path, token) {
-        Ok(_) => tracing::info!("Saved GitHub token to {}", path.display()),
+        Ok(_) => {
+            restrict_token_permissions(&path);
+            tracing::info!("Saved GitHub token to {}", path.display());
+        }
         Err(e) => tracing::warn!("Failed to save token file: {e}"),
     }
 }
+
+/// Restricts the saved token file to owner read/write (`0600`) on Unix.
+/// No-op on other platforms.
+#[cfg(unix)]
+fn restrict_token_permissions(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+        tracing::warn!("Failed to set token file permissions: {e}");
+    }
+}
+
+#[cfg(not(unix))]
+fn restrict_token_permissions(_path: &std::path::Path) {}
 
 #[derive(Debug, Deserialize)]
 struct DeviceCodeResponse {
@@ -170,14 +218,20 @@ pub async fn device_flow(client: &reqwest::Client) -> Option<String> {
     None
 }
 
-/// Resolves a GitHub token from the `GITHUB_TOKEN` environment variable, the
-/// saved token file, or by running the Device Flow (saving the result).
+/// Resolves a GitHub token from an environment variable, the saved token file,
+/// or by running the Device Flow (saving the result).
+///
+/// Environment variables are checked in the same priority order used by the
+/// GitHub Copilot SDK: `COPILOT_GITHUB_TOKEN`, then `GH_TOKEN`, then
+/// `GITHUB_TOKEN`.
 pub async fn resolve_github_token(client: &reqwest::Client) -> Option<String> {
-    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
-        let token = token.trim().to_string();
-        if !token.is_empty() {
-            tracing::info!("Using GitHub token from GITHUB_TOKEN environment variable");
-            return Some(token);
+    for name in ["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"] {
+        if let Ok(token) = std::env::var(name) {
+            let token = token.trim().to_string();
+            if !token.is_empty() {
+                tracing::info!("Using GitHub token from {name} environment variable");
+                return Some(token);
+            }
         }
     }
     if let Some(token) = load_saved_token() {

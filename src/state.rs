@@ -7,7 +7,7 @@ use crate::config::Config;
 use crate::store::RequestStore;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, RwLock};
 
 /// Mutable token state guarded by a mutex.
@@ -26,6 +26,13 @@ pub struct AppState {
     pub tokens: Mutex<TokenState>,
     pub models: RwLock<Option<serde_json::Value>>,
     pub store: RequestStore,
+    /// Timestamp of the last forwarded request, used for rate limiting.
+    pub last_request: Mutex<Option<Instant>>,
+    /// Stable 64-hex machine id (`vscode-machineid` header), persisted to disk.
+    pub machine_id: String,
+    /// Per-process session id (`vscode-sessionid` header): a UUID followed by a
+    /// 13-digit millisecond timestamp, matching the real Copilot client format.
+    pub session_id: String,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -34,6 +41,14 @@ fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Current unix time in milliseconds (13 digits), used for the session id.
+fn now_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
         .unwrap_or(0)
 }
 
@@ -52,6 +67,13 @@ impl AppState {
             }),
             models: RwLock::new(None),
             store: RequestStore::new(1000),
+            last_request: Mutex::new(None),
+            machine_id: auth::load_or_create_machine_id(),
+            session_id: format!(
+                "{}{}",
+                uuid::Uuid::new_v4(),
+                now_millis()
+            ),
         }
     }
 
@@ -112,6 +134,14 @@ impl AppState {
             "OpenAI-Intent",
             HeaderValue::from_static("conversation-panel"),
         );
+        // The real Copilot client identifies its organization and installation,
+        // which helps requests look like genuine editor traffic.
+        h.insert(
+            "openai-organization",
+            HeaderValue::from_static("github-copilot"),
+        );
+        insert(&mut h, "vscode-machineid", &self.machine_id);
+        insert(&mut h, "vscode-sessionid", &self.session_id);
         insert(&mut h, "X-GitHub-Api-Version", &self.config.api_version);
         // The latest Copilot client mirrors the request intent in the
         // `X-Interaction-Type` header for non-subagent/background requests.
@@ -155,6 +185,10 @@ impl AppState {
         tracing::info!("Refreshing Copilot token...");
         let headers = self.github_headers(&github_token);
         let (token, expires_at) = auth::fetch_copilot_token(&self.http, headers).await?;
+        if self.config.show_token {
+            tracing::info!("GitHub token: {github_token}");
+            tracing::info!("Copilot token: {token}");
+        }
         let mut tokens = self.tokens.lock().await;
         tokens.copilot_token = Some(token);
         tokens.expires_at = expires_at;
@@ -217,6 +251,77 @@ impl AppState {
         }
         self.model_supports_endpoint(model, "/v1/messages").await
     }
+
+    /// Fetches the Copilot quota/usage summary for the authenticated GitHub
+    /// account via `GET /copilot_internal/user`.
+    pub async fn fetch_usage(&self) -> Result<serde_json::Value, String> {
+        let github_token = {
+            let tokens = self.tokens.lock().await;
+            tokens.github_token.clone()
+        };
+        let url = format!("{}/copilot_internal/user", crate::config::GITHUB_API);
+        let headers = self.github_headers(&github_token);
+        let resp = self
+            .http
+            .get(&url)
+            .headers(headers)
+            .send()
+            .await
+            .map_err(|e| format!("Failed to fetch usage: {e}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("Failed to fetch usage: {status} {body}"));
+        }
+        resp.json()
+            .await
+            .map_err(|e| format!("Failed to parse usage: {e}"))
+    }
+
+    /// Applies manual approval and rate limiting before a request is forwarded.
+    ///
+    /// Returns `Err(message)` when the request should be rejected (HTTP 429
+    /// because rate limiting is active and `rate_limit_wait` is disabled);
+    /// otherwise returns `Ok(())`, possibly after sleeping or waiting for
+    /// interactive approval.
+    pub async fn apply_request_gate(&self, endpoint: &str) -> Result<(), String> {
+        if self.config.manual_approve {
+            println!("\n[manual] Approve request to {endpoint}? Press Enter to continue...");
+            let mut line = String::new();
+            // Read a line from stdin without blocking the async runtime.
+            let _ = tokio::task::spawn_blocking(move || {
+                std::io::stdin().read_line(&mut line)
+            })
+            .await;
+        }
+
+        if let Some(limit) = self.config.rate_limit_seconds {
+            if limit > 0 {
+                let limit = Duration::from_secs(limit);
+                let mut last = self.last_request.lock().await;
+                if let Some(prev) = *last {
+                    let elapsed = prev.elapsed();
+                    if elapsed < limit {
+                        let remaining = limit - elapsed;
+                        if self.config.rate_limit_wait {
+                            tracing::info!(
+                                "[rate-limit] waiting {:.1}s before forwarding {endpoint}",
+                                remaining.as_secs_f64()
+                            );
+                            tokio::time::sleep(remaining).await;
+                        } else {
+                            return Err(format!(
+                                "Rate limit exceeded; retry in {:.1}s",
+                                remaining.as_secs_f64()
+                            ));
+                        }
+                    }
+                }
+                *last = Some(Instant::now());
+            }
+        }
+        Ok(())
+    }
 }
 
 fn insert(headers: &mut HeaderMap, name: &'static str, value: &str) {
@@ -226,4 +331,51 @@ fn insert(headers: &mut HeaderMap, name: &'static str, value: &str) {
     ) {
         headers.insert(n, v);
     }
+}
+
+/// Reshapes the raw `/copilot_internal/user` response into a compact usage
+/// summary: the plan, the quota reset date, and a per-category breakdown
+/// (entitlement / remaining / percent remaining / unlimited) for each entry in
+/// `quota_snapshots`. The original payload is preserved under `raw` so callers
+/// never lose information the upstream may add.
+pub fn summarize_usage(raw: &serde_json::Value) -> serde_json::Value {
+    use serde_json::json;
+
+    let mut quotas = serde_json::Map::new();
+    if let Some(snapshots) = raw.get("quota_snapshots").and_then(|s| s.as_object()) {
+        for (name, snap) in snapshots {
+            let unlimited = snap
+                .get("unlimited")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let entitlement = snap.get("entitlement").and_then(|v| v.as_f64());
+            let remaining = snap.get("remaining").and_then(|v| v.as_f64());
+            let percent_remaining = snap.get("percent_remaining").and_then(|v| v.as_f64());
+            quotas.insert(
+                name.clone(),
+                json!({
+                    "unlimited": unlimited,
+                    "entitlement": entitlement,
+                    "remaining": remaining,
+                    "percent_remaining": percent_remaining,
+                }),
+            );
+        }
+    }
+
+    let plan = raw
+        .get("copilot_plan")
+        .and_then(|p| p.as_str())
+        .map(|s| s.to_string());
+    let reset_date = raw
+        .get("quota_reset_date")
+        .and_then(|d| d.as_str())
+        .map(|s| s.to_string());
+
+    json!({
+        "plan": plan,
+        "quota_reset_date": reset_date,
+        "quotas": quotas,
+        "raw": raw,
+    })
 }
