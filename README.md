@@ -7,6 +7,8 @@ CLI, OpenAI/Anthropic SDKs, etc.) can talk to GitHub Copilot models.
 This is a Rust backend port of the
 [`ghc-tunnel`](https://www.npmjs.com/package/ghc-tunnel) Node.js project.
 
+📖 **Documentation:** <https://martinforreal.github.io/ghc-proxy/>
+
 ## Quick Start
 
 ```bash

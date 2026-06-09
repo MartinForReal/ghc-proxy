@@ -1,0 +1,9 @@
+title: ghc-proxy
+description: >-
+  Fast Rust proxy that turns GitHub Copilot into OpenAI- and Anthropic-compatible
+  API endpoints. Works with Claude Code, Codex CLI, and any OpenAI/Anthropic SDK.
+theme: jekyll-theme-cayman
+show_downloads: false
+
+# Pages are authored as plain Markdown; no plugins required so the site builds
+# on GitHub Pages' default (safe-mode) Jekyll without extra configuration.
