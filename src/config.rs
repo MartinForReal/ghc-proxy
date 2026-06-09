@@ -10,13 +10,14 @@ use std::path::PathBuf;
 /// Kept in sync with the `engines.vscode` baseline of the latest
 /// `microsoft/vscode-copilot-chat` release (see "Mimicking the Copilot client"
 /// in the README for how to refresh these values).
-pub const VSCODE_VERSION: &str = "1.115.0";
+pub const VSCODE_VERSION: &str = "1.123.0";
 /// Default GitHub Copilot API version header value (`X-GitHub-Api-Version`),
-/// matching the latest documented Copilot REST API version.
-pub const API_VERSION: &str = "2026-03-10";
+/// matching the `X-GitHub-Api-Version` constant in the Copilot Chat client
+/// source (`src/platform/networking/common/networking.ts`).
+pub const API_VERSION: &str = "2025-05-01";
 /// Default Copilot Chat plugin version string, matching the `version` field of
 /// the latest `microsoft/vscode-copilot-chat` release.
-pub const COPILOT_VERSION: &str = "0.44.0";
+pub const COPILOT_VERSION: &str = "0.48.1";
 
 /// Default model name that Claude "opus"/"sonnet" requests are mapped to.
 pub const DEFAULT_OPUS: &str = "claude-opus-4.7-1m";

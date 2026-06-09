@@ -440,6 +440,15 @@ async fn messages_direct(
         .unwrap_or(false);
     let mut headers = state.copilot_headers(vision).await;
     headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+    // Mirror the official Anthropic API pattern for unlocking the 1M-token
+    // context window. Copilot accepts this header harmlessly, so only send it
+    // for models whose catalog actually advertises the extended window.
+    if state.model_supports_1m(&translated).await {
+        headers.insert(
+            "anthropic-beta",
+            HeaderValue::from_static("context-1m-2025-08-07"),
+        );
+    }
     set_initiator(&mut headers, agent);
 
     let url = format!("{}/v1/messages", state.config.copilot_base_url());
