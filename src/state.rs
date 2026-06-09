@@ -252,6 +252,32 @@ impl AppState {
         self.model_supports_endpoint(model, "/v1/messages").await
     }
 
+    /// Whether the named model advertises an extended (>200K) context window,
+    /// i.e. the 1M-token tier unlocked by the `context-1m-2025-08-07` beta on
+    /// the Anthropic-native endpoint. Reads `max_context_window_tokens` from the
+    /// cached model catalog; returns false when the catalog is unavailable.
+    pub async fn model_supports_1m(&self, model: &str) -> bool {
+        let models = self.models.read().await;
+        let Some(models) = models.as_ref() else {
+            return false;
+        };
+        models
+            .get("data")
+            .and_then(|d| d.as_array())
+            .map(|arr| {
+                arr.iter().any(|m| {
+                    m.get("id").and_then(|i| i.as_str()) == Some(model)
+                        && m.get("capabilities")
+                            .and_then(|c| c.get("limits"))
+                            .and_then(|l| l.get("max_context_window_tokens"))
+                            .and_then(|t| t.as_u64())
+                            .map(|t| t > 200_000)
+                            .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false)
+    }
+
     /// Fetches the Copilot quota/usage summary for the authenticated GitHub
     /// account via `GET /copilot_internal/user`.
     pub async fn fetch_usage(&self) -> Result<serde_json::Value, String> {

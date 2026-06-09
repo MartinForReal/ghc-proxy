@@ -4,6 +4,8 @@ use ghc_proxy::{auth, config, server, state::AppState};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+mod setup;
+
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Parsed command-line options.
@@ -87,8 +89,10 @@ fn print_help() {
 Usage: ghc-proxy [options]
 
 Options:
-  -s, --setup             Show the setup guide and write/update the config file
-      --claudecode        Include Claude Code setup instructions (use with --setup)
+  -s, --setup             Launch the interactive setup wizard (sign in + map
+                          models); writes the config file
+      --claudecode        Configure Claude Code (~/.claude/settings.json) to use
+                          this proxy (with --setup)
   -d, --default           Reset config to defaults during setup
   -p, --port <port>       Port to listen on (default: {port})
   -a, --address <addr>    Address to listen on (default: {addr})
@@ -178,6 +182,58 @@ fn print_info(as_json: bool) {
     }
 }
 
+/// Merges `env.ANTHROPIC_BASE_URL = base_url` into the given Claude Code
+/// `settings.json` content, preserving every other setting. `existing` is the
+/// current file contents (or `None`/empty for a new file). Returns the
+/// pretty-printed JSON to write, or an error if `existing` is not a JSON object.
+fn merge_claude_settings(existing: Option<&str>, base_url: &str) -> Result<String, String> {
+    let mut root: serde_json::Value = match existing {
+        Some(contents) if !contents.trim().is_empty() => serde_json::from_str(contents)
+            .map_err(|e| format!("existing settings.json is not valid JSON: {e}"))?,
+        _ => serde_json::json!({}),
+    };
+
+    let obj = root
+        .as_object_mut()
+        .ok_or_else(|| "existing settings.json is not a JSON object".to_string())?;
+    let env = obj.entry("env").or_insert_with(|| serde_json::json!({}));
+    if !env.is_object() {
+        *env = serde_json::json!({});
+    }
+    env.as_object_mut().unwrap().insert(
+        "ANTHROPIC_BASE_URL".to_string(),
+        serde_json::Value::String(base_url.to_string()),
+    );
+
+    serde_json::to_string_pretty(&root).map_err(|e| e.to_string())
+}
+
+/// Patches Claude Code's `settings.json` so its Anthropic requests route
+/// through this proxy by setting `env.ANTHROPIC_BASE_URL`. Any existing
+/// settings are preserved (merged); the file and directory are created if
+/// missing. Returns the path that was written.
+fn configure_claude_code(
+    cfg: &ghc_proxy::config::Config,
+) -> std::io::Result<std::path::PathBuf> {
+    let dir = dirs::home_dir()
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "home directory not found")
+        })?
+        .join(".claude");
+    let path = dir.join("settings.json");
+    let base_url = format!("http://{}:{}", cfg.address, cfg.port);
+
+    // Start from the existing settings when present; refuse to clobber a file
+    // that is not valid JSON so we never destroy data.
+    let existing = std::fs::read_to_string(&path).ok();
+    let merged = merge_claude_settings(existing.as_deref(), &base_url)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(&path, merged + "\n")?;
+    Ok(path)
+}
+
 /// Prints an interactive-style setup guide after the configuration file has
 /// been written/updated. Always shown for `--setup`, even when a config file
 /// already existed.
@@ -222,10 +278,24 @@ fn print_setup_guide(cfg: &ghc_proxy::config::Config, path: &std::path::Path, cl
 
     if claudecode {
         println!("\nClaude Code:");
-        println!(
-            "  Set ANTHROPIC_BASE_URL in ~/.claude/settings.json to point at\n  http://{}:{} so Claude Code routes through this proxy.",
-            cfg.address, cfg.port
-        );
+        match configure_claude_code(cfg) {
+            Ok(p) => {
+                println!(
+                    "  Set env.ANTHROPIC_BASE_URL=http://{}:{} in:\n    {}",
+                    cfg.address,
+                    cfg.port,
+                    p.display()
+                );
+                println!("  Claude Code will now route through this proxy.");
+            }
+            Err(e) => {
+                println!("  Failed to update Claude Code settings: {e}");
+                println!(
+                    "  Manually set env.ANTHROPIC_BASE_URL in ~/.claude/settings.json\n  to http://{}:{}",
+                    cfg.address, cfg.port
+                );
+            }
+        }
     }
     println!("{bar}");
 }
@@ -326,15 +396,51 @@ async fn main() {
             cfg.account_type = account_type;
         }
 
-        match config::write_config(&cfg) {
-            Ok(path) => print_setup_guide(&cfg, &path, cli.claudecode),
-            Err(e) => eprintln!("Failed to write config: {e}"),
+        // In a terminal, walk the user through an interactive wizard; otherwise
+        // (piped/headless) fall back to writing the config non-interactively.
+        if setup::is_interactive() {
+            if let Some(outcome) = setup::run(cfg, cli.claudecode).await {
+                match config::write_config(&outcome.cfg) {
+                    Ok(path) => {
+                        print_setup_guide(&outcome.cfg, &path, outcome.configure_claude_code)
+                    }
+                    Err(e) => eprintln!("Failed to write config: {e}"),
+                }
+            }
+        } else {
+            match config::write_config(&cfg) {
+                Ok(path) => print_setup_guide(&cfg, &path, cli.claudecode),
+                Err(e) => eprintln!("Failed to write config: {e}"),
+            }
         }
         return;
     }
 
-    // Load configuration (generates a default file on first run).
-    let mut cfg = config::load_config();
+    // Load configuration (generates a default file on first run). On a genuine
+    // first run with no config file and an attached terminal, launch the
+    // interactive setup wizard instead so the user can sign in and choose
+    // model mappings before the server starts.
+    let first_run = !config::config_path().exists();
+    let mut cfg = if first_run && setup::is_interactive() {
+        match setup::run(config::Config::default(), cli.claudecode).await {
+            Some(outcome) => {
+                match config::write_config(&outcome.cfg) {
+                    Ok(path) => tracing::info!("✓ Configuration written to {}", path.display()),
+                    Err(e) => tracing::warn!("Failed to write config: {e}"),
+                }
+                if outcome.configure_claude_code {
+                    match configure_claude_code(&outcome.cfg) {
+                        Ok(p) => tracing::info!("✓ Claude Code configured at {}", p.display()),
+                        Err(e) => tracing::warn!("Failed to configure Claude Code: {e}"),
+                    }
+                }
+                outcome.cfg
+            }
+            None => config::load_config(),
+        }
+    } else {
+        config::load_config()
+    };
 
     // Apply CLI overrides (highest priority)
     if let Some(addr) = cli.address {
@@ -448,3 +554,48 @@ async fn main() {
         std::process::exit(1);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::merge_claude_settings;
+
+    #[test]
+    fn creates_env_when_file_is_new() {
+        let out = merge_claude_settings(None, "http://127.0.0.1:8314").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["env"]["ANTHROPIC_BASE_URL"], "http://127.0.0.1:8314");
+    }
+
+    #[test]
+    fn preserves_existing_settings_and_env() {
+        let existing = r#"{
+            "theme": "dark",
+            "env": { "FOO": "bar", "ANTHROPIC_BASE_URL": "http://old" }
+        }"#;
+        let out = merge_claude_settings(Some(existing), "http://127.0.0.1:9000").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        // Unrelated keys are untouched.
+        assert_eq!(v["theme"], "dark");
+        assert_eq!(v["env"]["FOO"], "bar");
+        // The base URL is overwritten with the new value.
+        assert_eq!(v["env"]["ANTHROPIC_BASE_URL"], "http://127.0.0.1:9000");
+    }
+
+    #[test]
+    fn replaces_non_object_env() {
+        let out = merge_claude_settings(Some(r#"{"env": "oops"}"#), "http://x").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["env"]["ANTHROPIC_BASE_URL"], "http://x");
+    }
+
+    #[test]
+    fn rejects_invalid_json() {
+        assert!(merge_claude_settings(Some("{not json"), "http://x").is_err());
+    }
+
+    #[test]
+    fn rejects_non_object_root() {
+        assert!(merge_claude_settings(Some("[1, 2, 3]"), "http://x").is_err());
+    }
+}
+
