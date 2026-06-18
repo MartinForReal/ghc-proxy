@@ -238,6 +238,7 @@ fn calculate_cost(model: &str, input_tokens: u64, output_tokens: u64) -> f64 {
 
 /// Checks if a request is eligible for prompt caching (system prompt is large enough).
 /// Anthropic prompt caching requires at least 1024 cache-control-eligible tokens.
+#[allow(dead_code)]
 fn is_prompt_cache_eligible(req: &Value) -> bool {
     // Check if request has a system prompt
     if let Some(system) = req.get("system") {
@@ -261,6 +262,7 @@ fn is_prompt_cache_eligible(req: &Value) -> bool {
 }
 
 /// Detect if a response used prompt caching by checking for cache tokens.
+#[allow(dead_code)]
 fn extract_prompt_cache_hit(response: &Value) -> Option<bool> {
     let usage = response.get("usage")?;
     let cache_read = usage
@@ -284,6 +286,7 @@ fn extract_prompt_cache_hit(response: &Value) -> Option<bool> {
 /// Filter tools to keep only the top N by usage frequency.
 /// Reduces request size by removing rarely-used tools.
 /// For initial deployment, requires 3+ tools to filter (keep all if <3).
+#[allow(dead_code)]
 fn filter_tools_by_frequency(tools: &Value, _frequency_threshold: f64, max_tools: usize) -> Value {
     let tools_arr = match tools.as_array() {
         Some(arr) => arr,
@@ -1835,18 +1838,18 @@ async fn api_audit_summary(State(state): State<SharedState>) -> Response {
 
     // Sort tools by usage
     let mut tools_sorted: Vec<_> = tool_usage.into_iter().collect();
-    tools_sorted.sort_by(|a, b| b.1.cmp(&a.1));
+    tools_sorted.sort_by_key(|b| std::cmp::Reverse(b.1));
     let top_tools: Vec<_> = tools_sorted.into_iter().take(20).collect();
 
     // Sort stop reasons by count
     let mut stop_reasons_sorted: Vec<_> = stop_reason_counts.into_iter().collect();
-    stop_reasons_sorted.sort_by(|a, b| b.1.cmp(&a.1));
+    stop_reasons_sorted.sort_by_key(|b| std::cmp::Reverse(b.1));
 
     Json(json!({
         "total_requests": records.len(),
         "agent_initiated": agent_count,
         "total_cost_usd": (total_cost * 100.0).round() / 100.0,
-        "avg_cost_usd": if records.len() > 0 { (total_cost / records.len() as f64 * 100.0).round() / 100.0 } else { 0.0 },
+        "avg_cost_usd": if !records.is_empty() { (total_cost / records.len() as f64 * 100.0).round() / 100.0 } else { 0.0 },
         "top_tools": top_tools,
         "stop_reasons": stop_reasons_sorted,
         "cache_hits": cache_hit_count,

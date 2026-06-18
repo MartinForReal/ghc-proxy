@@ -27,9 +27,14 @@ authentication to GitHub Copilot is handled internally.
 | `GET /v1/models/full/` | Raw upstream model catalog with capabilities |
 | `GET /usage` | Copilot plan and quota usage |
 | `GET /` | Web analytics dashboard |
+| `GET /metrics/dashboard` | Metrics dashboard UI |
+| `GET /metrics` | OpenMetrics exposition endpoint |
 | `GET /requests` | Request browser |
 | `GET /api/stats` | Dashboard statistics (JSON) |
 | `GET /api/requests` | Recent requests (JSON) |
+| `GET /api/audit` | Filtered audit records |
+| `GET /api/audit/summary` | Aggregated audit summary |
+| `POST /api/config/reload` | Reload `config.yaml` without restart |
 
 Streaming (SSE) is supported on the chat, responses, and messages endpoints by
 setting `"stream": true` in the request body.
@@ -100,9 +105,13 @@ window (those advertising `max_context_window_tokens` greater than 200,000).
   `anthropic-beta: context-1m-2025-08-07` header for models whose catalog
   advertises an extended context window.
 - **Retry with backoff** — upstream connection errors are retried with
-  exponential backoff (`max_connection_retries`).
+  exponential backoff; retryable upstream HTTP errors are also retried
+  (`max_connection_retries`).
 - **Orphaned tool-result recovery** — when the upstream rejects a request for an
   orphaned `tool_use_id`, the proxy retries with the offending tool results
   stripped.
+- **Adaptive-thinking migration** — when an upstream model rejects
+  `thinking.type = "enabled"`, the proxy automatically retries using the
+  adaptive format.
 - **Content filtering** — system-prompt add/remove and tool-result suffix
   removal are applied per your configuration.

@@ -680,11 +680,9 @@ pub fn sanitize_anthropic_request(req: &Value) -> Value {
     }
     if let Some(messages) = out.get_mut("messages").and_then(|m| m.as_array_mut()) {
         for msg in messages.iter_mut() {
-            if let Some(content) = msg.get_mut("content") {
-                if let Value::String(s) = content {
-                    if s.trim().is_empty() {
-                        *s = String::new();
-                    }
+            if let Some(Value::String(s)) = msg.get_mut("content") {
+                if s.trim().is_empty() {
+                    *s = String::new();
                 }
             }
             if let Some(content) = msg.get_mut("content").and_then(|c| c.as_array_mut()) {

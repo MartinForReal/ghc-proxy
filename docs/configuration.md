@@ -20,6 +20,9 @@ Located at `~/.ghc-tunnel/config.yaml` (`%APPDATA%\ghc-tunnel\config.yaml` on
 Windows). Generated on first run, with `--config`, or through the setup wizard.
 
 ```yaml
+# Schema version for migration/write-back behavior
+config_version: 2
+
 # Server settings
 address: 127.0.0.1
 port: 8314
@@ -32,6 +35,9 @@ account_type: individual
 vscode_version: "1.123.0"
 api_version: "2025-05-01"
 copilot_version: "0.48.1"
+
+# Self-update behavior
+auto_upgrade: false
 
 # Model name mappings: exact (full match) and prefix (starts-with)
 model_mappings:
@@ -97,6 +103,9 @@ ghc-proxy [options]
       --manual              Require interactive approval before each request
       --fetch-version       Fetch the latest VS Code version at startup
       --no-fetch-version    Disable dynamic VS Code version fetching
+      --auto-upgrade        Auto-upgrade app when a newer release is available
+      --no-auto-upgrade     Disable app auto-upgrade
+      --update-config       Persist migrated config/default additions back to config.yaml
   -v, --version             Show version
   -h, --help                Show help
 ```
@@ -118,6 +127,7 @@ Every config field has a `GHC_PROXY_*` override:
 | `GHC_PROXY_REDIRECT_ANTHROPIC` | Always translate Anthropic via chat completions |
 | `GHC_PROXY_SHOW_TOKEN` | Log tokens on refresh (`true`/`1`) |
 | `GHC_PROXY_DYNAMIC_VSCODE_VERSION` | Fetch latest VS Code version (`true`/`1`) |
+| `GHC_PROXY_AUTO_UPGRADE` | Auto-upgrade app on startup (`true`/`1`) |
 | `GHC_PROXY_RATE_LIMIT_SECONDS` | Minimum seconds between requests |
 | `GHC_PROXY_RATE_LIMIT_WAIT` | Wait instead of rejecting when limited (`true`/`1`) |
 | `GHC_PROXY_MANUAL_APPROVE` | Require manual approval per request (`true`/`1`) |

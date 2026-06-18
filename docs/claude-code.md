@@ -23,8 +23,8 @@ Run the setup wizard with the Claude Code step enabled:
 This patches `~/.claude/settings.json`, merging both `env.ANTHROPIC_BASE_URL`
 and `env.ANTHROPIC_API_KEY` so Claude Code routes its Anthropic API calls
 through the proxy. Existing settings are preserved — the base URL is updated,
-an API key is added only when missing/empty, and the file is left untouched if
-it is not valid JSON.
+an API key is added only when missing, and the file is left untouched if it is
+not valid JSON.
 
 ### Manual setup
 

@@ -63,8 +63,22 @@ ghc-proxy [options]
   -d, --default           Reset config to defaults during setup
   -p, --port <port>       Port to listen on (default: 8314)
   -a, --address <addr>    Address to listen on (default: 127.0.0.1)
+      --debug / --no-debug  Toggle debug mode
       --account-type <t>  Account tier: individual | business | enterprise
   -c, --config            Generate the default config file (non-interactive)
+      auth                Authenticate with GitHub and exit (CI/headless)
+      check-usage         Print Copilot quota/usage and exit
+      info                Print diagnostics (version, paths, token) and exit
+      --json              Emit machine-readable JSON (with info)
+      --show-token        Log GitHub and Copilot tokens on refresh
+      --rate-limit <secs> Minimum seconds between forwarded requests
+      --wait              When rate limited, wait instead of returning HTTP 429
+      --manual            Require interactive approval before each request
+      --fetch-version     Fetch the latest VS Code version at startup
+      --no-fetch-version  Disable dynamic VS Code version fetching
+      --auto-upgrade      Auto-upgrade app when a newer release is available
+      --no-auto-upgrade   Disable app auto-upgrade
+      --update-config     Persist migrated config/default additions back to config.yaml
   -v, --version           Show version
   -h, --help              Show help
 ```
@@ -105,19 +119,22 @@ Config file: `~/.ghc-tunnel/config.yaml` (`%APPDATA%/ghc-tunnel/config.yaml`
 on Windows). It is generated on first run or with `--config`.
 
 ```yaml
+config_version: 2
 address: 127.0.0.1
 port: 8314
 debug: false
 account_type: individual            # individual | business | enterprise
 vscode_version: "1.123.0"
 api_version: "2025-05-01"
-copilot_version: "0.44.0"
+copilot_version: "0.48.1"
+auto_upgrade: false
 model_mappings:
   exact:
-    opus: claude-opus-4.7-1m
+    opus: claude-opus-4.8
+    sonnet: claude-opus-4.8
     haiku: claude-haiku-4.5
   prefix:
-    claude-sonnet-4-: claude-opus-4.7-1m
+    claude-sonnet-4-: claude-opus-4.8
 system_prompt_remove: []
 system_prompt_add: []
 tool_result_suffix_remove: []
@@ -134,7 +151,10 @@ max_connection_retries: 3
 | `POST /v1/messages` | Anthropic messages API |
 | `POST /v1/messages/count_tokens` | Anthropic token counting |
 | `GET /` | Web dashboard |
+| `GET /metrics/dashboard` | Metrics dashboard UI |
+| `GET /metrics` | OpenMetrics endpoint |
 | `GET /requests` | Request browser |
+| `POST /api/config/reload` | Reload config.yaml without restart |
 | `GET /api/models` | All supported models (used by the dashboard) |
 
 ## Example Usage
@@ -225,9 +245,8 @@ extension and the VS Code Marketplace:
 | `vscode_version` | latest VS Code stable release (`https://update.code.visualstudio.com/api/releases/stable`) |
 | `api_version` | `X-GitHub-Api-Version` constant in `src/platform/networking/common/networking.ts` |
 
-After updating the constants in `src/config.rs`, run the test suite (the header
-test in `tests/integration.rs` guards the expected header set) and bump the
-example values in this README.
+After updating the constants in `src/config.rs`, run the test suite and bump
+the example values in this README.
 
 ## Notes on Parity with `ghc-tunnel`
 
@@ -241,9 +260,10 @@ catalog, model-mapping configuration) and writes/updates the config file; in
 headless or piped contexts it instead re-renders the config non-interactively,
 applying any CLI overrides or resetting to defaults with `--default`.
 `--claudecode` patches `~/.claude/settings.json`, merging
-`env.ANTHROPIC_BASE_URL` so Claude Code routes through this proxy (existing
-settings are preserved). The dashboard lists all supported models alongside the
-request statistics.
+`env.ANTHROPIC_BASE_URL` and ensuring `env.ANTHROPIC_API_KEY` exists so Claude
+Code routes through this proxy (existing settings are preserved, and an
+existing API key is left untouched). The dashboard lists all supported models
+alongside the request statistics.
 
 ## License
 

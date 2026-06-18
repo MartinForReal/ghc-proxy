@@ -42,6 +42,9 @@ Once running, the proxy prints the endpoints it serves:
 ```text
 Starting GitHub Copilot API Proxy on 127.0.0.1:8314
 Dashboard:      http://127.0.0.1:8314/
+Metrics UI:     http://127.0.0.1:8314/metrics/dashboard
+OpenMetrics:    http://127.0.0.1:8314/metrics
+Reload config:  POST http://127.0.0.1:8314/api/config/reload
 OpenAI API:     http://127.0.0.1:8314/v1/chat/completions
 Responses API:  http://127.0.0.1:8314/v1/responses
 Anthropic API:  http://127.0.0.1:8314/v1/messages
@@ -83,7 +86,8 @@ It walks through:
    `opus` / `sonnet` / `haiku` aliases to specific models, or keep the
    recommended defaults.
 4. **Claude Code** — optionally configure `~/.claude/settings.json` to route
-   through the proxy.
+   through the proxy (`ANTHROPIC_BASE_URL` and `ANTHROPIC_API_KEY`; existing
+   API key values are preserved).
 
 Pass `--default` to start from built-in defaults, or `--claudecode` to include
 the Claude Code step automatically. The wizard only runs when attached to a
