@@ -30,6 +30,8 @@ struct Cli {
     wait: bool,
     manual: bool,
     fetch_version: Option<bool>,
+    update_config: bool,
+    auto_upgrade: Option<bool>,
 }
 
 fn parse_args() -> Cli {
@@ -52,6 +54,9 @@ fn parse_args() -> Cli {
             "--manual" => cli.manual = true,
             "--fetch-version" => cli.fetch_version = Some(true),
             "--no-fetch-version" => cli.fetch_version = Some(false),
+            "--update-config" => cli.update_config = true,
+            "--auto-upgrade" => cli.auto_upgrade = Some(true),
+            "--no-auto-upgrade" => cli.auto_upgrade = Some(false),
             "--rate-limit" => {
                 if let Some(v) = args.next() {
                     cli.rate_limit = v.parse().ok();
@@ -110,6 +115,9 @@ Options:
       --manual            Require interactive approval before each request
       --fetch-version     Fetch the latest VS Code version at startup
       --no-fetch-version  Disable dynamic VS Code version fetching
+            --auto-upgrade      Auto-upgrade app when a newer release is available
+            --no-auto-upgrade   Disable app auto-upgrade
+            --update-config     Persist migrated config/default additions back to config.yaml
   -v, --version           Show version
   -h, --help              Show this help
 
@@ -125,6 +133,7 @@ Environment Variables:
   GHC_PROXY_REDIRECT_ANTHROPIC      Redirect Anthropic requests (true/1)
   GHC_PROXY_SHOW_TOKEN              Log tokens on refresh (true/1)
   GHC_PROXY_DYNAMIC_VSCODE_VERSION  Fetch latest VS Code version (true/1)
+    GHC_PROXY_AUTO_UPGRADE            Auto-upgrade app on startup (true/1)
   GHC_PROXY_RATE_LIMIT_SECONDS      Minimum seconds between requests
   GHC_PROXY_RATE_LIMIT_WAIT         Wait instead of rejecting when limited (true/1)
   GHC_PROXY_MANUAL_APPROVE          Require manual approval per request (true/1)
@@ -300,6 +309,42 @@ fn print_setup_guide(cfg: &ghc_proxy::config::Config, path: &std::path::Path, cl
     println!("{bar}");
 }
 
+fn maybe_auto_upgrade(enabled: bool) {
+    if !enabled {
+        return;
+    }
+
+    tracing::info!("Checking for ghc-proxy updates...");
+    let updater = match self_update::backends::github::Update::configure()
+        .repo_owner("MartinForReal")
+        .repo_name("ghc-proxy")
+        .bin_name("ghc-proxy")
+        .show_download_progress(true)
+        .current_version(VERSION)
+        .build()
+    {
+        Ok(u) => u,
+        Err(e) => {
+            tracing::warn!("Auto-upgrade setup failed: {e}");
+            return;
+        }
+    };
+
+    match updater.update() {
+        Ok(status) => {
+            let new_version = status.version();
+            if new_version != VERSION {
+                tracing::info!(
+                    "ghc-proxy updated from {VERSION} to {new_version}. Restart to use the new binary."
+                );
+            } else {
+                tracing::info!("ghc-proxy is already up to date ({VERSION}).");
+            }
+        }
+        Err(e) => tracing::warn!("Auto-upgrade check/update failed: {e}"),
+    }
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -353,7 +398,7 @@ async fn main() {
         return;
     }
     if cli.check_usage {
-        let mut cfg = config::load_config();
+        let mut cfg = config::load_config_with_options(cli.update_config);
         cfg.show_token = cfg.show_token || cli.show_token;
         let client = reqwest::Client::new();
         let Some(github_token) = auth::resolve_github_token(&client).await else {
@@ -421,6 +466,7 @@ async fn main() {
     // interactive setup wizard instead so the user can sign in and choose
     // model mappings before the server starts.
     let first_run = !config::config_path().exists();
+    let write_back_on_migration = cli.update_config;
     let mut cfg = if first_run && setup::is_interactive() {
         match setup::run(config::Config::default(), cli.claudecode).await {
             Some(outcome) => {
@@ -436,10 +482,10 @@ async fn main() {
                 }
                 outcome.cfg
             }
-            None => config::load_config(),
+            None => config::load_config_with_options(write_back_on_migration),
         }
     } else {
-        config::load_config()
+        config::load_config_with_options(write_back_on_migration)
     };
 
     // Apply CLI overrides (highest priority)
@@ -471,9 +517,15 @@ async fn main() {
     if cli.manual {
         cfg.manual_approve = true;
     }
+    if let Some(auto_upgrade) = cli.auto_upgrade {
+        cfg.auto_upgrade = auto_upgrade;
+    }
     if let Some(fetch) = cli.fetch_version {
         cfg.dynamic_vscode_version = fetch;
     }
+
+    // Optionally self-update from GitHub releases before serving traffic.
+    maybe_auto_upgrade(cfg.auto_upgrade);
 
     // Optionally refresh the VS Code version used in upstream headers.
     if cfg.dynamic_vscode_version {
@@ -526,6 +578,20 @@ async fn main() {
         tracing::warn!("{e}");
     }
 
+    // Keep model catalog fresh without restart.
+    {
+        let state = app_state.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30 * 60));
+            loop {
+                interval.tick().await;
+                if let Err(e) = state.load_models().await {
+                    tracing::warn!("Periodic model refresh failed: {e}");
+                }
+            }
+        });
+    }
+
     let app = server::router(app_state.clone());
 
     let addr: SocketAddr = match format!("{host}:{port}").parse() {
@@ -538,6 +604,9 @@ async fn main() {
 
     println!("\nStarting GitHub Copilot API Proxy on {host}:{port}");
     println!("Dashboard:      http://{host}:{port}/");
+    println!("Metrics UI:     http://{host}:{port}/metrics/dashboard");
+    println!("OpenMetrics:    http://{host}:{port}/metrics");
+    println!("Reload config:  POST http://{host}:{port}/api/config/reload");
     println!("OpenAI API:     http://{host}:{port}/v1/chat/completions");
     println!("Responses API:  http://{host}:{port}/v1/responses");
     println!("Anthropic API:  http://{host}:{port}/v1/messages");

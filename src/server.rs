@@ -17,7 +17,7 @@ use axum::{
 };
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Builds the application router with all routes mounted.
 pub fn router(state: SharedState) -> Router {
@@ -35,10 +35,15 @@ pub fn router(state: SharedState) -> Router {
         .route("/v1/embeddings", post(embeddings))
         .route("/embeddings", post(embeddings))
         .route("/usage", get(usage))
+        .route("/metrics", get(metrics_openmetrics))
         .route("/", get(dashboard))
         .route("/requests", get(requests_page))
+        .route("/metrics/dashboard", get(metrics_page))
         .route("/api/stats", get(api_stats))
         .route("/api/requests", get(api_requests))
+        .route("/api/audit", get(api_audit))
+        .route("/api/audit/summary", get(api_audit_summary))
+        .route("/api/config/reload", post(api_reload_config))
         .route("/api/models", get(get_models))
         .fallback(not_found)
         .layer(DefaultBodyLimit::max(20 * 1024 * 1024 * 1024)) // 20 GB limit
@@ -98,6 +103,38 @@ fn log_error(endpoint: &str, request: &Value, response: &str, status: u16) {
     }
 }
 
+/// Logs the body of a request forwarded upstream to the tracing log when debug
+/// mode is enabled in the configuration.
+fn log_debug_request(state: &SharedState, endpoint: &str, body: &Value) {
+    if state.is_debug() {
+        tracing::info!(
+            "[debug] {endpoint} request body: {}",
+            serde_json::to_string(body).unwrap_or_default()
+        );
+    }
+}
+
+/// Logs the body of an upstream response to the tracing log when debug mode is
+/// enabled in the configuration.
+fn log_debug_response(state: &SharedState, endpoint: &str, body: &str) {
+    if state.is_debug() {
+        tracing::info!("[debug] {endpoint} response body: {body}");
+    }
+}
+
+/// Captures a JSON body for the dashboard store when debug mode is enabled,
+/// otherwise returns `None` to avoid retaining large payloads in memory.
+fn capture_json(state: &SharedState, body: &Value) -> Option<String> {
+    state
+        .is_debug()
+        .then(|| serde_json::to_string(body).unwrap_or_default())
+}
+
+/// Captures a string body for the dashboard store when debug mode is enabled.
+fn capture_str(state: &SharedState, body: &str) -> Option<String> {
+    state.is_debug().then(|| body.to_string())
+}
+
 #[allow(clippy::result_large_err)]
 fn parse_body(body: &Bytes) -> Result<Value, Response> {
     serde_json::from_slice::<Value>(body).map_err(|e| {
@@ -114,6 +151,157 @@ fn error_response(status: StatusCode, msg: String) -> Response {
 }
 
 // ---------------------------------------------------------------------------
+// Audit extraction helpers (Phase 1: Foundation for analytics)
+// ---------------------------------------------------------------------------
+
+/// Extract tool information from a request body.
+fn extract_tools_from_request(body: &Value) -> (usize, Vec<String>) {
+    let tools = match body.get("tools").and_then(|t| t.as_array()) {
+        Some(t) => t,
+        None => {
+            return (0, Vec::new());
+        }
+    };
+    
+    let names: Vec<String> = tools
+        .iter()
+        .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(String::from))
+        .collect();
+    
+    (tools.len(), names)
+}
+
+/// Extract message count from a request body (conversation turn count).
+fn extract_message_count(body: &Value) -> usize {
+    body.get("messages")
+        .and_then(|m| m.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0)
+}
+
+/// Extract stop reason from SSE response body (may contain multiple events).
+fn extract_stop_reason_from_sse(body: &str) -> Option<String> {
+    for line in body.lines() {
+        if let Some(data) = line.strip_prefix("data: ") {
+            if let Ok(event) = serde_json::from_str::<Value>(data) {
+                if let Some(sr) = event
+                    .get("delta")
+                    .and_then(|d| d.get("stop_reason"))
+                    .and_then(|s| s.as_str())
+                {
+                    return Some(sr.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Extract tool calls from SSE response (streaming events).
+fn extract_tools_called_from_sse(body: &str) -> Vec<String> {
+    let mut tools = Vec::new();
+    
+    for line in body.lines() {
+        if let Some(data) = line.strip_prefix("data: ") {
+            if let Ok(event) = serde_json::from_str::<Value>(data) {
+                // Check for tool_use in content_block
+                if let Some(block) = event.get("content_block") {
+                    if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
+                        if let Some(name) = block.get("name").and_then(|n| n.as_str()) {
+                            if !tools.contains(&name.to_string()) {
+                                tools.push(name.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    tools
+}
+
+/// Calculate estimated cost in USD based on token counts and model.
+/// Uses simplified rates: Claude $0.003/$0.015 (input/output), GPT-4 $0.03/$0.06, etc.
+fn calculate_cost(model: &str, input_tokens: u64, output_tokens: u64) -> f64 {
+    let (input_rate, output_rate) = match model {
+        m if m.contains("opus-4") => (0.015, 0.075),      // claude-opus
+        m if m.contains("sonnet") => (0.003, 0.015),      // claude-sonnet
+        m if m.contains("haiku") => (0.0008, 0.004),      // claude-haiku
+        m if m.contains("gpt-4") => (0.03, 0.06),         // gpt-4
+        m if m.contains("gpt-4o") => (0.005, 0.015),      // gpt-4o
+        _ => (0.0005, 0.0015),                             // fallback
+    };
+    
+    (input_tokens as f64 * input_rate + output_tokens as f64 * output_rate) / 1000.0
+}
+
+/// Checks if a request is eligible for prompt caching (system prompt is large enough).
+/// Anthropic prompt caching requires at least 1024 cache-control-eligible tokens.
+fn is_prompt_cache_eligible(req: &Value) -> bool {
+    // Check if request has a system prompt
+    if let Some(system) = req.get("system") {
+        let system_size = match system {
+            Value::String(s) => s.len() / 4, // Rough estimate: ~4 chars per token
+            Value::Array(blocks) => {
+                blocks.iter()
+                    .map(|b| {
+                        b.get("text")
+                            .and_then(|t| t.as_str())
+                            .map(|s| s.len() / 4)
+                            .unwrap_or(0)
+                    })
+                    .sum()
+            }
+            _ => 0,
+        };
+        system_size > 1024
+    } else {
+        false
+    }
+}
+
+/// Detect if a response used prompt caching by checking for cache tokens.
+fn extract_prompt_cache_hit(response: &Value) -> Option<bool> {
+    let usage = response.get("usage")?;
+    let cache_read = usage.get("cache_read_input_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+    let cache_creation = usage.get("cache_creation_input_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+    
+    if cache_read > 0 {
+        Some(true)  // Cache hit (reading from cache)
+    } else if cache_creation > 0 {
+        Some(false) // Cache write (creating new cache)
+    } else {
+        None        // No caching
+    }
+}
+
+/// Filter tools to keep only the top N by usage frequency.
+/// Reduces request size by removing rarely-used tools.
+/// For initial deployment, requires 3+ tools to filter (keep all if <3).
+fn filter_tools_by_frequency(tools: &Value, _frequency_threshold: f64, max_tools: usize) -> Value {
+    let tools_arr = match tools.as_array() {
+        Some(arr) => arr,
+        None => return tools.clone(),
+    };
+    
+    // Need at least 3 tools to make filtering worthwhile
+    if tools_arr.len() < 3 {
+        return tools.clone();
+    }
+    
+    // For Phase 2, we'll keep a configured number of tools
+    // In production, this would be based on actual usage frequency from audit data
+    // For now: keep top 20 tools (or all if fewer)
+    if tools_arr.len() <= max_tools {
+        return tools.clone();
+    }
+    
+    // Filter to top max_tools
+    Value::Array(tools_arr.iter().take(max_tools).cloned().collect())
+}
+
+// ---------------------------------------------------------------------------
 // Models
 // ---------------------------------------------------------------------------
 
@@ -121,8 +309,8 @@ async fn get_models(State(state): State<SharedState>) -> Response {
     if let Err(e) = state.ensure_copilot_token().await {
         return error_response(StatusCode::INTERNAL_SERVER_ERROR, e);
     }
-    if state.models.read().await.is_none() {
-        let _ = state.load_models().await;
+    if let Err(e) = state.ensure_models_fresh(Duration::from_secs(30 * 60)).await {
+        tracing::warn!("model refresh failed: {e}");
     }
     let models = state.models.read().await;
     let data: Vec<Value> = models
@@ -150,6 +338,9 @@ async fn get_models(State(state): State<SharedState>) -> Response {
 }
 
 async fn get_models_full(State(state): State<SharedState>) -> Response {
+    if let Err(e) = state.ensure_models_fresh(Duration::from_secs(30 * 60)).await {
+        tracing::warn!("model refresh failed: {e}");
+    }
     let models = state.models.read().await;
     Json(models.clone().unwrap_or(Value::Null)).into_response()
 }
@@ -175,7 +366,7 @@ async fn chat_completions(State(state): State<SharedState>, body: Bytes) -> Resp
         .and_then(|m| m.as_str())
         .unwrap_or("unknown")
         .to_string();
-    let translated = translate::translate(&state.config.model_mappings, &original_model);
+    let translated = translate::translate(&state.model_mappings(), &original_model);
     if translated != original_model {
         req["model"] = Value::String(translated.clone());
     }
@@ -206,9 +397,10 @@ async fn chat_completions(State(state): State<SharedState>, body: Bytes) -> Resp
     set_initiator(&mut headers, agent);
 
     let req_size = body.len();
-    let url = format!("{}/chat/completions", state.config.copilot_base_url());
+    let url = format!("{}/chat/completions", state.copilot_base_url());
     let is_stream = req.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
     let payload = serde_json::to_vec(&req).unwrap_or_default();
+    log_debug_request(&state, "/v1/chat/completions", &req);
 
     if is_stream {
         return stream_openai(
@@ -231,16 +423,26 @@ async fn chat_completions(State(state): State<SharedState>, body: Bytes) -> Resp
             StatusCode::GATEWAY_TIMEOUT,
             format!(
                 "Upstream connection error after {} attempts",
-                state.config.max_connection_retries + 1
+                state.max_connection_retries() + 1
             ),
         );
     };
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
     let resp_size = text.len();
+    log_debug_response(&state, "/v1/chat/completions", &text);
     if status.is_success() {
         let parsed: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
         let usage = parsed.get("usage").cloned().unwrap_or(json!({}));
+        let input_tokens = usage
+            .get("prompt_tokens")
+            .and_then(|t| t.as_u64())
+            .unwrap_or(0);
+        let output_tokens = usage
+            .get("completion_tokens")
+            .and_then(|t| t.as_u64())
+            .unwrap_or(0);
+        let (tool_count, tool_names) = extract_tools_from_request(&req);
         state.store.add(RequestRecord {
             id: uuid::Uuid::new_v4().to_string(),
             timestamp: now_iso(),
@@ -250,15 +452,19 @@ async fn chat_completions(State(state): State<SharedState>, body: Bytes) -> Resp
             status_code: status.as_u16(),
             request_size: req_size,
             response_size: resp_size,
-            input_tokens: usage
-                .get("prompt_tokens")
-                .and_then(|t| t.as_u64())
-                .unwrap_or(0),
-            output_tokens: usage
-                .get("completion_tokens")
-                .and_then(|t| t.as_u64())
-                .unwrap_or(0),
+            input_tokens,
+            output_tokens,
             duration: elapsed_secs(start),
+            request_body: capture_json(&state, &req),
+            response_body: capture_str(&state, &text),
+            message_count: Some(extract_message_count(&req)),
+            tool_count: (tool_count > 0).then_some(tool_count),
+            tool_names: (tool_count > 0).then_some(tool_names),
+            stop_reason: None, // OpenAI responses don't have stop_reason in JSON
+            tools_called: None,
+            is_agent_initiated: Some(agent),
+            prompt_cache_hit: None,
+            estimated_cost_usd: Some(calculate_cost(&original_model, input_tokens, output_tokens)),
         });
         Json(parsed).into_response()
     } else {
@@ -288,7 +494,7 @@ async fn responses(State(state): State<SharedState>, body: Bytes) -> Response {
         .and_then(|m| m.as_str())
         .unwrap_or("unknown")
         .to_string();
-    let translated = translate::translate(&state.config.model_mappings, &original_model);
+    let translated = translate::translate(&state.model_mappings(), &original_model);
     if translated != original_model {
         req["model"] = Value::String(translated.clone());
     }
@@ -326,9 +532,10 @@ async fn responses(State(state): State<SharedState>, body: Bytes) -> Response {
     set_initiator(&mut headers, agent);
 
     let req_size = body.len();
-    let url = format!("{}/responses", state.config.copilot_base_url());
+    let url = format!("{}/responses", state.copilot_base_url());
     let is_stream = req.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
     let payload = serde_json::to_vec(&req).unwrap_or_default();
+    log_debug_request(&state, "/v1/responses", &req);
 
     if is_stream {
         return stream_responses(
@@ -351,16 +558,26 @@ async fn responses(State(state): State<SharedState>, body: Bytes) -> Response {
             StatusCode::GATEWAY_TIMEOUT,
             format!(
                 "Upstream connection error after {} attempts",
-                state.config.max_connection_retries + 1
+                state.max_connection_retries() + 1
             ),
         );
     };
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
     let resp_size = text.len();
+    log_debug_response(&state, "/v1/responses", &text);
     if status.is_success() {
         let parsed: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
         let usage = parsed.get("usage").cloned().unwrap_or(json!({}));
+        let input_tokens = usage
+            .get("input_tokens")
+            .and_then(|t| t.as_u64())
+            .unwrap_or(0);
+        let output_tokens = usage
+            .get("output_tokens")
+            .and_then(|t| t.as_u64())
+            .unwrap_or(0);
+        let (tool_count, tool_names) = extract_tools_from_request(&req);
         state.store.add(RequestRecord {
             id: uuid::Uuid::new_v4().to_string(),
             timestamp: now_iso(),
@@ -370,15 +587,19 @@ async fn responses(State(state): State<SharedState>, body: Bytes) -> Response {
             status_code: status.as_u16(),
             request_size: req_size,
             response_size: resp_size,
-            input_tokens: usage
-                .get("input_tokens")
-                .and_then(|t| t.as_u64())
-                .unwrap_or(0),
-            output_tokens: usage
-                .get("output_tokens")
-                .and_then(|t| t.as_u64())
-                .unwrap_or(0),
+            input_tokens,
+            output_tokens,
             duration: elapsed_secs(start),
+            request_body: capture_json(&state, &req),
+            response_body: capture_str(&state, &text),
+            message_count: None, // /responses uses "input" not "messages"
+            tool_count: (tool_count > 0).then_some(tool_count),
+            tool_names: (tool_count > 0).then_some(tool_names),
+            stop_reason: None,
+            tools_called: None,
+            is_agent_initiated: Some(agent),
+            prompt_cache_hit: None,
+            estimated_cost_usd: Some(calculate_cost(&original_model, input_tokens, output_tokens)),
         });
         Json(parsed).into_response()
     } else {
@@ -408,12 +629,13 @@ async fn messages(State(state): State<SharedState>, body: Bytes) -> Response {
         .and_then(|m| m.as_str())
         .unwrap_or("unknown")
         .to_string();
-    let translated = translate::translate(&state.config.model_mappings, &original_model);
+    let translated = translate::translate(&state.model_mappings(), &original_model);
     if translated != original_model {
         req["model"] = Value::String(translated.clone());
     }
-    req = anthropic::apply_system_prompt(&req, &state.config);
-    req = anthropic::apply_tool_result_suffix(&req, &state.config);
+    let cfg = state.config_snapshot();
+    req = anthropic::apply_system_prompt(&req, &cfg);
+    req = anthropic::apply_tool_result_suffix(&req, &cfg);
 
     if state.use_direct_anthropic(&translated).await {
         messages_direct(state, req, original_model, translated, start).await
@@ -451,7 +673,7 @@ async fn messages_direct(
     }
     set_initiator(&mut headers, agent);
 
-    let url = format!("{}/v1/messages", state.config.copilot_base_url());
+    let url = format!("{}/v1/messages", state.copilot_base_url());
     let is_stream = req.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
 
     let mut current = req.clone();
@@ -461,6 +683,7 @@ async fn messages_direct(
         sanitized = anthropic::adjust_thinking_budget(&sanitized);
         let req_size = serde_json::to_vec(&current).map(|v| v.len()).unwrap_or(0);
         let payload = serde_json::to_vec(&sanitized).unwrap_or_default();
+        log_debug_request(&state, "/v1/messages", &sanitized);
 
         if is_stream {
             let upstream = state
@@ -479,6 +702,7 @@ async fn messages_direct(
             // adaptive-thinking migration before committing to the SSE stream.
             if status == StatusCode::BAD_REQUEST {
                 let text = upstream.text().await.unwrap_or_default();
+                log_debug_response(&state, "/v1/messages", &text);
                 log_error("/v1/messages", &current, &text, status.as_u16());
                 if !thinking_adapted
                     && util::is_thinking_enabled_unsupported_error(status.as_u16(), &text)
@@ -498,6 +722,7 @@ async fn messages_direct(
                 original_model,
                 translated,
                 req_size,
+                capture_json(&state, &sanitized),
                 start,
             )
             .await;
@@ -514,7 +739,35 @@ async fn messages_direct(
         let status = resp.status();
         if status.is_success() {
             let parsed: Value = resp.json().await.unwrap_or(Value::Null);
+            log_debug_response(
+                &state,
+                "/v1/messages",
+                &serde_json::to_string(&parsed).unwrap_or_default(),
+            );
             let usage = parsed.get("usage").cloned().unwrap_or(json!({}));
+            let input_tokens = usage
+                .get("input_tokens")
+                .and_then(|t| t.as_u64())
+                .unwrap_or(0);
+            let output_tokens = usage
+                .get("output_tokens")
+                .and_then(|t| t.as_u64())
+                .unwrap_or(0);
+            let (tool_count, tool_names) = extract_tools_from_request(&req);
+            let tools_called: Vec<String> = parsed
+                .get("content")
+                .and_then(|c| c.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter(|block| block.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
+                        .filter_map(|block| block.get("name").and_then(|n| n.as_str()).map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let stop_reason = parsed
+                .get("stop_reason")
+                .and_then(|sr| sr.as_str())
+                .map(String::from);
             state.store.add(RequestRecord {
                 id: uuid::Uuid::new_v4().to_string(),
                 timestamp: now_iso(),
@@ -524,19 +777,24 @@ async fn messages_direct(
                 status_code: status.as_u16(),
                 request_size: req_size,
                 response_size: serde_json::to_vec(&parsed).map(|v| v.len()).unwrap_or(0),
-                input_tokens: usage
-                    .get("input_tokens")
-                    .and_then(|t| t.as_u64())
-                    .unwrap_or(0),
-                output_tokens: usage
-                    .get("output_tokens")
-                    .and_then(|t| t.as_u64())
-                    .unwrap_or(0),
+                input_tokens,
+                output_tokens,
                 duration: elapsed_secs(start),
+                request_body: capture_json(&state, &sanitized),
+                response_body: capture_json(&state, &parsed),
+                message_count: Some(extract_message_count(&req)),
+                tool_count: (tool_count > 0).then_some(tool_count),
+                tool_names: (tool_count > 0).then_some(tool_names),
+                stop_reason,
+                tools_called: (!tools_called.is_empty()).then_some(tools_called),
+                is_agent_initiated: Some(agent),
+                prompt_cache_hit: None,
+                estimated_cost_usd: Some(calculate_cost(&original_model, input_tokens, output_tokens)),
             });
             return Json(parsed).into_response();
         }
         let text = resp.text().await.unwrap_or_default();
+        log_debug_response(&state, "/v1/messages", &text);
         log_error("/v1/messages", &current, &text, status.as_u16());
         if util::is_orphaned_tool_error(status.as_u16(), &text) {
             let ids = util::extract_orphaned_ids(&text);
@@ -571,12 +829,13 @@ async fn messages_translated(
     start: Instant,
 ) -> Response {
     let vision = anthropic::has_image(&req);
-    let url = format!("{}/chat/completions", state.config.copilot_base_url());
+    let url = format!("{}/chat/completions", state.copilot_base_url());
     let is_stream = req.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
 
     let mut current = req.clone();
     for _ in 0..4 {
-        let openai_req = anthropic::anthropic_to_openai(&current, &state.config);
+        let cfg = state.config_snapshot();
+        let openai_req = anthropic::anthropic_to_openai(&current, &cfg);
         let agent = openai_req
             .get("messages")
             .and_then(|m| m.as_array())
@@ -593,6 +852,7 @@ async fn messages_translated(
         set_initiator(&mut headers, agent);
         let req_size = serde_json::to_vec(&current).map(|v| v.len()).unwrap_or(0);
         let payload = serde_json::to_vec(&openai_req).unwrap_or_default();
+        log_debug_request(&state, "/v1/messages", &openai_req);
 
         if is_stream {
             return stream_anthropic_translated(
@@ -621,7 +881,21 @@ async fn messages_translated(
         if status.is_success() {
             let parsed: Value = resp.json().await.unwrap_or(Value::Null);
             let anthropic_resp = anthropic::openai_to_anthropic(&parsed);
+            log_debug_response(
+                &state,
+                "/v1/messages",
+                &serde_json::to_string(&parsed).unwrap_or_default(),
+            );
             let usage = parsed.get("usage").cloned().unwrap_or(json!({}));
+            let input_tokens = usage
+                .get("prompt_tokens")
+                .and_then(|t| t.as_u64())
+                .unwrap_or(0);
+            let output_tokens = usage
+                .get("completion_tokens")
+                .and_then(|t| t.as_u64())
+                .unwrap_or(0);
+            let (tool_count, tool_names) = extract_tools_from_request(&openai_req);
             state.store.add(RequestRecord {
                 id: uuid::Uuid::new_v4().to_string(),
                 timestamp: now_iso(),
@@ -633,19 +907,24 @@ async fn messages_translated(
                 response_size: serde_json::to_vec(&anthropic_resp)
                     .map(|v| v.len())
                     .unwrap_or(0),
-                input_tokens: usage
-                    .get("prompt_tokens")
-                    .and_then(|t| t.as_u64())
-                    .unwrap_or(0),
-                output_tokens: usage
-                    .get("completion_tokens")
-                    .and_then(|t| t.as_u64())
-                    .unwrap_or(0),
+                input_tokens,
+                output_tokens,
                 duration: elapsed_secs(start),
+                request_body: capture_json(&state, &openai_req),
+                response_body: capture_json(&state, &parsed),
+                message_count: Some(extract_message_count(&openai_req)),
+                tool_count: (tool_count > 0).then_some(tool_count),
+                tool_names: (tool_count > 0).then_some(tool_names),
+                stop_reason: None,
+                tools_called: None,
+                is_agent_initiated: Some(agent),
+                prompt_cache_hit: None,
+                estimated_cost_usd: Some(calculate_cost(&original_model, input_tokens, output_tokens)),
             });
             return Json(anthropic_resp).into_response();
         }
         let text = resp.text().await.unwrap_or_default();
+        log_debug_response(&state, "/v1/messages", &text);
         log_error("/v1/messages", &current, &text, status.as_u16());
         if util::is_orphaned_tool_error(status.as_u16(), &text) {
             let ids = util::extract_orphaned_ids(&text);
@@ -666,107 +945,63 @@ async fn count_tokens(State(state): State<SharedState>, body: Bytes) -> Response
     if state.ensure_copilot_token().await.is_err() {
         return Json(json!({"input_tokens": 1})).into_response();
     }
-    let req = match parse_body(&body) {
+    let mut req = match parse_body(&body) {
         Ok(v) => v,
         Err(_) => return Json(json!({"input_tokens": 1})).into_response(),
     };
-    let model = req.get("model").and_then(|m| m.as_str()).unwrap_or("");
-
-    let model_meta = {
-        let models = state.models.read().await;
-        models
-            .as_ref()
-            .and_then(|m| m.get("data"))
-            .and_then(|d| d.as_array())
-            .and_then(|arr| {
-                arr.iter()
-                    .find(|m| m.get("id").and_then(|i| i.as_str()) == Some(model))
-                    .cloned()
-            })
-    };
-    let Some(model_meta) = model_meta else {
-        return Json(json!({"input_tokens": 1})).into_response();
-    };
-
-    // Select the BPE tokenizer advertised by the model, falling back to
-    // `cl100k_base` when the capability is absent.
-    let tokenizer = model_meta
-        .get("capabilities")
-        .and_then(|c| c.get("tokenizer"))
-        .and_then(|t| t.as_str())
-        .unwrap_or("cl100k_base")
+    let original_model = req
+        .get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or("")
         .to_string();
-    let est = |s: &str| crate::filters::count_tokens(s, &tokenizer);
+    let translated = translate::translate(&state.model_mappings(), &original_model);
+    if translated != original_model {
+        req["model"] = Value::String(translated.clone());
+    }
 
-    let mut total: u64 = 0;
-    match req.get("system") {
-        Some(Value::String(s)) => total += est(s),
-        Some(Value::Array(blocks)) => {
-            for b in blocks {
-                if b.get("type").and_then(|t| t.as_str()) == Some("text") {
-                    total += est(b.get("text").and_then(|t| t.as_str()).unwrap_or(""));
-                }
-            }
-        }
-        _ => {}
-    }
-    for msg in req
-        .get("messages")
-        .and_then(|m| m.as_array())
-        .cloned()
-        .unwrap_or_default()
+    let _ = state
+        .ensure_models_fresh(Duration::from_secs(30 * 60))
+        .await;
+
+    // Prefer real token counting from upstream responses whenever the model
+    // supports the Anthropic native count-tokens endpoint.
+    if state
+        .model_supports_endpoint(&translated, "/v1/messages/count_tokens")
+        .await
     {
-        match msg.get("content") {
-            Some(Value::String(s)) => total += est(s),
-            Some(Value::Array(blocks)) => {
-                for b in blocks {
-                    match b.get("type").and_then(|t| t.as_str()) {
-                        Some("text") => {
-                            total += est(b.get("text").and_then(|t| t.as_str()).unwrap_or(""))
-                        }
-                        Some("tool_result") => {
-                            if let Some(s) = b.get("content").and_then(|c| c.as_str()) {
-                                total += est(s);
-                            }
-                        }
-                        Some("tool_use") => {
-                            let input = b.get("input").cloned().unwrap_or(json!({}));
-                            total += est(&serde_json::to_string(&input).unwrap_or_default());
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            _ => {}
+        let vision = anthropic::has_image(&req);
+        let mut headers = state.copilot_headers(vision).await;
+        headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+        if state.model_supports_1m(&translated).await {
+            headers.insert(
+                "anthropic-beta",
+                HeaderValue::from_static("context-1m-2025-08-07"),
+            );
         }
-    }
-    if let Some(tools) = req.get("tools").and_then(|t| t.as_array()) {
-        if !tools.is_empty() {
-            total += if model.starts_with("grok") { 480 } else { 346 };
-            for t in tools {
-                total += est(t.get("name").and_then(|n| n.as_str()).unwrap_or(""));
-                total += est(t.get("description").and_then(|d| d.as_str()).unwrap_or(""));
-                let schema = t.get("input_schema").cloned().unwrap_or(json!({}));
-                total += est(&serde_json::to_string(&schema).unwrap_or_default());
+        let url = format!("{}/v1/messages/count_tokens", state.copilot_base_url());
+        let payload = serde_json::to_vec(&req).unwrap_or_default();
+        if let Some(resp) = util::post_with_retry(
+            &state,
+            &url,
+            headers,
+            payload,
+            "/v1/messages/count_tokens",
+        )
+        .await
+        {
+            if resp.status().is_success() {
+                let parsed: Value = resp.json().await.unwrap_or(json!({"input_tokens": 1}));
+                return Json(parsed).into_response();
             }
         }
     }
-    let vendor = model_meta
-        .get("vendor")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    // The BPE encoders are an approximation of each model's real tokenizer, so
-    // apply the same correction factors copilot-api uses: Claude counts run
-    // ~15% higher than cl100k/o200k, Grok ~3%, other vendors ~5%.
-    let factor = if vendor == "Anthropic" {
-        1.15
-    } else if model.starts_with("grok") {
-        1.03
-    } else {
-        1.05
-    };
-    total = ((total as f64) * factor).ceil() as u64;
-    Json(json!({"input_tokens": total})).into_response()
+
+    error_response(
+        StatusCode::BAD_REQUEST,
+        format!(
+            "Real token counting is unavailable for model '{original_model}'. The upstream endpoint /v1/messages/count_tokens is not supported or failed."
+        ),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -792,8 +1027,9 @@ async fn embeddings(State(state): State<SharedState>, body: Bytes) -> Response {
         .to_string();
     let req_size = body.len();
     let headers = state.copilot_headers(false).await;
-    let url = format!("{}/embeddings", state.config.copilot_base_url());
+    let url = format!("{}/embeddings", state.copilot_base_url());
     let payload = serde_json::to_vec(&req).unwrap_or_default();
+    log_debug_request(&state, "/v1/embeddings", &req);
 
     let resp = util::post_with_retry(&state, &url, headers, payload, "/v1/embeddings").await;
     let Some(resp) = resp else {
@@ -801,31 +1037,43 @@ async fn embeddings(State(state): State<SharedState>, body: Bytes) -> Response {
             StatusCode::GATEWAY_TIMEOUT,
             format!(
                 "Upstream connection error after {} attempts",
-                state.config.max_connection_retries + 1
+                state.max_connection_retries() + 1
             ),
         );
     };
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
     let resp_size = text.len();
+    log_debug_response(&state, "/v1/embeddings", &text);
     if status.is_success() {
         let parsed: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
         let usage = parsed.get("usage").cloned().unwrap_or(json!({}));
+        let input_tokens = usage
+            .get("prompt_tokens")
+            .and_then(|t| t.as_u64())
+            .unwrap_or(0);
         state.store.add(RequestRecord {
             id: uuid::Uuid::new_v4().to_string(),
             timestamp: now_iso(),
             endpoint: "/v1/embeddings".into(),
-            model,
+            model: model.clone(),
             translated_model: None,
             status_code: status.as_u16(),
             request_size: req_size,
             response_size: resp_size,
-            input_tokens: usage
-                .get("prompt_tokens")
-                .and_then(|t| t.as_u64())
-                .unwrap_or(0),
+            input_tokens,
             output_tokens: 0,
             duration: elapsed_secs(start),
+            request_body: capture_json(&state, &req),
+            response_body: capture_str(&state, &text),
+            message_count: None,
+            tool_count: None,
+            tool_names: None,
+            stop_reason: None,
+            tools_called: None,
+            is_agent_initiated: Some(false),
+            prompt_cache_hit: None,
+            estimated_cost_usd: Some(calculate_cost(&model, input_tokens, 0)),
         });
         Json(parsed).into_response()
     } else {
@@ -881,6 +1129,9 @@ async fn stream_openai(
     req_size: usize,
     start: Instant,
 ) -> Response {
+    let req_body = state
+        .is_debug()
+        .then(|| String::from_utf8_lossy(&payload).into_owned());
     let upstream = state
         .http
         .post(url)
@@ -901,9 +1152,12 @@ async fn stream_openai(
         let mut input_tokens = 0u64;
         let mut output_tokens = 0u64;
         let mut resp_size = 0usize;
+        let mut debug_resp = String::new();
         while let Some(chunk) = byte_stream.next().await {
             let Ok(chunk) = chunk else { break; };
-            buf.push_str(&String::from_utf8_lossy(&chunk));
+            let chunk_str = String::from_utf8_lossy(&chunk);
+            if state.is_debug() { debug_resp.push_str(&chunk_str); }
+            buf.push_str(&chunk_str);
             let mut lines: Vec<&str> = buf.split('\n').collect();
             let remainder = lines.pop().unwrap_or("").to_string();
             for line in lines {
@@ -926,6 +1180,7 @@ async fn stream_openai(
             buf = remainder;
         }
         let _ = model;
+        log_debug_response(&state, endpoint, &debug_resp);
         state.store.add(RequestRecord {
             id: uuid::Uuid::new_v4().to_string(),
             timestamp: now_iso(),
@@ -938,6 +1193,16 @@ async fn stream_openai(
             input_tokens,
             output_tokens,
             duration: elapsed_secs(start),
+            request_body: req_body,
+            response_body: if state.is_debug() { Some(debug_resp) } else { None },
+            message_count: None, // Streaming doesn't have access to parsed req
+            tool_count: None,
+            tool_names: None,
+            stop_reason: None,
+            tools_called: None,
+            is_agent_initiated: None,
+            prompt_cache_hit: None,
+            estimated_cost_usd: Some(calculate_cost(&original_model, input_tokens, output_tokens)),
         });
     };
     build_sse_response(stream)
@@ -951,12 +1216,13 @@ async fn stream_responses(
     url: &str,
     headers: HeaderMap,
     payload: Vec<u8>,
-    _req: Value,
+    req: Value,
     original_model: String,
     translated: String,
     req_size: usize,
     start: Instant,
 ) -> Response {
+    let req_body = capture_json(&state, &req);
     let upstream = state
         .http
         .post(url)
@@ -976,12 +1242,15 @@ async fn stream_responses(
         let mut input_tokens = 0u64;
         let mut output_tokens = 0u64;
         let mut resp_size = 0usize;
+        let mut debug_resp = String::new();
         while let Some(chunk) = byte_stream.next().await {
             let Ok(chunk) = chunk else { break; };
             resp_size += chunk.len();
             // Verbatim passthrough of raw bytes.
             yield Ok::<Bytes, std::convert::Infallible>(Bytes::copy_from_slice(&chunk));
-            buf.push_str(&String::from_utf8_lossy(&chunk));
+            let chunk_str = String::from_utf8_lossy(&chunk);
+            if state.is_debug() { debug_resp.push_str(&chunk_str); }
+            buf.push_str(&chunk_str);
             let mut lines: Vec<&str> = buf.split('\n').collect();
             let remainder = lines.pop().unwrap_or("").to_string();
             for line in lines {
@@ -999,6 +1268,7 @@ async fn stream_responses(
             }
             buf = remainder;
         }
+        log_debug_response(&state, "/v1/responses", &debug_resp);
         state.store.add(RequestRecord {
             id: uuid::Uuid::new_v4().to_string(),
             timestamp: now_iso(),
@@ -1011,6 +1281,16 @@ async fn stream_responses(
             input_tokens,
             output_tokens,
             duration: elapsed_secs(start),
+            request_body: req_body,
+            response_body: if state.is_debug() { Some(debug_resp) } else { None },
+            message_count: None,
+            tool_count: None,
+            tool_names: None,
+            stop_reason: None,
+            tools_called: None,
+            is_agent_initiated: None,
+            prompt_cache_hit: None,
+            estimated_cost_usd: Some(calculate_cost(&original_model, input_tokens, output_tokens)),
         });
     };
     build_sse_response(stream)
@@ -1023,6 +1303,7 @@ async fn stream_anthropic_direct(
     original_model: String,
     translated: String,
     req_size: usize,
+    req_body: Option<String>,
     start: Instant,
 ) -> Response {
     let status = upstream.status().as_u16();
@@ -1033,11 +1314,14 @@ async fn stream_anthropic_direct(
         let mut output_tokens = 0u64;
         let mut resp_size = 0usize;
         let mut buf = String::new();
+        let mut debug_resp = String::new();
         while let Some(chunk) = byte_stream.next().await {
             let Ok(chunk) = chunk else { break; };
             resp_size += chunk.len();
             yield Ok::<Bytes, std::convert::Infallible>(Bytes::copy_from_slice(&chunk));
-            buf.push_str(&String::from_utf8_lossy(&chunk));
+            let chunk_str = String::from_utf8_lossy(&chunk);
+            if state.is_debug() { debug_resp.push_str(&chunk_str); }
+            buf.push_str(&chunk_str);
             let mut lines: Vec<&str> = buf.split('\n').collect();
             let remainder = lines.pop().unwrap_or("").to_string();
             for line in lines {
@@ -1058,6 +1342,7 @@ async fn stream_anthropic_direct(
             }
             buf = remainder;
         }
+        log_debug_response(&state, "/v1/messages", &debug_resp);
         state.store.add(RequestRecord {
             id: uuid::Uuid::new_v4().to_string(),
             timestamp: now_iso(),
@@ -1070,6 +1355,16 @@ async fn stream_anthropic_direct(
             input_tokens,
             output_tokens,
             duration: elapsed_secs(start),
+            request_body: req_body,
+            response_body: if state.is_debug() { Some(debug_resp.clone()) } else { None },
+            message_count: None,
+            tool_count: None,
+            tool_names: None,
+            stop_reason: extract_stop_reason_from_sse(&debug_resp),
+            tools_called: (!extract_tools_called_from_sse(&debug_resp).is_empty()).then(|| extract_tools_called_from_sse(&debug_resp)),
+            is_agent_initiated: None,
+            prompt_cache_hit: None,
+            estimated_cost_usd: Some(calculate_cost(&original_model, input_tokens, output_tokens)),
         });
     };
     build_sse_response(stream)
@@ -1088,6 +1383,9 @@ async fn stream_anthropic_translated(
     req_size: usize,
     start: Instant,
 ) -> Response {
+    let req_body = state
+        .is_debug()
+        .then(|| String::from_utf8_lossy(&payload).into_owned());
     let upstream = state
         .http
         .post(url)
@@ -1109,9 +1407,12 @@ async fn stream_anthropic_translated(
         let mut input_tokens = 0u64;
         let mut output_tokens = 0u64;
         let mut resp_size = 0usize;
+        let mut debug_resp = String::new();
         while let Some(chunk) = byte_stream.next().await {
             let Ok(chunk) = chunk else { break; };
-            buf.push_str(&String::from_utf8_lossy(&chunk));
+            let chunk_str = String::from_utf8_lossy(&chunk);
+            if state.is_debug() { debug_resp.push_str(&chunk_str); }
+            buf.push_str(&chunk_str);
             let mut lines: Vec<&str> = buf.split('\n').collect();
             let remainder = lines.pop().unwrap_or("").to_string();
             for line in lines {
@@ -1143,6 +1444,7 @@ async fn stream_anthropic_translated(
                 output_tokens = usage.get("completion_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
             }
         }
+        log_debug_response(&state, "/v1/messages", &debug_resp);
         state.store.add(RequestRecord {
             id: uuid::Uuid::new_v4().to_string(),
             timestamp: now_iso(),
@@ -1155,6 +1457,16 @@ async fn stream_anthropic_translated(
             input_tokens,
             output_tokens,
             duration: elapsed_secs(start),
+            request_body: req_body,
+            response_body: if state.is_debug() { Some(debug_resp) } else { None },
+            message_count: None,
+            tool_count: None,
+            tool_names: None,
+            stop_reason: None,
+            tools_called: None,
+            is_agent_initiated: None,
+            prompt_cache_hit: None,
+            estimated_cost_usd: Some(calculate_cost(&original_model, input_tokens, output_tokens)),
         });
     };
     build_sse_response(stream)
@@ -1182,6 +1494,10 @@ async fn requests_page() -> Response {
     serve_asset("requests.html", include_str!("../public/requests.html"))
 }
 
+async fn metrics_page() -> Response {
+    serve_asset("metrics.html", include_str!("../public/metrics.html"))
+}
+
 fn serve_asset(_name: &str, contents: &'static str) -> Response {
     let mut resp = Response::new(Body::from(contents));
     resp.headers_mut().insert(
@@ -1189,6 +1505,136 @@ fn serve_asset(_name: &str, contents: &'static str) -> Response {
         HeaderValue::from_static("text/html; charset=utf-8"),
     );
     resp
+}
+
+fn metrics_label_escape(v: &str) -> String {
+    v.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+async fn metrics_openmetrics(State(state): State<SharedState>) -> Response {
+    let stats = state.store.stats();
+    let (records, _) = state.store.recent(usize::MAX, 0);
+
+    let mut req_total_by_labels: HashMap<(String, u16, String), u64> = HashMap::new();
+    let mut in_tokens_by_model: HashMap<String, u64> = HashMap::new();
+    let mut out_tokens_by_model: HashMap<String, u64> = HashMap::new();
+    let mut duration_sum_by_endpoint: HashMap<String, f64> = HashMap::new();
+    let mut duration_count_by_endpoint: HashMap<String, u64> = HashMap::new();
+    let mut cost_total = 0.0_f64;
+
+    for rec in &records {
+        let model = rec
+            .translated_model
+            .as_ref()
+            .unwrap_or(&rec.model)
+            .to_string();
+        *req_total_by_labels
+            .entry((rec.endpoint.clone(), rec.status_code, model.clone()))
+            .or_insert(0) += 1;
+        *in_tokens_by_model.entry(model.clone()).or_insert(0) += rec.input_tokens;
+        *out_tokens_by_model.entry(model).or_insert(0) += rec.output_tokens;
+        *duration_sum_by_endpoint
+            .entry(rec.endpoint.clone())
+            .or_insert(0.0) += rec.duration;
+        *duration_count_by_endpoint
+            .entry(rec.endpoint.clone())
+            .or_insert(0) += 1;
+        cost_total += rec.estimated_cost_usd.unwrap_or(0.0);
+    }
+
+    let mut out = String::new();
+    out.push_str("# HELP ghc_proxy_requests_total Total proxied requests by endpoint/status/model.\n");
+    out.push_str("# TYPE ghc_proxy_requests_total counter\n");
+    for ((endpoint, status, model), count) in req_total_by_labels {
+        out.push_str(&format!(
+            "ghc_proxy_requests_total{{endpoint=\"{}\",status=\"{}\",model=\"{}\"}} {}\n",
+            metrics_label_escape(&endpoint),
+            status,
+            metrics_label_escape(&model),
+            count
+        ));
+    }
+
+    out.push_str("# HELP ghc_proxy_input_tokens_total Total input tokens from real upstream usage.\n");
+    out.push_str("# TYPE ghc_proxy_input_tokens_total counter\n");
+    for (model, total) in in_tokens_by_model {
+        out.push_str(&format!(
+            "ghc_proxy_input_tokens_total{{model=\"{}\"}} {}\n",
+            metrics_label_escape(&model),
+            total
+        ));
+    }
+
+    out.push_str("# HELP ghc_proxy_output_tokens_total Total output tokens from real upstream usage.\n");
+    out.push_str("# TYPE ghc_proxy_output_tokens_total counter\n");
+    for (model, total) in out_tokens_by_model {
+        out.push_str(&format!(
+            "ghc_proxy_output_tokens_total{{model=\"{}\"}} {}\n",
+            metrics_label_escape(&model),
+            total
+        ));
+    }
+
+    out.push_str("# HELP ghc_proxy_request_duration_seconds_sum Sum of request durations by endpoint.\n");
+    out.push_str("# TYPE ghc_proxy_request_duration_seconds_sum counter\n");
+    for (endpoint, sum) in &duration_sum_by_endpoint {
+        out.push_str(&format!(
+            "ghc_proxy_request_duration_seconds_sum{{endpoint=\"{}\"}} {:.6}\n",
+            metrics_label_escape(endpoint),
+            sum
+        ));
+    }
+
+    out.push_str("# HELP ghc_proxy_request_duration_seconds_count Count of requests by endpoint.\n");
+    out.push_str("# TYPE ghc_proxy_request_duration_seconds_count counter\n");
+    for (endpoint, count) in duration_count_by_endpoint {
+        out.push_str(&format!(
+            "ghc_proxy_request_duration_seconds_count{{endpoint=\"{}\"}} {}\n",
+            metrics_label_escape(&endpoint),
+            count
+        ));
+    }
+
+    out.push_str("# HELP ghc_proxy_store_records Number of request records currently retained in memory.\n");
+    out.push_str("# TYPE ghc_proxy_store_records gauge\n");
+    out.push_str(&format!("ghc_proxy_store_records {}\n", records.len()));
+
+    out.push_str("# HELP ghc_proxy_estimated_cost_usd_total Total estimated request cost in USD.\n");
+    out.push_str("# TYPE ghc_proxy_estimated_cost_usd_total counter\n");
+    out.push_str(&format!("ghc_proxy_estimated_cost_usd_total {:.8}\n", cost_total));
+
+    out.push_str("# HELP ghc_proxy_stats_request_count Total request count from aggregate store stats.\n");
+    out.push_str("# TYPE ghc_proxy_stats_request_count counter\n");
+    out.push_str(&format!("ghc_proxy_stats_request_count {}\n", stats.request_count));
+
+    out.push_str("# EOF\n");
+
+    let mut resp = Response::new(Body::from(out));
+    resp.headers_mut().insert(
+        "Content-Type",
+        HeaderValue::from_static("application/openmetrics-text; version=1.0.0; charset=utf-8"),
+    );
+    resp
+}
+
+async fn api_reload_config(State(state): State<SharedState>) -> Response {
+    let cfg = state.reload_config();
+    Json(json!({
+        "ok": true,
+        "config_path": state.config_path(),
+        "config": {
+            "address": cfg.address,
+            "port": cfg.port,
+            "debug": cfg.debug,
+            "account_type": cfg.account_type,
+            "max_connection_retries": cfg.max_connection_retries,
+            "redirect_anthropic": cfg.redirect_anthropic,
+            "rate_limit_seconds": cfg.rate_limit_seconds,
+            "rate_limit_wait": cfg.rate_limit_wait,
+            "manual_approve": cfg.manual_approve
+        }
+    }))
+    .into_response()
 }
 
 async fn api_stats(State(state): State<SharedState>) -> Response {
@@ -1221,6 +1667,152 @@ async fn api_requests(
         "page": page,
         "per_page": per_page,
         "total_pages": total_pages,
+    }))
+    .into_response()
+}
+
+/// Audit API: Returns filtered request records with audit fields.
+/// Query params: endpoint=, status=, tool_name=, agent=true|false, page=, per_page=
+async fn api_audit(
+    State(state): State<SharedState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let page: usize = params
+        .get("page")
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(1)
+        .max(1);
+    let per_page: usize = params
+        .get("per_page")
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(50);
+    let endpoint_filter = params.get("endpoint").map(|s| s.as_str());
+    let status_filter = params.get("status").and_then(|s| s.parse::<u16>().ok());
+    let tool_filter = params.get("tool_name").map(|s| s.as_str());
+    let agent_filter = params.get("agent").and_then(|s| s.parse::<bool>().ok());
+    
+    let (records, _total) = state.store.recent(usize::MAX, 0);
+    
+    // Apply filters
+    let filtered: Vec<RequestRecord> = records
+        .into_iter()
+        .filter(|rec| {
+            // Endpoint filter
+            if let Some(ep) = endpoint_filter {
+                if !rec.endpoint.contains(ep) {
+                    return false;
+                }
+            }
+            // Status code filter
+            if let Some(st) = status_filter {
+                if rec.status_code != st {
+                    return false;
+                }
+            }
+            // Tool name filter
+            if let Some(tool) = tool_filter {
+                if let Some(ref tools) = rec.tool_names {
+                    if !tools.iter().any(|t| t.contains(tool)) {
+                        return false;
+                    }
+                } else {
+                    return false;
+                }
+            }
+            // Agent filter
+            if let Some(is_agent) = agent_filter {
+                if rec.is_agent_initiated != Some(is_agent) {
+                    return false;
+                }
+            }
+            true
+        })
+        .collect();
+    
+    let filtered_total = filtered.len();
+    let offset = (page - 1) * per_page;
+    let items = filtered.into_iter().skip(offset).take(per_page).collect::<Vec<_>>();
+    let total_pages = if per_page > 0 {
+        filtered_total.div_ceil(per_page)
+    } else {
+        0
+    };
+    
+    Json(json!({
+        "items": items,
+        "total": filtered_total,
+        "page": page,
+        "per_page": per_page,
+        "total_pages": total_pages,
+    }))
+    .into_response()
+}
+
+/// Audit summary API: Returns aggregated statistics about tools, stop reasons, and costs.
+async fn api_audit_summary(State(state): State<SharedState>) -> Response {
+    let (records, _) = state.store.recent(usize::MAX, 0);
+    
+    let mut tool_usage: HashMap<String, usize> = HashMap::new();
+    let mut stop_reason_counts: HashMap<String, usize> = HashMap::new();
+    let mut total_cost = 0.0;
+    let mut agent_count = 0usize;
+    let mut cache_hit_count = 0usize;
+    let mut cache_write_count = 0usize;
+    
+    for rec in &records {
+        // Tool usage aggregation
+        if let Some(ref tools) = rec.tool_names {
+            for tool in tools {
+                *tool_usage.entry(tool.clone()).or_insert(0) += 1;
+            }
+        }
+        
+        // Stop reason aggregation
+        if let Some(ref sr) = rec.stop_reason {
+            *stop_reason_counts.entry(sr.clone()).or_insert(0) += 1;
+        }
+        
+        // Cost aggregation
+        if let Some(cost) = rec.estimated_cost_usd {
+            total_cost += cost;
+        }
+        
+        // Agent tracking
+        if rec.is_agent_initiated == Some(true) {
+            agent_count += 1;
+        }
+        
+        // Cache tracking
+        if rec.prompt_cache_hit == Some(true) {
+            cache_hit_count += 1;
+        } else if rec.prompt_cache_hit == Some(false) {
+            cache_write_count += 1;
+        }
+    }
+    
+    // Sort tools by usage
+    let mut tools_sorted: Vec<_> = tool_usage.into_iter().collect();
+    tools_sorted.sort_by(|a, b| b.1.cmp(&a.1));
+    let top_tools: Vec<_> = tools_sorted.into_iter().take(20).collect();
+    
+    // Sort stop reasons by count
+    let mut stop_reasons_sorted: Vec<_> = stop_reason_counts.into_iter().collect();
+    stop_reasons_sorted.sort_by(|a, b| b.1.cmp(&a.1));
+    
+    Json(json!({
+        "total_requests": records.len(),
+        "agent_initiated": agent_count,
+        "total_cost_usd": (total_cost * 100.0).round() / 100.0,
+        "avg_cost_usd": if records.len() > 0 { (total_cost / records.len() as f64 * 100.0).round() / 100.0 } else { 0.0 },
+        "top_tools": top_tools,
+        "stop_reasons": stop_reasons_sorted,
+        "cache_hits": cache_hit_count,
+        "cache_writes": cache_write_count,
+        "cache_hit_rate": if cache_hit_count + cache_write_count > 0 {
+            (cache_hit_count as f64 / (cache_hit_count + cache_write_count) as f64 * 100.0).round() / 100.0
+        } else {
+            0.0
+        },
     }))
     .into_response()
 }

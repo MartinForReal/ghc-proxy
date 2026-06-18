@@ -644,6 +644,17 @@ fn clean_cache_control(block: &mut Value) {
     }
 }
 
+fn is_empty_text_block(block: &Value) -> bool {
+    if type_of(block) != "text" {
+        return false;
+    }
+    block
+        .get("text")
+        .and_then(|t| t.as_str())
+        .map(|s| s.trim().is_empty())
+        .unwrap_or(true)
+}
+
 /// Filters an Anthropic request down to the allowed keys and strips the
 /// unsupported `scope` field from ephemeral `cache_control` blocks.
 pub fn sanitize_anthropic_request(req: &Value) -> Value {
@@ -668,13 +679,32 @@ pub fn sanitize_anthropic_request(req: &Value) -> Value {
         }
     }
     if let Some(messages) = out.get_mut("messages").and_then(|m| m.as_array_mut()) {
-        for msg in messages {
-            if let Some(content) = msg.get_mut("content").and_then(|c| c.as_array_mut()) {
-                for block in content {
-                    clean_cache_control(block);
+        for msg in messages.iter_mut() {
+            if let Some(content) = msg.get_mut("content") {
+                if let Value::String(s) = content {
+                    if s.trim().is_empty() {
+                        *s = String::new();
+                    }
                 }
             }
+            if let Some(content) = msg.get_mut("content").and_then(|c| c.as_array_mut()) {
+                for block in content.iter_mut() {
+                    clean_cache_control(block);
+                }
+                content.retain(|block| !is_empty_text_block(block));
+            }
         }
+        messages.retain(|msg| {
+            if let Some(content) = msg.get("content") {
+                match content {
+                    Value::String(s) => !s.trim().is_empty(),
+                    Value::Array(blocks) => !blocks.is_empty(),
+                    _ => true,
+                }
+            } else {
+                true
+            }
+        });
     }
     out
 }
@@ -967,6 +997,41 @@ mod tests {
         let req = json!({"model": "m", "messages": [], "output_config": {"effort": "high"}});
         let out = sanitize_anthropic_request(&req);
         assert_eq!(out["output_config"]["effort"], "high");
+    }
+
+    #[test]
+    fn sanitize_drops_empty_text_blocks() {
+        let req = json!({
+            "model": "m",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "   \n\t  "},
+                    {"type": "tool_result", "tool_use_id": "x", "content": "ok"}
+                ]
+            }]
+        });
+        let out = sanitize_anthropic_request(&req);
+        let blocks = out["messages"][0]["content"].as_array().cloned().unwrap_or_default();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], "tool_result");
+    }
+
+    #[test]
+    fn sanitize_drops_messages_with_empty_content() {
+        let req = json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "   "},
+                {"role": "assistant", "content": [{"type": "text", "text": "  "}]},
+                {"role": "user", "content": [{"type": "text", "text": "hello"}]}
+            ]
+        });
+        let out = sanitize_anthropic_request(&req);
+        let messages = out["messages"].as_array().cloned().unwrap_or_default();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"][0]["text"], "hello");
     }
 
     #[test]

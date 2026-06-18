@@ -3,11 +3,12 @@
 //! token refresh and building upstream request headers.
 
 use crate::auth;
-use crate::config::Config;
+use crate::config::{self, Config, ModelMappings};
 use crate::store::RequestStore;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::RwLock as StdRwLock;
 use tokio::sync::{Mutex, RwLock};
 
 /// Mutable token state guarded by a mutex.
@@ -22,9 +23,10 @@ pub struct TokenState {
 /// Application-wide shared state.
 pub struct AppState {
     pub http: reqwest::Client,
-    pub config: Config,
+    pub config: StdRwLock<Config>,
     pub tokens: Mutex<TokenState>,
     pub models: RwLock<Option<serde_json::Value>>,
+    pub models_loaded_at: Mutex<Option<Instant>>,
     pub store: RequestStore,
     /// Timestamp of the last forwarded request, used for rate limiting.
     pub last_request: Mutex<Option<Instant>>,
@@ -59,13 +61,14 @@ impl AppState {
             .expect("failed to build HTTP client");
         AppState {
             http,
-            config,
+            config: StdRwLock::new(config),
             tokens: Mutex::new(TokenState {
                 github_token,
                 copilot_token: None,
                 expires_at: 0,
             }),
             models: RwLock::new(None),
+            models_loaded_at: Mutex::new(None),
             store: RequestStore::new(1000),
             last_request: Mutex::new(None),
             machine_id: auth::load_or_create_machine_id(),
@@ -77,8 +80,39 @@ impl AppState {
         }
     }
 
+    pub fn config_snapshot(&self) -> Config {
+        self.config.read().unwrap().clone()
+    }
+
+    pub fn is_debug(&self) -> bool {
+        self.config.read().unwrap().debug
+    }
+
+    pub fn max_connection_retries(&self) -> u32 {
+        self.config.read().unwrap().max_connection_retries
+    }
+
+    pub fn model_mappings(&self) -> ModelMappings {
+        self.config.read().unwrap().model_mappings.clone()
+    }
+
+    pub fn copilot_base_url(&self) -> String {
+        self.config.read().unwrap().copilot_base_url()
+    }
+
+    pub fn config_path(&self) -> String {
+        config::config_path().display().to_string()
+    }
+
+    pub fn reload_config(&self) -> Config {
+        let cfg = config::load_config();
+        *self.config.write().unwrap() = cfg.clone();
+        cfg
+    }
+
     /// Headers used when talking to the GitHub REST API (token exchange).
     fn github_headers(&self, github_token: &str) -> HeaderMap {
+        let cfg = self.config_snapshot();
         let mut h = HeaderMap::new();
         h.insert("Content-Type", HeaderValue::from_static("application/json"));
         h.insert("Accept", HeaderValue::from_static("application/json"));
@@ -86,15 +120,15 @@ impl AppState {
         insert(
             &mut h,
             "Editor-Version",
-            &format!("vscode/{}", self.config.vscode_version),
+            &format!("vscode/{}", cfg.vscode_version),
         );
         insert(
             &mut h,
             "Editor-Plugin-Version",
-            &self.config.editor_plugin_version(),
+            &cfg.editor_plugin_version(),
         );
-        insert(&mut h, "User-Agent", &self.config.user_agent());
-        insert(&mut h, "X-GitHub-Api-Version", &self.config.api_version);
+        insert(&mut h, "User-Agent", &cfg.user_agent());
+        insert(&mut h, "X-GitHub-Api-Version", &cfg.api_version);
         h.insert(
             "X-VSCode-User-Agent-Library-Version",
             HeaderValue::from_static("electron-fetch"),
@@ -107,6 +141,7 @@ impl AppState {
     /// `vision` adds the `Copilot-Vision-Request` header. A fresh
     /// `X-Request-Id` is generated for every call.
     pub async fn copilot_headers(&self, vision: bool) -> HeaderMap {
+        let cfg = self.config_snapshot();
         let copilot_token = {
             let tokens = self.tokens.lock().await;
             tokens.copilot_token.clone().unwrap_or_default()
@@ -122,14 +157,14 @@ impl AppState {
         insert(
             &mut h,
             "Editor-Version",
-            &format!("vscode/{}", self.config.vscode_version),
+            &format!("vscode/{}", cfg.vscode_version),
         );
         insert(
             &mut h,
             "Editor-Plugin-Version",
-            &self.config.editor_plugin_version(),
+            &cfg.editor_plugin_version(),
         );
-        insert(&mut h, "User-Agent", &self.config.user_agent());
+        insert(&mut h, "User-Agent", &cfg.user_agent());
         h.insert(
             "OpenAI-Intent",
             HeaderValue::from_static("conversation-panel"),
@@ -142,7 +177,7 @@ impl AppState {
         );
         insert(&mut h, "vscode-machineid", &self.machine_id);
         insert(&mut h, "vscode-sessionid", &self.session_id);
-        insert(&mut h, "X-GitHub-Api-Version", &self.config.api_version);
+        insert(&mut h, "X-GitHub-Api-Version", &cfg.api_version);
         // The latest Copilot client mirrors the request intent in the
         // `X-Interaction-Type` header for non-subagent/background requests.
         h.insert(
@@ -185,7 +220,7 @@ impl AppState {
         tracing::info!("Refreshing Copilot token...");
         let headers = self.github_headers(&github_token);
         let (token, expires_at) = auth::fetch_copilot_token(&self.http, headers).await?;
-        if self.config.show_token {
+        if self.config_snapshot().show_token {
             tracing::info!("GitHub token: {github_token}");
             tracing::info!("Copilot token: {token}");
         }
@@ -199,7 +234,7 @@ impl AppState {
     /// Fetches the list of available models from upstream and caches it.
     pub async fn load_models(&self) -> Result<(), String> {
         self.ensure_copilot_token().await?;
-        let url = format!("{}/models", self.config.copilot_base_url());
+        let url = format!("{}/models", self.copilot_base_url());
         let headers = self.copilot_headers(false).await;
         let resp = self
             .http
@@ -218,7 +253,26 @@ impl AppState {
             .map(|a| a.len())
             .unwrap_or(0);
         *self.models.write().await = Some(json);
+        *self.models_loaded_at.lock().await = Some(Instant::now());
         tracing::info!("Loaded {count} models");
+        Ok(())
+    }
+
+    pub async fn ensure_models_fresh(&self, max_age: Duration) -> Result<(), String> {
+        let needs_refresh = {
+            if self.models.read().await.is_none() {
+                true
+            } else {
+                let loaded_at = self.models_loaded_at.lock().await;
+                match *loaded_at {
+                    Some(t) => t.elapsed() >= max_age,
+                    None => true,
+                }
+            }
+        };
+        if needs_refresh {
+            self.load_models().await?;
+        }
         Ok(())
     }
 
@@ -246,7 +300,7 @@ impl AppState {
 
     /// Whether the model should use the direct Anthropic upstream path.
     pub async fn use_direct_anthropic(&self, model: &str) -> bool {
-        if self.config.redirect_anthropic {
+        if self.config_snapshot().redirect_anthropic {
             return false;
         }
         self.model_supports_endpoint(model, "/v1/messages").await
@@ -311,7 +365,8 @@ impl AppState {
     /// otherwise returns `Ok(())`, possibly after sleeping or waiting for
     /// interactive approval.
     pub async fn apply_request_gate(&self, endpoint: &str) -> Result<(), String> {
-        if self.config.manual_approve {
+        let cfg = self.config_snapshot();
+        if cfg.manual_approve {
             println!("\n[manual] Approve request to {endpoint}? Press Enter to continue...");
             let mut line = String::new();
             // Read a line from stdin without blocking the async runtime.
@@ -321,7 +376,7 @@ impl AppState {
             .await;
         }
 
-        if let Some(limit) = self.config.rate_limit_seconds {
+        if let Some(limit) = cfg.rate_limit_seconds {
             if limit > 0 {
                 let limit = Duration::from_secs(limit);
                 let mut last = self.last_request.lock().await;
@@ -329,7 +384,7 @@ impl AppState {
                     let elapsed = prev.elapsed();
                     if elapsed < limit {
                         let remaining = limit - elapsed;
-                        if self.config.rate_limit_wait {
+                        if cfg.rate_limit_wait {
                             tracing::info!(
                                 "[rate-limit] waiting {:.1}s before forwarding {endpoint}",
                                 remaining.as_secs_f64()

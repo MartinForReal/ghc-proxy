@@ -17,6 +17,14 @@
     .pager { margin-top: 1rem; display: flex; gap: 0.5rem; align-items: center; }
     button { background: #21262d; color: #e6edf3; border: 1px solid #30363d; border-radius: 6px; padding: 0.35rem 0.75rem; cursor: pointer; }
     button:disabled { opacity: 0.5; cursor: default; }
+    tr.req-row { cursor: pointer; }
+    tr.req-row:hover td { background: #161b22; }
+    .caret { color: #8b949e; width: 1em; text-align: center; }
+    .detail-row td { background: #010409; padding: 0; }
+    .detail { padding: 0.75rem 1rem; display: grid; gap: 0.75rem; }
+    .detail h3 { margin: 0 0 0.25rem; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.05em; color: #8b949e; }
+    pre { margin: 0; max-height: 360px; overflow: auto; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; padding: 0.75rem; font-size: 0.8rem; white-space: pre-wrap; word-break: break-word; }
+    .muted { color: #8b949e; font-style: italic; padding: 0.75rem 1rem; }
   </style>
 </head>
 <body>
@@ -24,7 +32,7 @@
   <table>
     <thead>
       <tr>
-        <th>Time</th><th>Endpoint</th><th>Model</th><th>Status</th>
+        <th></th><th>Time</th><th>Endpoint</th><th>Model</th><th>Status</th>
         <th>In</th><th>Out</th><th>Duration</th>
       </tr>
     </thead>
@@ -38,25 +46,60 @@
   <script>
     let page = 1;
     const perPage = 50;
-    async function load() {
-      const res = await fetch(`/api/requests?page=${page}&per_page=${perPage}`);
-      const data = await res.json();
-      document.getElementById('rows').innerHTML = (data.items || []).map(r => {
+    const expanded = new Set();
+    function escapeHtml(s) {
+      return String(s ?? '').replace(/[&<>"']/g, c => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+      })[c]);
+    }
+    function pretty(s) {
+      if (s == null) return null;
+      try { return JSON.stringify(JSON.parse(s), null, 2); } catch (e) { return s; }
+    }
+    function render(data) {
+      const rows = (data.items || []).map(r => {
         const ok = r.status_code >= 200 && r.status_code < 400;
         const model = r.translated_model ? `${r.model} → ${r.translated_model}` : r.model;
-        return `<tr>
-          <td>${r.timestamp}</td>
-          <td>${r.endpoint}</td>
-          <td>${model}</td>
+        const id = r.id;
+        const open = expanded.has(id);
+        const hasBody = r.request_body != null || r.response_body != null;
+        const detail = hasBody
+          ? `<div class="detail">
+               <div><h3>Request body</h3><pre>${escapeHtml(pretty(r.request_body) ?? '(none)')}</pre></div>
+               <div><h3>Response body</h3><pre>${escapeHtml(pretty(r.response_body) ?? '(none)')}</pre></div>
+             </div>`
+          : `<div class="muted">No body captured. Run the proxy with debug enabled (--debug) to record request/response bodies.</div>`;
+        return `<tr class="req-row" data-id="${escapeHtml(id)}">
+          <td class="caret">${open ? '▾' : '▸'}</td>
+          <td>${escapeHtml(r.timestamp)}</td>
+          <td>${escapeHtml(r.endpoint)}</td>
+          <td>${escapeHtml(model)}</td>
           <td class="${ok ? 'status-ok' : 'status-err'}">${r.status_code}</td>
           <td>${r.input_tokens}</td>
           <td>${r.output_tokens}</td>
           <td>${r.duration}s</td>
-        </tr>`;
+        </tr>
+        <tr class="detail-row" data-detail="${escapeHtml(id)}" style="display:${open ? 'table-row' : 'none'}"><td colspan="8">${detail}</td></tr>`;
       }).join('');
+      document.getElementById('rows').innerHTML = rows;
+      document.querySelectorAll('tr.req-row').forEach(tr => {
+        tr.onclick = () => {
+          const id = tr.getAttribute('data-id');
+          if (expanded.has(id)) expanded.delete(id); else expanded.add(id);
+          const isOpen = expanded.has(id);
+          const d = tr.nextElementSibling;
+          if (d) d.style.display = isOpen ? 'table-row' : 'none';
+          tr.querySelector('.caret').textContent = isOpen ? '▾' : '▸';
+        };
+      });
       document.getElementById('info').textContent = `Page ${data.page} / ${data.total_pages || 1} (${data.total} total)`;
       document.getElementById('prev').disabled = page <= 1;
       document.getElementById('next').disabled = page >= (data.total_pages || 1);
+    }
+    async function load() {
+      const res = await fetch(`/api/requests?page=${page}&per_page=${perPage}`);
+      const data = await res.json();
+      render(data);
     }
     document.getElementById('prev').onclick = () => { if (page > 1) { page--; load(); } };
     document.getElementById('next').onclick = () => { page++; load(); };

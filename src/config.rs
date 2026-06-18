@@ -18,9 +18,12 @@ pub const API_VERSION: &str = "2025-05-01";
 /// Default Copilot Chat plugin version string, matching the `version` field of
 /// the latest `microsoft/vscode-copilot-chat` release.
 pub const COPILOT_VERSION: &str = "0.48.1";
+/// Config schema version used to detect when defaults/options changed and a
+/// persisted config should be rewritten with migrated values.
+pub const CONFIG_VERSION: u32 = 2;
 
 /// Default model name that Claude "opus"/"sonnet" requests are mapped to.
-pub const DEFAULT_OPUS: &str = "claude-opus-4.7-1m";
+pub const DEFAULT_OPUS: &str = "claude-opus-4.8";
 /// Default model name that Claude "haiku" requests are mapped to.
 pub const DEFAULT_HAIKU: &str = "claude-haiku-4.5";
 
@@ -47,6 +50,8 @@ pub struct ModelMappings {
 /// Parsed representation of `config.yaml`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
+    #[serde(default = "default_loaded_config_version")]
+    pub config_version: u32,
     #[serde(default = "default_address")]
     pub address: String,
     #[serde(default = "default_port")]
@@ -83,6 +88,10 @@ pub struct Config {
     /// the `Editor-Version` header (falling back to `vscode_version`).
     #[serde(default)]
     pub dynamic_vscode_version: bool,
+    /// When true, check GitHub releases and auto-upgrade this binary when a
+    /// newer version is available.
+    #[serde(default)]
+    pub auto_upgrade: bool,
     /// Minimum number of seconds between successive proxied requests. `None`
     /// disables rate limiting.
     #[serde(default)]
@@ -99,6 +108,11 @@ pub struct Config {
 
 fn default_address() -> String {
     DEFAULT_ADDRESS.to_string()
+}
+fn default_loaded_config_version() -> u32 {
+    // Missing in old files; we treat that as legacy and migrate to
+    // `CONFIG_VERSION` on load.
+    0
 }
 fn default_port() -> u16 {
     DEFAULT_PORT
@@ -122,6 +136,7 @@ fn default_max_retries() -> u32 {
 impl Default for Config {
     fn default() -> Self {
         Config {
+            config_version: CONFIG_VERSION,
             address: default_address(),
             port: default_port(),
             debug: false,
@@ -137,6 +152,7 @@ impl Default for Config {
             redirect_anthropic: false,
             show_token: false,
             dynamic_vscode_version: false,
+            auto_upgrade: false,
             rate_limit_seconds: None,
             rate_limit_wait: false,
             manual_approve: false,
@@ -168,7 +184,7 @@ pub fn default_model_mappings() -> ModelMappings {
     let opus = DEFAULT_OPUS.to_string();
     let haiku = DEFAULT_HAIKU.to_string();
     let mut exact = BTreeMap::new();
-    for k in ["opus", "sonnet", "opus4-7", "4-7[1m]"] {
+    for k in ["opus", "sonnet", "opus4-7", "opus4-8", "4-7[1m]", "4-8[1m]"] {
         exact.insert(k.to_string(), opus.clone());
     }
     exact.insert("haiku".to_string(), haiku.clone());
@@ -179,17 +195,23 @@ pub fn default_model_mappings() -> ModelMappings {
         "claude-opus-4.5-",
         "claude-opus-4.6-",
         "claude-opus-4.7-",
+        "claude-opus-4.8-",
         "claude-opus-4-5-",
         "claude-opus-4-6-",
         "claude-opus-4-7-",
+        "claude-opus-4-8-",
         "claude-opus-4.5",
         "claude-opus-4.6",
         "claude-opus-4.7",
+        "claude-opus-4.8",
         "claude-opus-4-6",
         "claude-opus-4-7",
+        "claude-opus-4-8",
         "claude-opus-4-6[1m]",
         "claude-opus-4-7[1m]",
+        "claude-opus-4-8[1m]",
         "claude-sonnet-4-7",
+        "claude-sonnet-4-8",
         "claude-sonnet-4-6",
         "claude-sonnet-4-5",
     ] {
@@ -257,6 +279,8 @@ pub fn render_config_yaml(cfg: &Config) -> String {
     let mut s = String::new();
     s.push_str("# GitHub Copilot API Proxy Configuration\n");
     s.push_str("# ========================================\n\n");
+    let _ = writeln!(s, "config_version: {}", cfg.config_version);
+    s.push('\n');
     s.push_str("# Server Settings\n");
     let _ = writeln!(s, "address: {}", cfg.address);
     let _ = writeln!(s, "port: {}", cfg.port);
@@ -270,6 +294,7 @@ pub fn render_config_yaml(cfg: &Config) -> String {
     let _ = writeln!(s, "vscode_version: \"{}\"", cfg.vscode_version);
     let _ = writeln!(s, "api_version: \"{}\"", cfg.api_version);
     let _ = writeln!(s, "copilot_version: \"{}\"", cfg.copilot_version);
+    let _ = writeln!(s, "auto_upgrade: {}", cfg.auto_upgrade);
     s.push('\n');
     s.push_str("# Model Name Mappings\n");
     s.push_str("# Two types: exact (full name match) and prefix (starts-with match)\n");
@@ -373,7 +398,10 @@ pub fn generate_default_config() -> std::io::Result<Option<PathBuf>> {
 /// Loads configuration from `config.yaml`, generating a default file first if
 /// none exists. Falls back to built-in defaults on any parse error.
 /// Environment variables can override config file values with the prefix `GHC_PROXY_`.
-pub fn load_config() -> Config {
+///
+/// When `write_back_on_migration` is true, migrated config values are persisted
+/// to disk. Otherwise migrations are applied only in-memory for this process.
+pub fn load_config_with_options(write_back_on_migration: bool) -> Config {
     let path = config_path();
     if !path.exists() {
         if let Err(e) = generate_default_config() {
@@ -383,8 +411,18 @@ pub fn load_config() -> Config {
     let mut cfg = match std::fs::read_to_string(&path) {
         Ok(contents) => match serde_norway::from_str::<Config>(&contents) {
             Ok(mut cfg) => {
+                let mut needs_write_back = false;
                 if cfg.model_mappings.exact.is_empty() && cfg.model_mappings.prefix.is_empty() {
                     cfg.model_mappings = default_model_mappings();
+                    needs_write_back = true;
+                }
+                if migrate_config(&mut cfg) {
+                    needs_write_back = true;
+                }
+                if needs_write_back && write_back_on_migration {
+                    if let Err(e) = write_config(&cfg) {
+                        tracing::warn!("Failed to persist migrated config to {}: {e}", path.display());
+                    }
                 }
                 tracing::info!("✓ Configuration loaded from: {}", path.display());
                 cfg
@@ -392,7 +430,21 @@ pub fn load_config() -> Config {
             Err(e) => {
                 tracing::error!("Failed to parse config file at {}: {}", path.display(), e);
                 tracing::warn!("Using default configuration values. Fix the config file to use custom settings.");
-                Config::default()
+                let cfg = Config::default();
+                if write_back_on_migration {
+                    if let Err(write_err) = write_config(&cfg) {
+                        tracing::warn!(
+                            "Failed to rebuild corrupted config at {}: {write_err}",
+                            path.display()
+                        );
+                    } else {
+                        tracing::info!(
+                            "✓ Rebuilt corrupted config file at {}",
+                            path.display()
+                        );
+                    }
+                }
+                cfg
             }
         },
         Err(e) => {
@@ -485,6 +537,13 @@ pub fn load_config() -> Config {
             cfg.dynamic_vscode_version
         );
     }
+    if let Ok(val) = std::env::var("GHC_PROXY_AUTO_UPGRADE") {
+        cfg.auto_upgrade = val.eq_ignore_ascii_case("true") || val == "1";
+        tracing::info!(
+            "✓ Overriding auto_upgrade from GHC_PROXY_AUTO_UPGRADE: {}",
+            cfg.auto_upgrade
+        );
+    }
     if let Ok(val) = std::env::var("GHC_PROXY_RATE_LIMIT_SECONDS") {
         match val.parse::<u64>() {
             Ok(secs) => {
@@ -516,4 +575,48 @@ pub fn load_config() -> Config {
     }
 
     cfg
+}
+
+/// Read-only configuration load used by default runtime paths.
+pub fn load_config() -> Config {
+    load_config_with_options(false)
+}
+
+/// Applies in-place config migrations from older schema versions.
+/// Returns true when the config was modified and should be written back.
+fn migrate_config(cfg: &mut Config) -> bool {
+    let mut changed = false;
+
+    if cfg.config_version < CONFIG_VERSION {
+        // Ensure new aliases introduced with Opus 4.8 exist in legacy files.
+        let opus = DEFAULT_OPUS.to_string();
+        for k in ["opus4-8", "4-8[1m]"] {
+            cfg.model_mappings.exact.insert(k.to_string(), opus.clone());
+        }
+        for k in [
+            "claude-opus-4.8-",
+            "claude-opus-4-8-",
+            "claude-opus-4.8",
+            "claude-opus-4-8",
+            "claude-opus-4-8[1m]",
+            "claude-sonnet-4-8",
+        ] {
+            cfg.model_mappings.prefix.insert(k.to_string(), opus.clone());
+        }
+
+        // If legacy default aliases still point at old built-in Opus values,
+        // lift them to the current default.
+        for k in ["opus", "sonnet", "opus4-7", "4-7[1m]"] {
+            if let Some(v) = cfg.model_mappings.exact.get_mut(k) {
+                if v == "claude-opus-4.7-1m" || v == "claude-opus-4.7" {
+                    *v = opus.clone();
+                }
+            }
+        }
+
+        cfg.config_version = CONFIG_VERSION;
+        changed = true;
+    }
+
+    changed
 }

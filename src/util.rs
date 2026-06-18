@@ -121,6 +121,22 @@ pub fn remove_orphaned_tool_results(messages: &[Value], orphaned: &[String]) -> 
 /// Performs a POST request with retry and exponential backoff on connection
 /// errors, refreshing the Copilot token between attempts. Returns the response
 /// or `None` if all attempts fail at the transport level.
+/// Detects whether a response status code is retryable.
+/// Terminal errors (4xx except 429, 5xx except 502-504) should not be retried.
+/// Connection errors and transient 5xx errors should be retried.
+pub fn is_retryable_error(status: u16) -> bool {
+    match status {
+        // Client errors: only retry 429 (rate limit)
+        400..=428 | 430..=499 => false,
+        429 => true, // Rate limit - retry with backoff
+        // Server errors: retry 502, 503, 504 (gateway/service issues)
+        502..=504 => true,
+        // Other 5xx errors (500, 501, etc) - don't retry (likely permanent)
+        500..=501 | 505..=599 => false,
+        _ => false,
+    }
+}
+
 pub async fn post_with_retry(
     state: &AppState,
     url: &str,
@@ -128,7 +144,7 @@ pub async fn post_with_retry(
     body: Vec<u8>,
     endpoint: &str,
 ) -> Option<reqwest::Response> {
-    let max = state.config.max_connection_retries;
+    let max = state.max_connection_retries();
     let mut attempt = 0u32;
     loop {
         let result = state
@@ -139,7 +155,28 @@ pub async fn post_with_retry(
             .send()
             .await;
         match result {
-            Ok(resp) => return Some(resp),
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                // If response is successful or a non-retryable error, return it
+                if status < 400 || !is_retryable_error(status) {
+                    return Some(resp);
+                }
+                // Response is a retryable error - log and possibly retry
+                let _ = state.ensure_copilot_token().await;
+                if attempt < max {
+                    let backoff = if status == 429 { 2u64.pow(attempt + 1) } else { 2u64.pow(attempt) }.min(8);
+                    tracing::warn!(
+                        "[{endpoint}] Retryable error {status} (attempt {}/{}), backing off {backoff}s",
+                        attempt + 1,
+                        max + 1
+                    );
+                    tokio::time::sleep(Duration::from_secs(backoff)).await;
+                    attempt += 1;
+                } else {
+                    tracing::warn!("[{endpoint}] Retryable error {status} (final attempt)");
+                    return Some(resp);
+                }
+            }
             Err(e) => {
                 let _ = state.ensure_copilot_token().await;
                 if attempt < max {

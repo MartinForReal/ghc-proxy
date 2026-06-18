@@ -18,6 +18,38 @@ pub struct RequestRecord {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub duration: f64,
+    /// Captured request body. Only populated when debug mode is enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_body: Option<String>,
+    /// Captured upstream response body. Only populated when debug mode is enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_body: Option<String>,
+    
+    // Audit fields: extracted from request/response bodies for analysis
+    /// Number of messages in the request (conversation turn count)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_count: Option<usize>,
+    /// Number of tools sent in the request
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_count: Option<usize>,
+    /// Names of tools sent in the request
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_names: Option<Vec<String>>,
+    /// Reason why the response stopped: "end_turn", "tool_use", "max_tokens", etc.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
+    /// Names of tools actually called by the model
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools_called: Option<Vec<String>>,
+    /// Whether this request was initiated by an agent (vs user)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_agent_initiated: Option<bool>,
+    /// Whether prompt caching was used (hit or write)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_hit: Option<bool>,
+    /// Estimated cost in USD based on token counts and model rates
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_cost_usd: Option<f64>,
 }
 
 /// Aggregate statistics returned by `/api/stats`.
