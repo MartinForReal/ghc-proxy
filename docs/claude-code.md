@@ -20,19 +20,22 @@ Run the setup wizard with the Claude Code step enabled:
 ./target/release/ghc-proxy --setup --claudecode
 ```
 
-This patches `~/.claude/settings.json`, merging `env.ANTHROPIC_BASE_URL` so
-Claude Code routes its Anthropic API calls through the proxy. Existing settings
-are preserved — only the base URL key is added or updated, and the file is left
-untouched if it is not valid JSON.
+This patches `~/.claude/settings.json`, merging both `env.ANTHROPIC_BASE_URL`
+and `env.ANTHROPIC_API_KEY` so Claude Code routes its Anthropic API calls
+through the proxy. Existing settings are preserved — the base URL is updated,
+an API key is added only when missing/empty, and the file is left untouched if
+it is not valid JSON.
 
 ### Manual setup
 
-Set `ANTHROPIC_BASE_URL` to the proxy in `~/.claude/settings.json`:
+Set both `ANTHROPIC_BASE_URL` and `ANTHROPIC_API_KEY` in
+`~/.claude/settings.json`:
 
 ```json
 {
   "env": {
-    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8314"
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8314",
+    "ANTHROPIC_API_KEY": "ghc-proxy"
   }
 }
 ```
@@ -41,6 +44,7 @@ Or export it in your shell before launching Claude Code:
 
 ```bash
 export ANTHROPIC_BASE_URL="http://127.0.0.1:8314"
+export ANTHROPIC_API_KEY="ghc-proxy"
 ```
 
 ### Mapping Claude Code's models

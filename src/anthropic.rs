@@ -1012,7 +1012,10 @@ mod tests {
             }]
         });
         let out = sanitize_anthropic_request(&req);
-        let blocks = out["messages"][0]["content"].as_array().cloned().unwrap_or_default();
+        let blocks = out["messages"][0]["content"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0]["type"], "tool_result");
     }

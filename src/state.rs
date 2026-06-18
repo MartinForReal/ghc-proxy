@@ -7,8 +7,8 @@ use crate::config::{self, Config, ModelMappings};
 use crate::store::RequestStore;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::sync::RwLock as StdRwLock;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, RwLock};
 
 /// Mutable token state guarded by a mutex.
@@ -72,11 +72,7 @@ impl AppState {
             store: RequestStore::new(1000),
             last_request: Mutex::new(None),
             machine_id: auth::load_or_create_machine_id(),
-            session_id: format!(
-                "{}{}",
-                uuid::Uuid::new_v4(),
-                now_millis()
-            ),
+            session_id: format!("{}{}", uuid::Uuid::new_v4(), now_millis()),
         }
     }
 
@@ -370,10 +366,8 @@ impl AppState {
             println!("\n[manual] Approve request to {endpoint}? Press Enter to continue...");
             let mut line = String::new();
             // Read a line from stdin without blocking the async runtime.
-            let _ = tokio::task::spawn_blocking(move || {
-                std::io::stdin().read_line(&mut line)
-            })
-            .await;
+            let _ =
+                tokio::task::spawn_blocking(move || std::io::stdin().read_line(&mut line)).await;
         }
 
         if let Some(limit) = cfg.rate_limit_seconds {

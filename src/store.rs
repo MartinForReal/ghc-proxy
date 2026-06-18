@@ -24,7 +24,7 @@ pub struct RequestRecord {
     /// Captured upstream response body. Only populated when debug mode is enabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_body: Option<String>,
-    
+
     // Audit fields: extracted from request/response bodies for analysis
     /// Number of messages in the request (conversation turn count)
     #[serde(default, skip_serializing_if = "Option::is_none")]

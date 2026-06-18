@@ -165,7 +165,10 @@ fn print_info(as_json: bool) {
             "token_path": token_path.display().to_string(),
             "token_exists": token_exists,
         });
-        println!("{}", serde_json::to_string_pretty(&info).unwrap_or_default());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&info).unwrap_or_default()
+        );
     } else {
         println!("ghc-proxy {VERSION}");
         println!(
@@ -191,6 +194,8 @@ fn print_info(as_json: bool) {
     }
 }
 
+const CLAUDE_CODE_PROXY_API_KEY: &str = "ghc-proxy";
+
 /// Merges `env.ANTHROPIC_BASE_URL = base_url` into the given Claude Code
 /// `settings.json` content, preserving every other setting. `existing` is the
 /// current file contents (or `None`/empty for a new file). Returns the
@@ -209,21 +214,27 @@ fn merge_claude_settings(existing: Option<&str>, base_url: &str) -> Result<Strin
     if !env.is_object() {
         *env = serde_json::json!({});
     }
-    env.as_object_mut().unwrap().insert(
+    let env_obj = env.as_object_mut().unwrap();
+    env_obj.insert(
         "ANTHROPIC_BASE_URL".to_string(),
         serde_json::Value::String(base_url.to_string()),
     );
+    if !env_obj.contains_key("ANTHROPIC_API_KEY") {
+        env_obj.insert(
+            "ANTHROPIC_API_KEY".to_string(),
+            serde_json::Value::String(CLAUDE_CODE_PROXY_API_KEY.to_string()),
+        );
+    }
 
     serde_json::to_string_pretty(&root).map_err(|e| e.to_string())
 }
 
 /// Patches Claude Code's `settings.json` so its Anthropic requests route
-/// through this proxy by setting `env.ANTHROPIC_BASE_URL`. Any existing
-/// settings are preserved (merged); the file and directory are created if
-/// missing. Returns the path that was written.
-fn configure_claude_code(
-    cfg: &ghc_proxy::config::Config,
-) -> std::io::Result<std::path::PathBuf> {
+/// through this proxy by setting `env.ANTHROPIC_BASE_URL` and ensuring
+/// `env.ANTHROPIC_API_KEY` is present. Any existing settings are preserved
+/// (merged); the file and directory are created if missing. Returns the path
+/// that was written.
+fn configure_claude_code(cfg: &ghc_proxy::config::Config) -> std::io::Result<std::path::PathBuf> {
     let dir = dirs::home_dir()
         .ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::NotFound, "home directory not found")
@@ -290,9 +301,10 @@ fn print_setup_guide(cfg: &ghc_proxy::config::Config, path: &std::path::Path, cl
         match configure_claude_code(cfg) {
             Ok(p) => {
                 println!(
-                    "  Set env.ANTHROPIC_BASE_URL=http://{}:{} in:\n    {}",
+                    "  Set env.ANTHROPIC_BASE_URL=http://{}:{} and env.ANTHROPIC_API_KEY={} in:\n    {}",
                     cfg.address,
                     cfg.port,
+                    CLAUDE_CODE_PROXY_API_KEY,
                     p.display()
                 );
                 println!("  Claude Code will now route through this proxy.");
@@ -300,8 +312,10 @@ fn print_setup_guide(cfg: &ghc_proxy::config::Config, path: &std::path::Path, cl
             Err(e) => {
                 println!("  Failed to update Claude Code settings: {e}");
                 println!(
-                    "  Manually set env.ANTHROPIC_BASE_URL in ~/.claude/settings.json\n  to http://{}:{}",
-                    cfg.address, cfg.port
+                    "  Manually set env.ANTHROPIC_BASE_URL=http://{}:{} and env.ANTHROPIC_API_KEY={}\n  in ~/.claude/settings.json",
+                    cfg.address,
+                    cfg.port,
+                    CLAUDE_CODE_PROXY_API_KEY
                 );
             }
         }
@@ -633,13 +647,18 @@ mod tests {
         let out = merge_claude_settings(None, "http://127.0.0.1:8314").unwrap();
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["env"]["ANTHROPIC_BASE_URL"], "http://127.0.0.1:8314");
+        assert_eq!(v["env"]["ANTHROPIC_API_KEY"], "ghc-proxy");
     }
 
     #[test]
     fn preserves_existing_settings_and_env() {
         let existing = r#"{
             "theme": "dark",
-            "env": { "FOO": "bar", "ANTHROPIC_BASE_URL": "http://old" }
+            "env": {
+              "FOO": "bar",
+              "ANTHROPIC_BASE_URL": "http://old",
+              "ANTHROPIC_API_KEY": "real-key"
+            }
         }"#;
         let out = merge_claude_settings(Some(existing), "http://127.0.0.1:9000").unwrap();
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -648,6 +667,8 @@ mod tests {
         assert_eq!(v["env"]["FOO"], "bar");
         // The base URL is overwritten with the new value.
         assert_eq!(v["env"]["ANTHROPIC_BASE_URL"], "http://127.0.0.1:9000");
+        // Existing API key is preserved.
+        assert_eq!(v["env"]["ANTHROPIC_API_KEY"], "real-key");
     }
 
     #[test]
@@ -655,6 +676,29 @@ mod tests {
         let out = merge_claude_settings(Some(r#"{"env": "oops"}"#), "http://x").unwrap();
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["env"]["ANTHROPIC_BASE_URL"], "http://x");
+        assert_eq!(v["env"]["ANTHROPIC_API_KEY"], "ghc-proxy");
+    }
+
+    #[test]
+    fn fills_missing_api_key_only() {
+        let out = merge_claude_settings(
+            Some(r#"{"env":{"ANTHROPIC_BASE_URL":"http://old"}}"#),
+            "http://x",
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["env"]["ANTHROPIC_API_KEY"], "ghc-proxy");
+    }
+
+    #[test]
+    fn leaves_existing_api_key_untouched_even_if_empty() {
+        let out = merge_claude_settings(
+            Some(r#"{"env":{"ANTHROPIC_BASE_URL":"http://old","ANTHROPIC_API_KEY":"   "}}"#),
+            "http://x",
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["env"]["ANTHROPIC_API_KEY"], "   ");
     }
 
     #[test]
@@ -667,4 +711,3 @@ mod tests {
         assert!(merge_claude_settings(Some("[1, 2, 3]"), "http://x").is_err());
     }
 }
-

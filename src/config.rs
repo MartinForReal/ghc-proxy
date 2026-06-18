@@ -421,7 +421,10 @@ pub fn load_config_with_options(write_back_on_migration: bool) -> Config {
                 }
                 if needs_write_back && write_back_on_migration {
                     if let Err(e) = write_config(&cfg) {
-                        tracing::warn!("Failed to persist migrated config to {}: {e}", path.display());
+                        tracing::warn!(
+                            "Failed to persist migrated config to {}: {e}",
+                            path.display()
+                        );
                     }
                 }
                 tracing::info!("✓ Configuration loaded from: {}", path.display());
@@ -438,10 +441,7 @@ pub fn load_config_with_options(write_back_on_migration: bool) -> Config {
                             path.display()
                         );
                     } else {
-                        tracing::info!(
-                            "✓ Rebuilt corrupted config file at {}",
-                            path.display()
-                        );
+                        tracing::info!("✓ Rebuilt corrupted config file at {}", path.display());
                     }
                 }
                 cfg
@@ -601,7 +601,9 @@ fn migrate_config(cfg: &mut Config) -> bool {
             "claude-opus-4-8[1m]",
             "claude-sonnet-4-8",
         ] {
-            cfg.model_mappings.prefix.insert(k.to_string(), opus.clone());
+            cfg.model_mappings
+                .prefix
+                .insert(k.to_string(), opus.clone());
         }
 
         // If legacy default aliases still point at old built-in Opus values,

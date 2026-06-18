@@ -162,12 +162,12 @@ fn extract_tools_from_request(body: &Value) -> (usize, Vec<String>) {
             return (0, Vec::new());
         }
     };
-    
+
     let names: Vec<String> = tools
         .iter()
         .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(String::from))
         .collect();
-    
+
     (tools.len(), names)
 }
 
@@ -200,7 +200,7 @@ fn extract_stop_reason_from_sse(body: &str) -> Option<String> {
 /// Extract tool calls from SSE response (streaming events).
 fn extract_tools_called_from_sse(body: &str) -> Vec<String> {
     let mut tools = Vec::new();
-    
+
     for line in body.lines() {
         if let Some(data) = line.strip_prefix("data: ") {
             if let Ok(event) = serde_json::from_str::<Value>(data) {
@@ -217,7 +217,7 @@ fn extract_tools_called_from_sse(body: &str) -> Vec<String> {
             }
         }
     }
-    
+
     tools
 }
 
@@ -225,14 +225,14 @@ fn extract_tools_called_from_sse(body: &str) -> Vec<String> {
 /// Uses simplified rates: Claude $0.003/$0.015 (input/output), GPT-4 $0.03/$0.06, etc.
 fn calculate_cost(model: &str, input_tokens: u64, output_tokens: u64) -> f64 {
     let (input_rate, output_rate) = match model {
-        m if m.contains("opus-4") => (0.015, 0.075),      // claude-opus
-        m if m.contains("sonnet") => (0.003, 0.015),      // claude-sonnet
-        m if m.contains("haiku") => (0.0008, 0.004),      // claude-haiku
-        m if m.contains("gpt-4") => (0.03, 0.06),         // gpt-4
-        m if m.contains("gpt-4o") => (0.005, 0.015),      // gpt-4o
-        _ => (0.0005, 0.0015),                             // fallback
+        m if m.contains("opus-4") => (0.015, 0.075), // claude-opus
+        m if m.contains("sonnet") => (0.003, 0.015), // claude-sonnet
+        m if m.contains("haiku") => (0.0008, 0.004), // claude-haiku
+        m if m.contains("gpt-4") => (0.03, 0.06),    // gpt-4
+        m if m.contains("gpt-4o") => (0.005, 0.015), // gpt-4o
+        _ => (0.0005, 0.0015),                       // fallback
     };
-    
+
     (input_tokens as f64 * input_rate + output_tokens as f64 * output_rate) / 1000.0
 }
 
@@ -243,16 +243,15 @@ fn is_prompt_cache_eligible(req: &Value) -> bool {
     if let Some(system) = req.get("system") {
         let system_size = match system {
             Value::String(s) => s.len() / 4, // Rough estimate: ~4 chars per token
-            Value::Array(blocks) => {
-                blocks.iter()
-                    .map(|b| {
-                        b.get("text")
-                            .and_then(|t| t.as_str())
-                            .map(|s| s.len() / 4)
-                            .unwrap_or(0)
-                    })
-                    .sum()
-            }
+            Value::Array(blocks) => blocks
+                .iter()
+                .map(|b| {
+                    b.get("text")
+                        .and_then(|t| t.as_str())
+                        .map(|s| s.len() / 4)
+                        .unwrap_or(0)
+                })
+                .sum(),
             _ => 0,
         };
         system_size > 1024
@@ -264,15 +263,21 @@ fn is_prompt_cache_eligible(req: &Value) -> bool {
 /// Detect if a response used prompt caching by checking for cache tokens.
 fn extract_prompt_cache_hit(response: &Value) -> Option<bool> {
     let usage = response.get("usage")?;
-    let cache_read = usage.get("cache_read_input_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
-    let cache_creation = usage.get("cache_creation_input_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
-    
+    let cache_read = usage
+        .get("cache_read_input_tokens")
+        .and_then(|t| t.as_u64())
+        .unwrap_or(0);
+    let cache_creation = usage
+        .get("cache_creation_input_tokens")
+        .and_then(|t| t.as_u64())
+        .unwrap_or(0);
+
     if cache_read > 0 {
-        Some(true)  // Cache hit (reading from cache)
+        Some(true) // Cache hit (reading from cache)
     } else if cache_creation > 0 {
         Some(false) // Cache write (creating new cache)
     } else {
-        None        // No caching
+        None // No caching
     }
 }
 
@@ -284,19 +289,19 @@ fn filter_tools_by_frequency(tools: &Value, _frequency_threshold: f64, max_tools
         Some(arr) => arr,
         None => return tools.clone(),
     };
-    
+
     // Need at least 3 tools to make filtering worthwhile
     if tools_arr.len() < 3 {
         return tools.clone();
     }
-    
+
     // For Phase 2, we'll keep a configured number of tools
     // In production, this would be based on actual usage frequency from audit data
     // For now: keep top 20 tools (or all if fewer)
     if tools_arr.len() <= max_tools {
         return tools.clone();
     }
-    
+
     // Filter to top max_tools
     Value::Array(tools_arr.iter().take(max_tools).cloned().collect())
 }
@@ -309,7 +314,10 @@ async fn get_models(State(state): State<SharedState>) -> Response {
     if let Err(e) = state.ensure_copilot_token().await {
         return error_response(StatusCode::INTERNAL_SERVER_ERROR, e);
     }
-    if let Err(e) = state.ensure_models_fresh(Duration::from_secs(30 * 60)).await {
+    if let Err(e) = state
+        .ensure_models_fresh(Duration::from_secs(30 * 60))
+        .await
+    {
         tracing::warn!("model refresh failed: {e}");
     }
     let models = state.models.read().await;
@@ -338,7 +346,10 @@ async fn get_models(State(state): State<SharedState>) -> Response {
 }
 
 async fn get_models_full(State(state): State<SharedState>) -> Response {
-    if let Err(e) = state.ensure_models_fresh(Duration::from_secs(30 * 60)).await {
+    if let Err(e) = state
+        .ensure_models_fresh(Duration::from_secs(30 * 60))
+        .await
+    {
         tracing::warn!("model refresh failed: {e}");
     }
     let models = state.models.read().await;
@@ -759,8 +770,12 @@ async fn messages_direct(
                 .and_then(|c| c.as_array())
                 .map(|arr| {
                     arr.iter()
-                        .filter(|block| block.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
-                        .filter_map(|block| block.get("name").and_then(|n| n.as_str()).map(String::from))
+                        .filter(|block| {
+                            block.get("type").and_then(|t| t.as_str()) == Some("tool_use")
+                        })
+                        .filter_map(|block| {
+                            block.get("name").and_then(|n| n.as_str()).map(String::from)
+                        })
                         .collect()
                 })
                 .unwrap_or_default();
@@ -789,7 +804,11 @@ async fn messages_direct(
                 tools_called: (!tools_called.is_empty()).then_some(tools_called),
                 is_agent_initiated: Some(agent),
                 prompt_cache_hit: None,
-                estimated_cost_usd: Some(calculate_cost(&original_model, input_tokens, output_tokens)),
+                estimated_cost_usd: Some(calculate_cost(
+                    &original_model,
+                    input_tokens,
+                    output_tokens,
+                )),
             });
             return Json(parsed).into_response();
         }
@@ -919,7 +938,11 @@ async fn messages_translated(
                 tools_called: None,
                 is_agent_initiated: Some(agent),
                 prompt_cache_hit: None,
-                estimated_cost_usd: Some(calculate_cost(&original_model, input_tokens, output_tokens)),
+                estimated_cost_usd: Some(calculate_cost(
+                    &original_model,
+                    input_tokens,
+                    output_tokens,
+                )),
             });
             return Json(anthropic_resp).into_response();
         }
@@ -980,14 +1003,8 @@ async fn count_tokens(State(state): State<SharedState>, body: Bytes) -> Response
         }
         let url = format!("{}/v1/messages/count_tokens", state.copilot_base_url());
         let payload = serde_json::to_vec(&req).unwrap_or_default();
-        if let Some(resp) = util::post_with_retry(
-            &state,
-            &url,
-            headers,
-            payload,
-            "/v1/messages/count_tokens",
-        )
-        .await
+        if let Some(resp) =
+            util::post_with_retry(&state, &url, headers, payload, "/v1/messages/count_tokens").await
         {
             if resp.status().is_success() {
                 let parsed: Value = resp.json().await.unwrap_or(json!({"input_tokens": 1}));
@@ -1543,7 +1560,9 @@ async fn metrics_openmetrics(State(state): State<SharedState>) -> Response {
     }
 
     let mut out = String::new();
-    out.push_str("# HELP ghc_proxy_requests_total Total proxied requests by endpoint/status/model.\n");
+    out.push_str(
+        "# HELP ghc_proxy_requests_total Total proxied requests by endpoint/status/model.\n",
+    );
     out.push_str("# TYPE ghc_proxy_requests_total counter\n");
     for ((endpoint, status, model), count) in req_total_by_labels {
         out.push_str(&format!(
@@ -1555,7 +1574,9 @@ async fn metrics_openmetrics(State(state): State<SharedState>) -> Response {
         ));
     }
 
-    out.push_str("# HELP ghc_proxy_input_tokens_total Total input tokens from real upstream usage.\n");
+    out.push_str(
+        "# HELP ghc_proxy_input_tokens_total Total input tokens from real upstream usage.\n",
+    );
     out.push_str("# TYPE ghc_proxy_input_tokens_total counter\n");
     for (model, total) in in_tokens_by_model {
         out.push_str(&format!(
@@ -1565,7 +1586,9 @@ async fn metrics_openmetrics(State(state): State<SharedState>) -> Response {
         ));
     }
 
-    out.push_str("# HELP ghc_proxy_output_tokens_total Total output tokens from real upstream usage.\n");
+    out.push_str(
+        "# HELP ghc_proxy_output_tokens_total Total output tokens from real upstream usage.\n",
+    );
     out.push_str("# TYPE ghc_proxy_output_tokens_total counter\n");
     for (model, total) in out_tokens_by_model {
         out.push_str(&format!(
@@ -1575,7 +1598,9 @@ async fn metrics_openmetrics(State(state): State<SharedState>) -> Response {
         ));
     }
 
-    out.push_str("# HELP ghc_proxy_request_duration_seconds_sum Sum of request durations by endpoint.\n");
+    out.push_str(
+        "# HELP ghc_proxy_request_duration_seconds_sum Sum of request durations by endpoint.\n",
+    );
     out.push_str("# TYPE ghc_proxy_request_duration_seconds_sum counter\n");
     for (endpoint, sum) in &duration_sum_by_endpoint {
         out.push_str(&format!(
@@ -1585,7 +1610,9 @@ async fn metrics_openmetrics(State(state): State<SharedState>) -> Response {
         ));
     }
 
-    out.push_str("# HELP ghc_proxy_request_duration_seconds_count Count of requests by endpoint.\n");
+    out.push_str(
+        "# HELP ghc_proxy_request_duration_seconds_count Count of requests by endpoint.\n",
+    );
     out.push_str("# TYPE ghc_proxy_request_duration_seconds_count counter\n");
     for (endpoint, count) in duration_count_by_endpoint {
         out.push_str(&format!(
@@ -1595,17 +1622,29 @@ async fn metrics_openmetrics(State(state): State<SharedState>) -> Response {
         ));
     }
 
-    out.push_str("# HELP ghc_proxy_store_records Number of request records currently retained in memory.\n");
+    out.push_str(
+        "# HELP ghc_proxy_store_records Number of request records currently retained in memory.\n",
+    );
     out.push_str("# TYPE ghc_proxy_store_records gauge\n");
     out.push_str(&format!("ghc_proxy_store_records {}\n", records.len()));
 
-    out.push_str("# HELP ghc_proxy_estimated_cost_usd_total Total estimated request cost in USD.\n");
+    out.push_str(
+        "# HELP ghc_proxy_estimated_cost_usd_total Total estimated request cost in USD.\n",
+    );
     out.push_str("# TYPE ghc_proxy_estimated_cost_usd_total counter\n");
-    out.push_str(&format!("ghc_proxy_estimated_cost_usd_total {:.8}\n", cost_total));
+    out.push_str(&format!(
+        "ghc_proxy_estimated_cost_usd_total {:.8}\n",
+        cost_total
+    ));
 
-    out.push_str("# HELP ghc_proxy_stats_request_count Total request count from aggregate store stats.\n");
+    out.push_str(
+        "# HELP ghc_proxy_stats_request_count Total request count from aggregate store stats.\n",
+    );
     out.push_str("# TYPE ghc_proxy_stats_request_count counter\n");
-    out.push_str(&format!("ghc_proxy_stats_request_count {}\n", stats.request_count));
+    out.push_str(&format!(
+        "ghc_proxy_stats_request_count {}\n",
+        stats.request_count
+    ));
 
     out.push_str("# EOF\n");
 
@@ -1690,9 +1729,9 @@ async fn api_audit(
     let status_filter = params.get("status").and_then(|s| s.parse::<u16>().ok());
     let tool_filter = params.get("tool_name").map(|s| s.as_str());
     let agent_filter = params.get("agent").and_then(|s| s.parse::<bool>().ok());
-    
+
     let (records, _total) = state.store.recent(usize::MAX, 0);
-    
+
     // Apply filters
     let filtered: Vec<RequestRecord> = records
         .into_iter()
@@ -1728,16 +1767,20 @@ async fn api_audit(
             true
         })
         .collect();
-    
+
     let filtered_total = filtered.len();
     let offset = (page - 1) * per_page;
-    let items = filtered.into_iter().skip(offset).take(per_page).collect::<Vec<_>>();
+    let items = filtered
+        .into_iter()
+        .skip(offset)
+        .take(per_page)
+        .collect::<Vec<_>>();
     let total_pages = if per_page > 0 {
         filtered_total.div_ceil(per_page)
     } else {
         0
     };
-    
+
     Json(json!({
         "items": items,
         "total": filtered_total,
@@ -1751,14 +1794,14 @@ async fn api_audit(
 /// Audit summary API: Returns aggregated statistics about tools, stop reasons, and costs.
 async fn api_audit_summary(State(state): State<SharedState>) -> Response {
     let (records, _) = state.store.recent(usize::MAX, 0);
-    
+
     let mut tool_usage: HashMap<String, usize> = HashMap::new();
     let mut stop_reason_counts: HashMap<String, usize> = HashMap::new();
     let mut total_cost = 0.0;
     let mut agent_count = 0usize;
     let mut cache_hit_count = 0usize;
     let mut cache_write_count = 0usize;
-    
+
     for rec in &records {
         // Tool usage aggregation
         if let Some(ref tools) = rec.tool_names {
@@ -1766,22 +1809,22 @@ async fn api_audit_summary(State(state): State<SharedState>) -> Response {
                 *tool_usage.entry(tool.clone()).or_insert(0) += 1;
             }
         }
-        
+
         // Stop reason aggregation
         if let Some(ref sr) = rec.stop_reason {
             *stop_reason_counts.entry(sr.clone()).or_insert(0) += 1;
         }
-        
+
         // Cost aggregation
         if let Some(cost) = rec.estimated_cost_usd {
             total_cost += cost;
         }
-        
+
         // Agent tracking
         if rec.is_agent_initiated == Some(true) {
             agent_count += 1;
         }
-        
+
         // Cache tracking
         if rec.prompt_cache_hit == Some(true) {
             cache_hit_count += 1;
@@ -1789,16 +1832,16 @@ async fn api_audit_summary(State(state): State<SharedState>) -> Response {
             cache_write_count += 1;
         }
     }
-    
+
     // Sort tools by usage
     let mut tools_sorted: Vec<_> = tool_usage.into_iter().collect();
     tools_sorted.sort_by(|a, b| b.1.cmp(&a.1));
     let top_tools: Vec<_> = tools_sorted.into_iter().take(20).collect();
-    
+
     // Sort stop reasons by count
     let mut stop_reasons_sorted: Vec<_> = stop_reason_counts.into_iter().collect();
     stop_reasons_sorted.sort_by(|a, b| b.1.cmp(&a.1));
-    
+
     Json(json!({
         "total_requests": records.len(),
         "agent_initiated": agent_count,

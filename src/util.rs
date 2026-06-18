@@ -164,7 +164,12 @@ pub async fn post_with_retry(
                 // Response is a retryable error - log and possibly retry
                 let _ = state.ensure_copilot_token().await;
                 if attempt < max {
-                    let backoff = if status == 429 { 2u64.pow(attempt + 1) } else { 2u64.pow(attempt) }.min(8);
+                    let backoff = if status == 429 {
+                        2u64.pow(attempt + 1)
+                    } else {
+                        2u64.pow(attempt)
+                    }
+                    .min(8);
                     tracing::warn!(
                         "[{endpoint}] Retryable error {status} (attempt {}/{}), backing off {backoff}s",
                         attempt + 1,
