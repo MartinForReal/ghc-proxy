@@ -58,11 +58,11 @@ pub async fn run(starting: Config, claudecode_flag: bool) -> Option<Outcome> {
 
     // --- Step 1: server settings -----------------------------------------
     let defaults = starting.clone();
-    let settings = match tokio::task::spawn_blocking(move || prompt_server_settings(&defaults)).await
-    {
-        Ok(Ok(s)) => s,
-        _ => return cancelled(),
-    };
+    let settings =
+        match tokio::task::spawn_blocking(move || prompt_server_settings(&defaults)).await {
+            Ok(Ok(s)) => s,
+            _ => return cancelled(),
+        };
     let mut cfg = starting;
     cfg.address = settings.address;
     cfg.port = settings.port;
@@ -86,7 +86,10 @@ pub async fn run(starting: Config, claudecode_flag: bool) -> Option<Outcome> {
     if model_ids.is_empty() {
         println!("⚠ Could not fetch the model catalog. Default mappings will be offered.");
     } else {
-        println!("✓ {} models available from GitHub Copilot.", model_ids.len());
+        println!(
+            "✓ {} models available from GitHub Copilot.",
+            model_ids.len()
+        );
     }
 
     // --- Step 4: model mappings ------------------------------------------

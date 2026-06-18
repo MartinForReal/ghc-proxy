@@ -156,7 +156,10 @@ fn print_info(as_json: bool) {
             "token_path": token_path.display().to_string(),
             "token_exists": token_exists,
         });
-        println!("{}", serde_json::to_string_pretty(&info).unwrap_or_default());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&info).unwrap_or_default()
+        );
     } else {
         println!("ghc-proxy {VERSION}");
         println!(
@@ -212,9 +215,7 @@ fn merge_claude_settings(existing: Option<&str>, base_url: &str) -> Result<Strin
 /// through this proxy by setting `env.ANTHROPIC_BASE_URL`. Any existing
 /// settings are preserved (merged); the file and directory are created if
 /// missing. Returns the path that was written.
-fn configure_claude_code(
-    cfg: &ghc_proxy::config::Config,
-) -> std::io::Result<std::path::PathBuf> {
+fn configure_claude_code(cfg: &ghc_proxy::config::Config) -> std::io::Result<std::path::PathBuf> {
     let dir = dirs::home_dir()
         .ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::NotFound, "home directory not found")
@@ -598,4 +599,3 @@ mod tests {
         assert!(merge_claude_settings(Some("[1, 2, 3]"), "http://x").is_err());
     }
 }
-
