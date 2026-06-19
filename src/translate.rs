@@ -5,8 +5,8 @@ use crate::config::ModelMappings;
 /// Translates an incoming model name using the configured mappings.
 ///
 /// Exact matches take priority over prefix matches. When several prefixes
-/// match, the longest (most specific) one wins, so an entry like
-/// `claude-opus-4.7-xhigh` takes precedence over a shorter `claude-opus-4.7`.
+/// match, the longest (most specific) one wins, so a prefix like
+/// `claude-opus-4.8-` takes precedence over a shorter `claude-opus-4.8`.
 /// If nothing matches the original name is returned unchanged.
 pub fn translate(mappings: &ModelMappings, model: &str) -> String {
     if let Some(target) = mappings.exact.get(model) {
@@ -29,26 +29,20 @@ pub fn translate(mappings: &ModelMappings, model: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::default_model_mappings;
+    use crate::config::{default_model_mappings, DEFAULT_HAIKU, DEFAULT_OPUS};
 
     #[test]
     fn exact_mapping_wins() {
         let m = default_model_mappings();
-        assert_eq!(translate(&m, "opus"), "claude-opus-4.7-1m");
-        assert_eq!(translate(&m, "haiku"), "claude-haiku-4.5");
+        assert_eq!(translate(&m, "opus"), DEFAULT_OPUS);
+        assert_eq!(translate(&m, "haiku"), DEFAULT_HAIKU);
     }
 
     #[test]
     fn prefix_mapping_applies() {
         let m = default_model_mappings();
-        assert_eq!(
-            translate(&m, "claude-sonnet-4-20250101"),
-            "claude-opus-4.7-1m"
-        );
-        assert_eq!(
-            translate(&m, "claude-haiku-4.5-20250101"),
-            "claude-haiku-4.5"
-        );
+        assert_eq!(translate(&m, "claude-sonnet-4-20250101"), DEFAULT_OPUS);
+        assert_eq!(translate(&m, "claude-haiku-4.5-20250101"), DEFAULT_HAIKU);
     }
 
     #[test]
@@ -60,16 +54,10 @@ mod tests {
     #[test]
     fn longest_prefix_wins() {
         let mut m = default_model_mappings();
-        // A more specific prefix must take precedence over the shorter
-        // `claude-opus-4.7` entry that would otherwise match first in sorted
-        // key order.
-        m.prefix.insert(
-            "claude-opus-4.7-xhigh".to_string(),
-            "claude-opus-4.7-xhigh".to_string(),
-        );
-        assert_eq!(
-            translate(&m, "claude-opus-4.7-xhigh"),
-            "claude-opus-4.7-xhigh"
-        );
+        // Give the shorter prefix a different valid target so the assertion
+        // can observe that the longer `claude-opus-4.8-` prefix wins.
+        m.prefix
+            .insert("claude-opus-4.8".to_string(), DEFAULT_HAIKU.to_string());
+        assert_eq!(translate(&m, "claude-opus-4.8-20250101"), DEFAULT_OPUS);
     }
 }
