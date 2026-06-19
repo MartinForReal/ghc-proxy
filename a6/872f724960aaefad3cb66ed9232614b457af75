@@ -1,0 +1,21 @@
+src/translate.rs
+  s_76f6ae60b39923::t_464c06fb1a6540 61
+  s_76f6ae60b39923::t_d8f286896e2d5f 32,37-38,44-45
+  s_76f6ae60b39923::t_d16e823593f20b 8-9,57-60
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "a6872f724960aaefad3cb66ed9232614b457af75",
+  "prompts": {},
+  "sessions": {
+    "s_76f6ae60b39923": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019eddd3-32c6-72a1-abe7-748da6831056",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Fan Shangxiang <fanshangxiang@gmail.com>"
+    }
+  }
+}
