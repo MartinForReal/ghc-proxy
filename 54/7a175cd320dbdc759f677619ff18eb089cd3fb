@@ -1,0 +1,29 @@
+src/setup.rs
+  s_4328714ed0a0d0::t_9a063685e52c3c 152
+src/gemini.rs
+  s_4328714ed0a0d0::t_f9b43eac8c6530 82-85,94-97,165-168,175-178,222-225,387-390
+src/server.rs
+  s_4328714ed0a0d0::t_f9b43eac8c6530 111-115,1220-1223
+src/main.rs
+  s_4328714ed0a0d0::t_9e5e71cf49f1cb 963,981
+  s_4328714ed0a0d0::t_e2829dfdeb31af 300
+  s_4328714ed0a0d0::t_f9b43eac8c6530 612,771,961-962,1007-1008
+src/config.rs
+  s_4328714ed0a0d0::t_f9b43eac8c6530 374-376
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.3",
+  "base_commit_sha": "547a175cd320dbdc759f677619ff18eb089cd3fb",
+  "prompts": {},
+  "sessions": {
+    "s_4328714ed0a0d0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "cd1f8143-87b0-40a7-8746-a40af0d42600",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Fan Shangxiang <fanshangxiang@gmail.com>"
+    }
+  }
+}
