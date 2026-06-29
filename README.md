@@ -40,6 +40,13 @@ file.
   stripping).
 - **Anthropic-compatible** `/v1/messages` endpoint (direct passthrough when the
   upstream model supports it, otherwise translated through chat completions).
+- **Gemini-compatible** `/v1beta/models/{model}:generateContent`,
+  `:streamGenerateContent`, and `:countTokens` endpoints (translated through chat
+  completions).
+- **Optional API-key authentication** on the LLM endpoints
+  (`Authorization: Bearer`, `x-api-key`, or `x-goog-api-key`), disabled by
+  default and compared in constant time.
+- **OpenAPI spec** served at `/openapi.json` describing every LLM endpoint.
 - Automatic **model name translation** via configurable exact/prefix mappings.
 - **Streaming** support (SSE) for all endpoints.
 - **Retry with exponential backoff** for upstream connection errors.
@@ -60,6 +67,8 @@ ghc-proxy [options]
 
   -s, --setup             Launch the interactive setup wizard (sign in + map models)
       --claudecode        Configure Claude Code (~/.claude/settings.json) to use this proxy (with --setup)
+      --codex             Configure Codex (~/.codex/config.toml) to use this proxy (with --setup)
+      --gemini            Configure Gemini CLI (~/.gemini/.env) to use this proxy (with --setup)
   -d, --default           Reset config to defaults during setup
   -p, --port <port>       Port to listen on (default: 8314)
   -a, --address <addr>    Address to listen on (default: 127.0.0.1)
@@ -96,6 +105,24 @@ A GitHub token is resolved in this order:
 The GitHub token is exchanged for a short-lived **Copilot token** via
 `https://api.github.com/copilot_internal/v2/token`, which is refreshed
 automatically before it expires.
+
+## Endpoint Authentication
+
+By default the proxy accepts all local requests. To require a key, set `api_key`
+in `config.yaml` (or the `GHC_PROXY_API_KEY` environment variable). When set,
+every request to the LLM endpoints must present a matching key, compared in
+constant time:
+
+```bash
+# Anthropic / OpenAI style
+curl http://127.0.0.1:8314/v1/messages -H "x-api-key: my-secret-key" ...
+curl http://127.0.0.1:8314/v1/chat/completions -H "Authorization: Bearer my-secret-key" ...
+# Gemini style
+curl "http://127.0.0.1:8314/v1beta/models/gemini-2.5-pro:generateContent" -H "x-goog-api-key: my-secret-key" ...
+```
+
+The dashboard, metrics, and static pages remain open so local monitoring keeps
+working without a key.
 
 ## Setup Wizard
 
@@ -139,6 +166,10 @@ system_prompt_remove: []
 system_prompt_add: []
 tool_result_suffix_remove: []
 max_connection_retries: 3
+
+# Optional: require this key on all LLM endpoints (Bearer / x-api-key /
+# x-goog-api-key). Omit or leave empty to disable authentication.
+# api_key: my-secret-key
 ```
 
 ## API Endpoints
@@ -150,6 +181,10 @@ max_connection_retries: 3
 | `GET /v1/models` | List available models |
 | `POST /v1/messages` | Anthropic messages API |
 | `POST /v1/messages/count_tokens` | Anthropic token counting |
+| `POST /v1beta/models/{model}:generateContent` | Gemini generate content |
+| `POST /v1beta/models/{model}:streamGenerateContent` | Gemini streaming (SSE) |
+| `POST /v1beta/models/{model}:countTokens` | Gemini token counting |
+| `GET /openapi.json` | OpenAPI v3 specification |
 | `GET /` | Web dashboard |
 | `GET /metrics/dashboard` | Metrics dashboard UI |
 | `GET /metrics` | OpenMetrics endpoint |
@@ -212,6 +247,7 @@ cargo clippy     # lint
 | `src/translate.rs` | Model-name translation (exact + prefix) |
 | `src/filters.rs` | Content filtering and token estimation |
 | `src/anthropic.rs` | Anthropic <-> OpenAI request/response/stream translation |
+| `src/gemini.rs` | Gemini <-> OpenAI request/response/stream translation |
 | `src/responses.rs` | Codex `/v1/responses` adapters |
 | `src/util.rs` | Retry-with-backoff and orphaned tool-result handling |
 | `src/server.rs` | Axum router and all HTTP handlers |
@@ -259,7 +295,9 @@ database. `--setup` launches an interactive wizard (GitHub sign-in, live model
 catalog, model-mapping configuration) and writes/updates the config file; in
 headless or piped contexts it instead re-renders the config non-interactively,
 applying any CLI overrides or resetting to defaults with `--default`.
-`--claudecode` patches `~/.claude/settings.json`, merging
+`--codex` patches `~/.codex/config.toml` (adding a `model_providers.ghc-proxy`
+block and selecting it), and `--gemini` patches `~/.gemini/.env` (base URL,
+model, and api-key auth selection). `--claudecode` patches `~/.claude/settings.json`, merging
 `env.ANTHROPIC_BASE_URL` and ensuring `env.ANTHROPIC_API_KEY` exists so Claude
 Code routes through this proxy (existing settings are preserved, and an
 existing API key is left untouched). The dashboard lists all supported models

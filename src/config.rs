@@ -104,6 +104,12 @@ pub struct Config {
     /// each proxied request is forwarded upstream.
     #[serde(default)]
     pub manual_approve: bool,
+    /// Optional API key guarding the LLM endpoints. When set, every request to
+    /// the OpenAI/Anthropic/Gemini-compatible endpoints must present a matching
+    /// key (`Authorization: Bearer`, `x-api-key`, or `x-goog-api-key`). When
+    /// `None`/empty, authentication is disabled and all requests are accepted.
+    #[serde(default)]
+    pub api_key: Option<String>,
 }
 
 fn default_address() -> String {
@@ -156,6 +162,7 @@ impl Default for Config {
             rate_limit_seconds: None,
             rate_limit_wait: false,
             manual_approve: false,
+            api_key: None,
         }
     }
 }
@@ -343,6 +350,7 @@ pub fn render_config_yaml(cfg: &Config) -> String {
         || cfg.rate_limit_seconds.is_some()
         || cfg.rate_limit_wait
         || cfg.manual_approve
+        || cfg.api_key.is_some()
     {
         s.push('\n');
         s.push_str("# Diagnostics & request controls\n");
@@ -360,6 +368,12 @@ pub fn render_config_yaml(cfg: &Config) -> String {
         }
         if cfg.manual_approve {
             let _ = writeln!(s, "manual_approve: {}", cfg.manual_approve);
+        }
+        if let Some(ref key) = cfg.api_key {
+            if !key.is_empty() {
+                s.push_str("# API key required on LLM endpoints (Bearer / x-api-key / x-goog-api-key)\n");
+                let _ = writeln!(s, "api_key: {}", yaml_scalar(key));
+            }
         }
     }
     s
@@ -572,6 +586,16 @@ pub fn load_config_with_options(write_back_on_migration: bool) -> Config {
             "✓ Overriding manual_approve from GHC_PROXY_MANUAL_APPROVE: {}",
             cfg.manual_approve
         );
+    }
+
+    if let Ok(val) = std::env::var("GHC_PROXY_API_KEY") {
+        let trimmed = val.trim();
+        if trimmed.is_empty() {
+            cfg.api_key = None;
+        } else {
+            cfg.api_key = Some(trimmed.to_string());
+        }
+        tracing::info!("API key auth enabled via GHC_PROXY_API_KEY");
     }
 
     cfg

@@ -5,6 +5,7 @@ pub mod anthropic;
 pub mod auth;
 pub mod config;
 pub mod filters;
+pub mod gemini;
 pub mod responses;
 pub mod server;
 pub mod state;

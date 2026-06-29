@@ -11,8 +11,9 @@ title: API Reference
 ---
 
 All endpoints listen on `http://<address>:<port>` (default
-`http://127.0.0.1:8314`). No API key is required by the proxy itself —
-authentication to GitHub Copilot is handled internally.
+`http://127.0.0.1:8314`). By default no API key is required by the proxy itself —
+authentication to GitHub Copilot is handled internally. You can optionally
+require a key on the LLM endpoints; see [Authentication](#authentication) below.
 
 ## Endpoints
 
@@ -22,6 +23,9 @@ authentication to GitHub Copilot is handled internally.
 | `POST /v1/responses` | OpenAI Responses API for Codex (also `/responses`) |
 | `POST /v1/messages` | Anthropic Messages API |
 | `POST /v1/messages/count_tokens` | Anthropic token counting (real BPE) |
+| `POST /v1beta/models/{model}:generateContent` | Gemini generate content |
+| `POST /v1beta/models/{model}:streamGenerateContent` | Gemini streaming (SSE) |
+| `POST /v1beta/models/{model}:countTokens` | Gemini token counting |
 | `POST /v1/embeddings` | Embeddings (also `/embeddings`) |
 | `GET /v1/models` | List available models (also `/models`, `/api/models`) |
 | `GET /v1/models/full/` | Raw upstream model catalog with capabilities |
@@ -35,9 +39,11 @@ authentication to GitHub Copilot is handled internally.
 | `GET /api/audit` | Filtered audit records |
 | `GET /api/audit/summary` | Aggregated audit summary |
 | `POST /api/config/reload` | Reload `config.yaml` without restart |
+| `GET /openapi.json` | OpenAPI v3 specification of the LLM endpoints |
 
 Streaming (SSE) is supported on the chat, responses, and messages endpoints by
-setting `"stream": true` in the request body.
+setting `"stream": true` in the request body. The Gemini surface streams via the
+dedicated `:streamGenerateContent` action.
 
 ## OpenAI SDK
 
@@ -69,6 +75,34 @@ print(msg.content)
 The proxy serves Anthropic requests directly from Copilot's native
 `/v1/messages` endpoint when the model supports it, and otherwise translates
 them through chat completions transparently.
+
+## Gemini
+
+```bash
+curl "http://127.0.0.1:8314/v1beta/models/gemini-2.5-pro:generateContent" \
+  -H "Content-Type: application/json" \
+  -d '{"contents": [{"role": "user", "parts": [{"text": "Hello!"}]}]}'
+```
+
+The model is taken from the URL path and translated per your
+[mappings](configuration.md#model-mappings). Gemini requests are translated
+through chat completions, so any Copilot model works. Streaming uses the
+`:streamGenerateContent` action and emits `data:` SSE lines.
+
+## Authentication
+
+By default the proxy accepts all local requests. Set `api_key` in `config.yaml`
+(or `GHC_PROXY_API_KEY`) to require a key on the LLM endpoints. The key is
+accepted from any of the standard provider headers and compared in constant time:
+
+```bash
+curl http://127.0.0.1:8314/v1/messages          -H "x-api-key: KEY" ...
+curl http://127.0.0.1:8314/v1/chat/completions  -H "Authorization: Bearer KEY" ...
+curl "http://127.0.0.1:8314/v1beta/models/gemini-2.5-pro:generateContent" -H "x-goog-api-key: KEY" ...
+```
+
+The dashboard, metrics, and static pages stay open so local monitoring works
+without a key. Unauthenticated requests to protected endpoints return `401`.
 
 ## cURL
 

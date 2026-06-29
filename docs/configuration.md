@@ -55,6 +55,10 @@ tool_result_suffix_remove: []
 
 # Retry: max retries for upstream connection errors (0 = none)
 max_connection_retries: 3
+
+# Optional: require this key on all LLM endpoints (Bearer / x-api-key /
+# x-goog-api-key). Omit or leave empty to disable authentication.
+# api_key: my-secret-key
 ```
 
 ### Model mappings
@@ -87,6 +91,8 @@ ghc-proxy [options]
 
   -s, --setup               Launch the interactive setup wizard
       --claudecode          Configure Claude Code to use this proxy (with --setup)
+      --codex               Configure Codex to use this proxy (with --setup)
+      --gemini              Configure Gemini CLI to use this proxy (with --setup)
   -d, --default             Reset config to defaults during setup
   -p, --port <port>         Port to listen on (default: 8314)
   -a, --address <addr>      Address to listen on (default: 127.0.0.1)
@@ -131,6 +137,7 @@ Every config field has a `GHC_PROXY_*` override:
 | `GHC_PROXY_RATE_LIMIT_SECONDS` | Minimum seconds between requests |
 | `GHC_PROXY_RATE_LIMIT_WAIT` | Wait instead of rejecting when limited (`true`/`1`) |
 | `GHC_PROXY_MANUAL_APPROVE` | Require manual approval per request (`true`/`1`) |
+| `GHC_PROXY_API_KEY` | Require this key on LLM endpoints (empty = disabled) |
 
 Token-related variables (`COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN`) are
 covered in [Getting Started](getting-started.md#authentication).
@@ -143,6 +150,14 @@ To stay comfortably under GitHub Copilot abuse thresholds:
   Combine with `--wait` to delay instead of returning HTTP 429.
 - `--manual` pauses before each upstream call until you approve it on the
   console — useful when dialing in a new client.
+
+## Endpoint authentication
+
+By default the proxy accepts all requests. Set `api_key` in `config.yaml` (or the
+`GHC_PROXY_API_KEY` environment variable) to require a key on the LLM endpoints.
+The key is accepted from `Authorization: Bearer <key>`, `x-api-key`, or
+`x-goog-api-key`, and compared in constant time. The dashboard, metrics, and
+static pages remain open so local monitoring keeps working without a key.
 
 ## Mimicking the Copilot client
 

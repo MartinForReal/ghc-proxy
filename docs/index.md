@@ -5,8 +5,9 @@ title: ghc-proxy
 # ghc-proxy
 
 A **GitHub Copilot API proxy** written in Rust. It exposes standard **OpenAI**
-and **Anthropic** compatible HTTP endpoints so any tool — Claude Code, the Codex
-CLI, the OpenAI/Anthropic SDKs, and more — can talk to GitHub Copilot models.
+and **Anthropic** compatible HTTP endpoints — plus a **Gemini**-compatible
+surface — so any tool — Claude Code, the Codex CLI, the Gemini CLI, the
+OpenAI/Anthropic SDKs, and more — can talk to GitHub Copilot models.
 
 > **Documentation:** [Getting Started](getting-started.md) ·
 > [Configuration](configuration.md) · [API Reference](api.md) ·
@@ -33,12 +34,15 @@ so OpenAI- and Anthropic-native clients work unmodified.
 
 - **OpenAI-compatible** `/v1/chat/completions` and `/v1/responses` (Codex) endpoints.
 - **Anthropic-compatible** `/v1/messages` endpoint with native passthrough or translation.
+- **Gemini-compatible** `/v1beta/models/{model}:generateContent` (+ streaming and token counting).
 - **Embeddings**, **model listing**, **token counting**, and a **usage** endpoint.
 - **Model-name translation** via configurable exact and longest-prefix mappings.
 - **Streaming (SSE)**, **retry with backoff**, and **content filtering**.
 - **1M-context** support via the `anthropic-beta` header for capable models.
 - **Interactive setup wizard** — GitHub sign-in, live model catalog, model mapping.
-- **Claude Code integration** — one flag wires `~/.claude/settings.json` to the proxy.
+- **Optional API-key auth** on the LLM endpoints (Bearer / `x-api-key` / `x-goog-api-key`), off by default.
+- **One-click client setup** for Claude Code, Codex, and the Gemini CLI.
+- **OpenAPI spec** at `/openapi.json`.
 - **Analytics dashboard** at `/` and a request browser at `/requests`.
 
 ## Quick start

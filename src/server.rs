@@ -2,6 +2,7 @@
 //! Anthropic-compatible proxy endpoints, plus the analytics dashboard API.
 
 use crate::anthropic::{self, AnthropicStreamState};
+use crate::gemini;
 use crate::responses as codex;
 use crate::state::SharedState;
 use crate::store::RequestRecord;
@@ -9,8 +10,9 @@ use crate::translate;
 use crate::util;
 use axum::{
     body::{Body, Bytes},
-    extract::{DefaultBodyLimit, Query, State},
+    extract::{DefaultBodyLimit, Path, Query, Request, State},
     http::{HeaderMap, HeaderValue, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -45,9 +47,96 @@ pub fn router(state: SharedState) -> Router {
         .route("/api/audit/summary", get(api_audit_summary))
         .route("/api/config/reload", post(api_reload_config))
         .route("/api/models", get(get_models))
+        .route("/v1beta/models/{model_action}", post(gemini_generate))
+        .route("/openapi.json", get(openapi_spec))
         .fallback(not_found)
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ))
         .layer(DefaultBodyLimit::max(20 * 1024 * 1024 * 1024)) // 20 GB limit
         .with_state(state)
+}
+
+/// Whether a request path is an LLM API endpoint that should be guarded by the
+/// optional API key. The dashboard UI, static assets, and metrics endpoints are
+/// intentionally left open so local monitoring keeps working without a key.
+fn is_protected_path(path: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        "/v1/",
+        "/chat/completions",
+        "/responses",
+        "/embeddings",
+        "/models",
+        "/v1beta/",
+    ];
+    PREFIXES.iter().any(|p| path.starts_with(p))
+}
+
+/// Constant-time byte comparison to avoid leaking the key through timing.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Extracts a presented API key from the standard provider headers:
+/// `Authorization: Bearer <key>`, `x-api-key: <key>`, or `x-goog-api-key: <key>`.
+fn presented_api_key(headers: &HeaderMap) -> Option<String> {
+    if let Some(v) = headers.get("authorization").and_then(|h| h.to_str().ok()) {
+        if let Some(rest) = v
+            .strip_prefix("Bearer ")
+            .or_else(|| v.strip_prefix("bearer "))
+        {
+            return Some(rest.trim().to_string());
+        }
+    }
+    if let Some(v) = headers.get("x-api-key").and_then(|h| h.to_str().ok()) {
+        return Some(v.trim().to_string());
+    }
+    if let Some(v) = headers.get("x-goog-api-key").and_then(|h| h.to_str().ok()) {
+        return Some(v.trim().to_string());
+    }
+    None
+}
+
+/// Authentication middleware. When an API key is configured, every request to a
+/// protected LLM endpoint must present a matching key. When no key is
+/// configured, all requests pass through unchanged.
+async fn auth_middleware(State(state): State<SharedState>, request: Request, next: Next) -> Response {
+    let Some(expected) = state.api_key() else {
+        return next.run(request).await;
+    };
+    let path = request.uri().path();
+    if !is_protected_path(path) {
+        return next.run(request).await;
+    }
+    let presented = presented_api_key(request.headers());
+    let ok = presented
+        .as_deref()
+        .map(|p| constant_time_eq(p.as_bytes(), expected.as_bytes()))
+        .unwrap_or(false);
+    if ok {
+        next.run(request).await
+    } else {
+        tracing::warn!("[auth] rejected unauthenticated request to {path}");
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "error": {
+                    "message": "Missing or invalid API key.",
+                    "type": "authentication_error",
+                    "code": "invalid_api_key"
+                }
+            })),
+        )
+            .into_response()
+    }
 }
 
 async fn not_found() -> impl IntoResponse {
@@ -1025,6 +1114,277 @@ async fn count_tokens(State(state): State<SharedState>, body: Bytes) -> Response
 }
 
 // ---------------------------------------------------------------------------
+// Gemini (translated through OpenAI chat completions)
+// ---------------------------------------------------------------------------
+
+/// Splits a Gemini path segment like `gemini-2.5-pro:generateContent` into the
+/// `(model, action)` pair. A missing action defaults to `generateContent`.
+fn split_model_action(seg: &str) -> (String, String) {
+    match seg.rsplit_once(':') {
+        Some((model, action)) => (model.to_string(), action.to_string()),
+        None => (seg.to_string(), "generateContent".to_string()),
+    }
+}
+
+fn gemini_error(status: StatusCode, msg: String) -> Response {
+    (
+        status,
+        Json(json!({"error": {"code": status.as_u16(), "message": msg, "status": "ERROR"}})),
+    )
+        .into_response()
+}
+
+/// Handles the Gemini `generateContent`, `streamGenerateContent`, and
+/// `countTokens` actions by translating to/from the OpenAI chat completions API.
+async fn gemini_generate(
+    State(state): State<SharedState>,
+    Path(model_action): Path<String>,
+    body: Bytes,
+) -> Response {
+    let start = Instant::now();
+    let (raw_model, action) = split_model_action(&model_action);
+
+    if let Err(e) = state.ensure_copilot_token().await {
+        return gemini_error(StatusCode::INTERNAL_SERVER_ERROR, e);
+    }
+
+    let req = match parse_body(&body) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+
+    let translated = translate::translate(&state.model_mappings(), &raw_model);
+
+    // countTokens: translate and defer to the chat-completions-based estimate.
+    if action == "countTokens" || action == "counttokens" {
+        let openai_req = gemini::gemini_to_openai(&req, &translated, false);
+        let text = collect_text_for_count(&openai_req);
+        let tokenizer = state.model_tokenizer(&translated).await;
+        let total = crate::filters::count_tokens(&text, &tokenizer);
+        return Json(json!({"totalTokens": total})).into_response();
+    }
+
+    let is_stream = action == "streamGenerateContent" || action == "streamgeneratecontent";
+
+    if let Err(e) = state.apply_request_gate("/v1beta/models").await {
+        return gemini_error(StatusCode::TOO_MANY_REQUESTS, e);
+    }
+
+    let openai_req = gemini::gemini_to_openai(&req, &translated, is_stream);
+    let vision = gemini::has_image(&req);
+    let agent = gemini::is_agent(&req);
+    let mut headers = state.copilot_headers(vision).await;
+    set_initiator(&mut headers, agent);
+
+    let url = format!("{}/chat/completions", state.copilot_base_url());
+    let req_size = body.len();
+    let payload = serde_json::to_vec(&openai_req).unwrap_or_default();
+    log_debug_request(&state, "/v1beta/models", &openai_req);
+
+    if is_stream {
+        return stream_gemini(
+            state.clone(),
+            &url,
+            headers,
+            payload,
+            raw_model,
+            translated,
+            req_size,
+            start,
+        )
+        .await;
+    }
+
+    let resp = util::post_with_retry(&state, &url, headers, payload, "/v1beta/models").await;
+    let Some(resp) = resp else {
+        return gemini_error(
+            StatusCode::GATEWAY_TIMEOUT,
+            format!(
+                "Upstream connection error after {} attempts",
+                state.max_connection_retries() + 1
+            ),
+        );
+    };
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    let resp_size = text.len();
+    log_debug_response(&state, "/v1beta/models", &text);
+    if status.is_success() {
+        let parsed: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+        let gemini_resp = gemini::openai_to_gemini(&parsed);
+        let usage = parsed.get("usage").cloned().unwrap_or(json!({}));
+        let input_tokens = usage.get("prompt_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+        let output_tokens = usage
+            .get("completion_tokens")
+            .and_then(|t| t.as_u64())
+            .unwrap_or(0);
+        state.store.add(RequestRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            timestamp: now_iso(),
+            endpoint: "/v1beta/models".into(),
+            model: raw_model.clone(),
+            translated_model: (translated != raw_model).then_some(translated),
+            status_code: status.as_u16(),
+            request_size: req_size,
+            response_size: resp_size,
+            input_tokens,
+            output_tokens,
+            duration: elapsed_secs(start),
+            request_body: capture_json(&state, &openai_req),
+            response_body: capture_str(&state, &text),
+            message_count: None,
+            tool_count: None,
+            tool_names: None,
+            stop_reason: None,
+            tools_called: None,
+            is_agent_initiated: Some(agent),
+            prompt_cache_hit: None,
+            estimated_cost_usd: Some(calculate_cost(&raw_model, input_tokens, output_tokens)),
+        });
+        Json(gemini_resp).into_response()
+    } else {
+        log_error("/v1beta/models", &openai_req, &text, status.as_u16());
+        gemini_error(
+            StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+            text,
+        )
+    }
+}
+
+/// Concatenates all text payloads in an OpenAI request for token estimation.
+fn collect_text_for_count(openai_req: &Value) -> String {
+    let mut out = String::new();
+    if let Some(messages) = openai_req.get("messages").and_then(|m| m.as_array()) {
+        for m in messages {
+            match m.get("content") {
+                Some(Value::String(s)) => {
+                    out.push_str(s);
+                    out.push('\n');
+                }
+                Some(Value::Array(parts)) => {
+                    for p in parts {
+                        if let Some(t) = p.get("text").and_then(|t| t.as_str()) {
+                            out.push_str(t);
+                            out.push('\n');
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+/// Streams an OpenAI chat-completions SSE stream translated into Gemini
+/// `streamGenerateContent` SSE events (`data: {json}` lines).
+#[allow(clippy::too_many_arguments)]
+async fn stream_gemini(
+    state: SharedState,
+    url: &str,
+    headers: HeaderMap,
+    payload: Vec<u8>,
+    original_model: String,
+    translated: String,
+    req_size: usize,
+    start: Instant,
+) -> Response {
+    let req_body = state
+        .is_debug()
+        .then(|| String::from_utf8_lossy(&payload).into_owned());
+    let upstream = state
+        .http
+        .post(url)
+        .headers(headers)
+        .body(payload)
+        .send()
+        .await;
+    let upstream = match upstream {
+        Ok(r) => r,
+        Err(e) => return gemini_error(StatusCode::GATEWAY_TIMEOUT, e.to_string()),
+    };
+    let status = upstream.status().as_u16();
+    let model_json = Value::String(translated.clone());
+    let stream = async_stream::stream! {
+        use futures_util::StreamExt;
+        let mut byte_stream = upstream.bytes_stream();
+        let mut buf = String::new();
+        let mut input_tokens = 0u64;
+        let mut output_tokens = 0u64;
+        let mut resp_size = 0usize;
+        let mut finish: Option<String> = None;
+        let mut debug_resp = String::new();
+        while let Some(chunk) = byte_stream.next().await {
+            let Ok(chunk) = chunk else { break; };
+            let chunk_str = String::from_utf8_lossy(&chunk);
+            if state.is_debug() { debug_resp.push_str(&chunk_str); }
+            buf.push_str(&chunk_str);
+            let mut lines: Vec<&str> = buf.split('\n').collect();
+            let remainder = lines.pop().unwrap_or("").to_string();
+            for line in lines {
+                let line = line.trim_end_matches('\r');
+                if !line.starts_with("data: ") { continue; }
+                let data = &line[6..];
+                if data == "[DONE]" { continue; }
+                if let Ok(v) = serde_json::from_str::<Value>(data) {
+                    if let Some(u) = v.get("usage") {
+                        if !u.is_null() {
+                            input_tokens = u.get("prompt_tokens").and_then(|t| t.as_u64()).unwrap_or(input_tokens);
+                            output_tokens = u.get("completion_tokens").and_then(|t| t.as_u64()).unwrap_or(output_tokens);
+                        }
+                    }
+                    if let Some(choice) = v.get("choices").and_then(|c| c.as_array()).and_then(|a| a.first()) {
+                        if let Some(text) = choice.get("delta").and_then(|d| d.get("content")).and_then(|c| c.as_str()) {
+                            if !text.is_empty() {
+                                let ev = gemini::gemini_stream_text_chunk(text, &model_json);
+                                let payload = format!("data: {}\n\n", serde_json::to_string(&ev).unwrap_or_default());
+                                resp_size += payload.len();
+                                yield Ok::<Bytes, std::convert::Infallible>(Bytes::from(payload));
+                            }
+                        }
+                        if let Some(fr) = choice.get("finish_reason").and_then(|f| f.as_str()) {
+                            finish = Some(fr.to_string());
+                        }
+                    }
+                }
+            }
+            buf = remainder;
+        }
+        // Final chunk with finish reason + usage.
+        let usage = json!({"prompt_tokens": input_tokens, "completion_tokens": output_tokens});
+        let ev = gemini::gemini_stream_final_chunk(finish.as_deref(), &usage, &model_json);
+        let payload = format!("data: {}\n\n", serde_json::to_string(&ev).unwrap_or_default());
+        resp_size += payload.len();
+        yield Ok(Bytes::from(payload));
+        log_debug_response(&state, "/v1beta/models", &debug_resp);
+        state.store.add(RequestRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            timestamp: now_iso(),
+            endpoint: "/v1beta/models".to_string(),
+            model: original_model.clone(),
+            translated_model: (translated != original_model).then_some(translated.clone()),
+            status_code: status,
+            request_size: req_size,
+            response_size: resp_size,
+            input_tokens,
+            output_tokens,
+            duration: elapsed_secs(start),
+            request_body: req_body,
+            response_body: if state.is_debug() { Some(debug_resp) } else { None },
+            message_count: None,
+            tool_count: None,
+            tool_names: None,
+            stop_reason: None,
+            tools_called: None,
+            is_agent_initiated: None,
+            prompt_cache_hit: None,
+            estimated_cost_usd: Some(calculate_cost(&original_model, input_tokens, output_tokens)),
+        });
+    };
+    build_sse_response(stream)
+}
+
+// ---------------------------------------------------------------------------
 // Embeddings
 // ---------------------------------------------------------------------------
 
@@ -1510,6 +1870,95 @@ async fn dashboard() -> Response {
     serve_asset("dashboard.html", include_str!("../public/dashboard.html"))
 }
 
+/// Serves a machine-readable OpenAPI v3 specification describing the proxy's
+/// LLM endpoints (OpenAI, Anthropic, and Gemini surfaces). Mirrors the
+/// discovery endpoint exposed by agent-maestro so the same tooling works here.
+async fn openapi_spec() -> Response {
+    let spec = json!({
+        "openapi": "3.0.3",
+        "info": {
+            "title": "ghc-proxy",
+            "description": "GitHub Copilot API proxy exposing OpenAI-, Anthropic-, and Gemini-compatible endpoints.",
+            "version": env!("CARGO_PKG_VERSION")
+        },
+        "servers": [{ "url": "/" }],
+        "paths": {
+            "/v1/chat/completions": {
+                "post": {
+                    "summary": "OpenAI Chat Completions",
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+                    "responses": { "200": { "description": "Chat completion (JSON or SSE when stream=true)" } }
+                }
+            },
+            "/v1/responses": {
+                "post": {
+                    "summary": "OpenAI Responses API (Codex)",
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+                    "responses": { "200": { "description": "Response (JSON or SSE when stream=true)" } }
+                }
+            },
+            "/v1/messages": {
+                "post": {
+                    "summary": "Anthropic Messages API",
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+                    "responses": { "200": { "description": "Anthropic message (JSON or SSE when stream=true)" } }
+                }
+            },
+            "/v1/messages/count_tokens": {
+                "post": {
+                    "summary": "Anthropic token counting",
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+                    "responses": { "200": { "description": "Token count" } }
+                }
+            },
+            "/v1/embeddings": {
+                "post": {
+                    "summary": "OpenAI Embeddings",
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+                    "responses": { "200": { "description": "Embedding vectors" } }
+                }
+            },
+            "/v1/models": {
+                "get": {
+                    "summary": "List available models",
+                    "responses": { "200": { "description": "Model list" } }
+                }
+            },
+            "/v1beta/models/{model}:generateContent": {
+                "post": {
+                    "summary": "Gemini generateContent",
+                    "parameters": [{ "name": "model", "in": "path", "required": true, "schema": { "type": "string" } }],
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+                    "responses": { "200": { "description": "Gemini candidate response" } }
+                }
+            },
+            "/v1beta/models/{model}:streamGenerateContent": {
+                "post": {
+                    "summary": "Gemini streamGenerateContent (SSE)",
+                    "parameters": [{ "name": "model", "in": "path", "required": true, "schema": { "type": "string" } }],
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+                    "responses": { "200": { "description": "Gemini streaming response" } }
+                }
+            },
+            "/v1beta/models/{model}:countTokens": {
+                "post": {
+                    "summary": "Gemini countTokens",
+                    "parameters": [{ "name": "model", "in": "path", "required": true, "schema": { "type": "string" } }],
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+                    "responses": { "200": { "description": "Token count" } }
+                }
+            }
+        },
+        "components": {
+            "securitySchemes": {
+                "ApiKeyAuth": { "type": "apiKey", "in": "header", "name": "x-api-key" },
+                "BearerAuth": { "type": "http", "scheme": "bearer" }
+            }
+        }
+    });
+    Json(spec).into_response()
+}
+
 async fn requests_page() -> Response {
     serve_asset("requests.html", include_str!("../public/requests.html"))
 }
@@ -1861,4 +2310,61 @@ async fn api_audit_summary(State(state): State<SharedState>) -> Response {
         },
     }))
     .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderMap;
+
+    #[test]
+    fn constant_time_eq_matches() {
+        assert!(constant_time_eq(b"secret", b"secret"));
+        assert!(!constant_time_eq(b"secret", b"secrey"));
+        assert!(!constant_time_eq(b"secret", b"secre"));
+        assert!(!constant_time_eq(b"", b"x"));
+        assert!(constant_time_eq(b"", b""));
+    }
+
+    #[test]
+    fn protected_paths_cover_llm_endpoints() {
+        assert!(is_protected_path("/v1/chat/completions"));
+        assert!(is_protected_path("/v1/messages"));
+        assert!(is_protected_path("/v1/responses"));
+        assert!(is_protected_path("/chat/completions"));
+        assert!(is_protected_path(
+            "/v1beta/models/gemini-2.5-pro:generateContent"
+        ));
+        assert!(!is_protected_path("/"));
+        assert!(!is_protected_path("/metrics"));
+        assert!(!is_protected_path("/api/stats"));
+        assert!(!is_protected_path("/requests"));
+    }
+
+    #[test]
+    fn presented_key_from_bearer() {
+        let mut h = HeaderMap::new();
+        h.insert("authorization", HeaderValue::from_static("Bearer abc123"));
+        assert_eq!(presented_api_key(&h).as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn presented_key_from_x_api_key() {
+        let mut h = HeaderMap::new();
+        h.insert("x-api-key", HeaderValue::from_static("k-456"));
+        assert_eq!(presented_api_key(&h).as_deref(), Some("k-456"));
+    }
+
+    #[test]
+    fn presented_key_from_goog_header() {
+        let mut h = HeaderMap::new();
+        h.insert("x-goog-api-key", HeaderValue::from_static("g-789"));
+        assert_eq!(presented_api_key(&h).as_deref(), Some("g-789"));
+    }
+
+    #[test]
+    fn presented_key_absent() {
+        let h = HeaderMap::new();
+        assert_eq!(presented_api_key(&h), None);
+    }
 }

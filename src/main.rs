@@ -13,6 +13,8 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 struct Cli {
     setup: bool,
     claudecode: bool,
+    codex: bool,
+    gemini: bool,
     defaults: bool,
     port: Option<u16>,
     address: Option<String>,
@@ -41,6 +43,8 @@ fn parse_args() -> Cli {
         match arg.as_str() {
             "-s" | "--setup" => cli.setup = true,
             "--claudecode" => cli.claudecode = true,
+            "--codex" => cli.codex = true,
+            "--gemini" => cli.gemini = true,
             "-d" | "--default" => cli.defaults = true,
             "-c" | "--config" => cli.config = true,
             "-v" | "--version" => cli.version = true,
@@ -98,6 +102,10 @@ Options:
                           models); writes the config file
       --claudecode        Configure Claude Code (~/.claude/settings.json) to use
                           this proxy (with --setup)
+      --codex             Configure Codex (~/.codex/config.toml) to use this
+                          proxy (with --setup)
+      --gemini            Configure Gemini CLI (~/.gemini/.env) to use this
+                          proxy (with --setup)
   -d, --default           Reset config to defaults during setup
   -p, --port <port>       Port to listen on (default: {port})
   -a, --address <addr>    Address to listen on (default: {addr})
@@ -225,6 +233,23 @@ fn merge_claude_settings(existing: Option<&str>, base_url: &str) -> Result<Strin
             serde_json::Value::String(CLAUDE_CODE_PROXY_API_KEY.to_string()),
         );
     }
+    // Make Claude Code compact context earlier. Because the proxy routes through
+    // Copilot, whose tokenizer differs from Anthropic's, local token estimates
+    // can run lower than real usage and bump into the model's full window. These
+    // defaults trigger auto-compaction at ~85% of the reported window. Existing
+    // user values are preserved.
+    if !env_obj.contains_key("CLAUDE_CODE_AUTO_COMPACT_WINDOW") {
+        env_obj.insert(
+            "CLAUDE_CODE_AUTO_COMPACT_WINDOW".to_string(),
+            serde_json::Value::String("1".to_string()),
+        );
+    }
+    if !env_obj.contains_key("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE") {
+        env_obj.insert(
+            "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE".to_string(),
+            serde_json::Value::String("85".to_string()),
+        );
+    }
 
     serde_json::to_string_pretty(&root).map_err(|e| e.to_string())
 }
@@ -254,10 +279,235 @@ fn configure_claude_code(cfg: &ghc_proxy::config::Config) -> std::io::Result<std
     Ok(path)
 }
 
+/// Recommended default model for Codex when none is detected.
+const CODEX_DEFAULT_MODEL: &str = "gpt-5.5";
+/// Internal provider id written into the Codex config for this proxy.
+const CODEX_PROVIDER_ID: &str = "ghc-proxy";
+
+/// Merges a `[model_providers.ghc-proxy]` block plus top-level `model`,
+/// `model_provider`, and (optionally) `model_context_window` into the given
+/// Codex `config.toml` content, preserving every other setting. `existing` is
+/// the current file contents (or `None`/empty for a new file). Returns the
+/// serialized TOML to write, or an error if `existing` is not valid TOML.
+fn merge_codex_config(
+    existing: Option<&str>,
+    base_url: &str,
+    model: &str,
+    context_window: Option<u64>,
+) -> Result<String, String> {
+    use toml::Value;
+    let mut root: Value = match existing {
+        Some(contents) if !contents.trim().is_empty() => contents
+            .parse::<Value>()
+            .map_err(|e| format!("existing config.toml is not valid TOML: {e}"))?,
+        _ => Value::Table(toml::map::Map::new()),
+    };
+    let table = root
+        .as_table_mut()
+        .ok_or_else(|| "existing config.toml is not a TOML table".to_string())?;
+
+    table.insert("model".to_string(), Value::String(model.to_string()));
+    table.insert(
+        "model_provider".to_string(),
+        Value::String(CODEX_PROVIDER_ID.to_string()),
+    );
+    if let Some(window) = context_window {
+        table.insert(
+            "model_context_window".to_string(),
+            Value::Integer(window as i64),
+        );
+    }
+
+    // Ensure [model_providers] exists and is a table, then write our provider.
+    let providers = table
+        .entry("model_providers".to_string())
+        .or_insert_with(|| Value::Table(toml::map::Map::new()));
+    if !providers.is_table() {
+        *providers = Value::Table(toml::map::Map::new());
+    }
+    let providers = providers.as_table_mut().unwrap();
+    let mut provider = toml::map::Map::new();
+    provider.insert("name".to_string(), Value::String("GHC Proxy".to_string()));
+    provider.insert(
+        "base_url".to_string(),
+        Value::String(format!("{base_url}/v1")),
+    );
+    provider.insert(
+        "wire_api".to_string(),
+        Value::String("responses".to_string()),
+    );
+    providers.insert(CODEX_PROVIDER_ID.to_string(), Value::Table(provider));
+
+    toml::to_string_pretty(&root).map_err(|e| e.to_string())
+}
+
+/// Patches Codex's `~/.codex/config.toml` so it routes through this proxy by
+/// adding a `model_providers.ghc-proxy` block and selecting it. Any existing
+/// settings are preserved (merged); the file and directory are created if
+/// missing. `context_window` is written as `model_context_window` when known.
+/// Returns the path that was written.
+fn configure_codex(
+    cfg: &ghc_proxy::config::Config,
+    model: &str,
+    context_window: Option<u64>,
+) -> std::io::Result<std::path::PathBuf> {
+    let dir = dirs::home_dir()
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "home directory not found")
+        })?
+        .join(".codex");
+    let path = dir.join("config.toml");
+    let base_url = format!("http://{}:{}", cfg.address, cfg.port);
+
+    let existing = std::fs::read_to_string(&path).ok();
+    let merged = merge_codex_config(existing.as_deref(), &base_url, model, context_window)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(&path, merged)?;
+    Ok(path)
+}
+
+/// Default model written for the Gemini CLI when none is detected.
+const GEMINI_DEFAULT_MODEL: &str = "gemini-2.5-pro";
+/// Default API key placeholder written for local Gemini CLI auth.
+const GEMINI_PROXY_API_KEY: &str = "ghc-proxy";
+
+/// Merges Gemini CLI environment variables into the lines of an existing `.env`
+/// file, preserving unrelated entries and any user-set `GEMINI_API_KEY`. Returns
+/// the full `.env` text to write.
+fn merge_gemini_env(existing: Option<&str>, base_url: &str, model: &str) -> String {
+    use std::collections::BTreeSet;
+    // Keys we manage; existing values for these are replaced (except the API key
+    // which is only filled when absent).
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut out_lines: Vec<String> = Vec::new();
+    let mut has_api_key = false;
+
+    if let Some(contents) = existing {
+        for line in contents.lines() {
+            let trimmed = line.trim_start();
+            let key = trimmed
+                .split_once('=')
+                .map(|(k, _)| k.trim().to_string())
+                .unwrap_or_default();
+            match key.as_str() {
+                "GOOGLE_GEMINI_BASE_URL" => {
+                    out_lines.push(format!("GOOGLE_GEMINI_BASE_URL={base_url}/v1beta"));
+                    seen.insert(key);
+                }
+                "GEMINI_MODEL" => {
+                    out_lines.push(format!("GEMINI_MODEL={model}"));
+                    seen.insert(key);
+                }
+                "GEMINI_TELEMETRY_ENABLED" => {
+                    out_lines.push("GEMINI_TELEMETRY_ENABLED=false".to_string());
+                    seen.insert(key);
+                }
+                "GEMINI_API_KEY" => {
+                    // Preserve a user-set key untouched.
+                    out_lines.push(line.to_string());
+                    has_api_key = true;
+                    seen.insert(key);
+                }
+                _ => out_lines.push(line.to_string()),
+            }
+        }
+    }
+
+    if !seen.contains("GOOGLE_GEMINI_BASE_URL") {
+        out_lines.push(format!("GOOGLE_GEMINI_BASE_URL={base_url}/v1beta"));
+    }
+    if !has_api_key {
+        out_lines.push(format!("GEMINI_API_KEY={GEMINI_PROXY_API_KEY}"));
+    }
+    if !seen.contains("GEMINI_MODEL") {
+        out_lines.push(format!("GEMINI_MODEL={model}"));
+    }
+    if !seen.contains("GEMINI_TELEMETRY_ENABLED") {
+        out_lines.push("GEMINI_TELEMETRY_ENABLED=false".to_string());
+    }
+
+    let mut s = out_lines.join("\n");
+    s.push('\n');
+    s
+}
+
+/// Patches the Gemini CLI's `~/.gemini/.env` so it routes through this proxy by
+/// writing `GOOGLE_GEMINI_BASE_URL`, `GEMINI_API_KEY`, `GEMINI_MODEL`, and
+/// disabling telemetry. Existing unrelated entries are preserved. Also writes a
+/// `settings.json` selecting the api-key auth method to skip the first-launch
+/// prompt. Returns the `.env` path that was written.
+fn configure_gemini_cli(
+    cfg: &ghc_proxy::config::Config,
+    model: &str,
+) -> std::io::Result<std::path::PathBuf> {
+    let dir = dirs::home_dir()
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "home directory not found")
+        })?
+        .join(".gemini");
+    let env_path = dir.join(".env");
+    let base_url = format!("http://{}:{}", cfg.address, cfg.port);
+
+    let existing = std::fs::read_to_string(&env_path).ok();
+    let merged = merge_gemini_env(existing.as_deref(), &base_url, model);
+
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(&env_path, merged)?;
+
+    // Best-effort: select the api-key auth method to skip the first-run prompt.
+    let settings_path = dir.join("settings.json");
+    let settings_existing = std::fs::read_to_string(&settings_path).ok();
+    if let Ok(merged_settings) = merge_gemini_settings(settings_existing.as_deref()) {
+        let _ = std::fs::write(&settings_path, merged_settings + "\n");
+    }
+
+    Ok(env_path)
+}
+
+/// Merges `security.auth.selectedType = "gemini-api-key"` into a Gemini CLI
+/// `settings.json`, preserving every other setting.
+fn merge_gemini_settings(existing: Option<&str>) -> Result<String, String> {
+    let mut root: serde_json::Value = match existing {
+        Some(contents) if !contents.trim().is_empty() => serde_json::from_str(contents)
+            .map_err(|e| format!("existing settings.json is not valid JSON: {e}"))?,
+        _ => serde_json::json!({}),
+    };
+    let obj = root
+        .as_object_mut()
+        .ok_or_else(|| "existing settings.json is not a JSON object".to_string())?;
+    let security = obj
+        .entry("security")
+        .or_insert_with(|| serde_json::json!({}));
+    if !security.is_object() {
+        *security = serde_json::json!({});
+    }
+    let auth = security
+        .as_object_mut()
+        .unwrap()
+        .entry("auth")
+        .or_insert_with(|| serde_json::json!({}));
+    if !auth.is_object() {
+        *auth = serde_json::json!({});
+    }
+    auth.as_object_mut().unwrap().insert(
+        "selectedType".to_string(),
+        serde_json::Value::String("gemini-api-key".to_string()),
+    );
+    serde_json::to_string_pretty(&root).map_err(|e| e.to_string())
+}
+
 /// Prints an interactive-style setup guide after the configuration file has
 /// been written/updated. Always shown for `--setup`, even when a config file
 /// already existed.
-fn print_setup_guide(cfg: &ghc_proxy::config::Config, path: &std::path::Path, claudecode: bool) {
+fn print_setup_guide(
+    cfg: &ghc_proxy::config::Config,
+    path: &std::path::Path,
+    claudecode: bool,
+    codex: bool,
+    gemini: bool,
+) {
     let bar = "=".repeat(60);
     println!("\n{bar}");
     println!("ghc-proxy setup");
@@ -316,6 +566,52 @@ fn print_setup_guide(cfg: &ghc_proxy::config::Config, path: &std::path::Path, cl
                     cfg.address,
                     cfg.port,
                     CLAUDE_CODE_PROXY_API_KEY
+                );
+            }
+        }
+    }
+
+    if codex {
+        println!("\nCodex:");
+        match configure_codex(cfg, CODEX_DEFAULT_MODEL, None) {
+            Ok(p) => {
+                println!(
+                    "  Added model_provider \"{CODEX_PROVIDER_ID}\" (base_url http://{}:{}/v1)\n  and selected model {CODEX_DEFAULT_MODEL} in:\n    {}",
+                    cfg.address,
+                    cfg.port,
+                    p.display()
+                );
+                println!("  Codex will now route through this proxy.");
+            }
+            Err(e) => {
+                println!("  Failed to update Codex settings: {e}");
+                println!(
+                    "  Manually add a [model_providers.{CODEX_PROVIDER_ID}] block with\n  base_url=http://{}:{}/v1 in ~/.codex/config.toml",
+                    cfg.address,
+                    cfg.port
+                );
+            }
+        }
+    }
+
+    if gemini {
+        println!("\nGemini CLI:");
+        match configure_gemini_cli(cfg, GEMINI_DEFAULT_MODEL) {
+            Ok(p) => {
+                println!(
+                    "  Set GOOGLE_GEMINI_BASE_URL=http://{}:{}/v1beta and GEMINI_MODEL={GEMINI_DEFAULT_MODEL}\n  in:\n    {}",
+                    cfg.address,
+                    cfg.port,
+                    p.display()
+                );
+                println!("  Gemini CLI will now route through this proxy.");
+            }
+            Err(e) => {
+                println!("  Failed to update Gemini CLI settings: {e}");
+                println!(
+                    "  Manually set GOOGLE_GEMINI_BASE_URL=http://{}:{}/v1beta in ~/.gemini/.env",
+                    cfg.address,
+                    cfg.port
                 );
             }
         }
@@ -457,18 +753,26 @@ async fn main() {
 
         // In a terminal, walk the user through an interactive wizard; otherwise
         // (piped/headless) fall back to writing the config non-interactively.
+        let codex_flag = cli.codex;
+        let gemini_flag = cli.gemini;
         if setup::is_interactive() {
             if let Some(outcome) = setup::run(cfg, cli.claudecode).await {
                 match config::write_config(&outcome.cfg) {
-                    Ok(path) => {
-                        print_setup_guide(&outcome.cfg, &path, outcome.configure_claude_code)
-                    }
+                    Ok(path) => print_setup_guide(
+                        &outcome.cfg,
+                        &path,
+                        outcome.configure_claude_code,
+                        codex_flag,
+                        gemini_flag,
+                    ),
                     Err(e) => eprintln!("Failed to write config: {e}"),
                 }
             }
         } else {
             match config::write_config(&cfg) {
-                Ok(path) => print_setup_guide(&cfg, &path, cli.claudecode),
+                Ok(path) => {
+                    print_setup_guide(&cfg, &path, cli.claudecode, codex_flag, gemini_flag)
+                }
                 Err(e) => eprintln!("Failed to write config: {e}"),
             }
         }
@@ -492,6 +796,18 @@ async fn main() {
                     match configure_claude_code(&outcome.cfg) {
                         Ok(p) => tracing::info!("✓ Claude Code configured at {}", p.display()),
                         Err(e) => tracing::warn!("Failed to configure Claude Code: {e}"),
+                    }
+                }
+                if cli.codex {
+                    match configure_codex(&outcome.cfg, CODEX_DEFAULT_MODEL, None) {
+                        Ok(p) => tracing::info!("✓ Codex configured at {}", p.display()),
+                        Err(e) => tracing::warn!("Failed to configure Codex: {e}"),
+                    }
+                }
+                if cli.gemini {
+                    match configure_gemini_cli(&outcome.cfg, GEMINI_DEFAULT_MODEL) {
+                        Ok(p) => tracing::info!("✓ Gemini CLI configured at {}", p.display()),
+                        Err(e) => tracing::warn!("Failed to configure Gemini CLI: {e}"),
                     }
                 }
                 outcome.cfg
@@ -624,6 +940,8 @@ async fn main() {
     println!("OpenAI API:     http://{host}:{port}/v1/chat/completions");
     println!("Responses API:  http://{host}:{port}/v1/responses");
     println!("Anthropic API:  http://{host}:{port}/v1/messages");
+    println!("Gemini API:     http://{host}:{port}/v1beta/models/{{model}}:generateContent");
+    println!("OpenAPI spec:   http://{host}:{port}/openapi.json");
 
     let listener = match tokio::net::TcpListener::bind(addr).await {
         Ok(l) => l,
@@ -640,7 +958,82 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::merge_claude_settings;
+    use super::{merge_claude_settings, merge_codex_config};
+
+    #[test]
+    fn codex_config_new_file() {
+        let out = merge_codex_config(None, "http://127.0.0.1:8314", "gpt-5.5", Some(272000)).unwrap();
+        let v: toml::Value = out.parse().unwrap();
+        assert_eq!(v["model"].as_str(), Some("gpt-5.5"));
+        assert_eq!(v["model_provider"].as_str(), Some("ghc-proxy"));
+        assert_eq!(v["model_context_window"].as_integer(), Some(272000));
+        assert_eq!(
+            v["model_providers"]["ghc-proxy"]["base_url"].as_str(),
+            Some("http://127.0.0.1:8314/v1")
+        );
+        assert_eq!(
+            v["model_providers"]["ghc-proxy"]["wire_api"].as_str(),
+            Some("responses")
+        );
+    }
+
+    #[test]
+    fn codex_config_preserves_existing_keys() {
+        let existing = "approval_policy = \"on-request\"\n[tui]\ntheme = \"dark\"\n";
+        let out = merge_codex_config(Some(existing), "http://x", "gpt-5.5", None).unwrap();
+        let v: toml::Value = out.parse().unwrap();
+        // Unrelated keys preserved.
+        assert_eq!(v["approval_policy"].as_str(), Some("on-request"));
+        assert_eq!(v["tui"]["theme"].as_str(), Some("dark"));
+        // Provider added.
+        assert_eq!(v["model_provider"].as_str(), Some("ghc-proxy"));
+        // No context window key when None.
+        assert!(v.get("model_context_window").is_none());
+    }
+
+    #[test]
+    fn codex_config_rejects_invalid_toml() {
+        assert!(merge_codex_config(Some("=not valid="), "http://x", "m", None).is_err());
+    }
+
+    #[test]
+    fn gemini_env_new_file() {
+        let out = super::merge_gemini_env(None, "http://127.0.0.1:8314", "gemini-2.5-pro");
+        assert!(out.contains("GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:8314/v1beta"));
+        assert!(out.contains("GEMINI_API_KEY=ghc-proxy"));
+        assert!(out.contains("GEMINI_MODEL=gemini-2.5-pro"));
+        assert!(out.contains("GEMINI_TELEMETRY_ENABLED=false"));
+    }
+
+    #[test]
+    fn gemini_env_preserves_user_key_and_other_vars() {
+        let existing = "FOO=bar\nGEMINI_API_KEY=real-key\nGOOGLE_GEMINI_BASE_URL=http://old/v1beta\n";
+        let out = super::merge_gemini_env(Some(existing), "http://x", "m");
+        // Unrelated var preserved.
+        assert!(out.contains("FOO=bar"));
+        // User key untouched.
+        assert!(out.contains("GEMINI_API_KEY=real-key"));
+        assert!(!out.contains("GEMINI_API_KEY=ghc-proxy"));
+        // Base URL updated to the new value (old removed).
+        assert!(out.contains("GOOGLE_GEMINI_BASE_URL=http://x/v1beta"));
+        assert!(!out.contains("http://old/v1beta"));
+    }
+
+    #[test]
+    fn gemini_settings_selects_api_key_auth() {
+        let out = super::merge_gemini_settings(None).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["security"]["auth"]["selectedType"], "gemini-api-key");
+    }
+
+    #[test]
+    fn gemini_settings_preserves_existing() {
+        let existing = r#"{"theme":"dark"}"#;
+        let out = super::merge_gemini_settings(Some(existing)).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["theme"], "dark");
+        assert_eq!(v["security"]["auth"]["selectedType"], "gemini-api-key");
+    }
 
     #[test]
     fn creates_env_when_file_is_new() {
@@ -648,6 +1041,17 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["env"]["ANTHROPIC_BASE_URL"], "http://127.0.0.1:8314");
         assert_eq!(v["env"]["ANTHROPIC_API_KEY"], "ghc-proxy");
+        assert_eq!(v["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "1");
+        assert_eq!(v["env"]["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"], "85");
+    }
+
+    #[test]
+    fn preserves_existing_compaction_overrides() {
+        let existing = r#"{"env":{"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE":"70"}}"#;
+        let out = merge_claude_settings(Some(existing), "http://x").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["env"]["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"], "70");
+        assert_eq!(v["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "1");
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "ghc-proxy"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 description = "GitHub Copilot API Proxy - Provides OpenAI and Anthropic compatible endpoints via GitHub Copilot (Rust port of ghc-tunnel)"
 license = "MIT"
@@ -35,5 +35,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tiktoken-rs = "0.12"
 dialoguer = { version = "0.12", default-features = false, features = ["fuzzy-select"] }
 self_update = "0.44"
+toml = "0.8"
 
 [dev-dependencies]

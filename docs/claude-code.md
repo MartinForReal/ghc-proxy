@@ -20,11 +20,14 @@ Run the setup wizard with the Claude Code step enabled:
 ./target/release/ghc-proxy --setup --claudecode
 ```
 
-This patches `~/.claude/settings.json`, merging both `env.ANTHROPIC_BASE_URL`
-and `env.ANTHROPIC_API_KEY` so Claude Code routes its Anthropic API calls
-through the proxy. Existing settings are preserved — the base URL is updated,
-an API key is added only when missing, and the file is left untouched if it is
-not valid JSON.
+This patches `~/.claude/settings.json`, merging `env.ANTHROPIC_BASE_URL` and
+`env.ANTHROPIC_API_KEY` so Claude Code routes its Anthropic API calls through the
+proxy. It also sets `CLAUDE_CODE_AUTO_COMPACT_WINDOW` and
+`CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` (default 85%) so Claude Code compacts context
+earlier — Copilot’s tokenizer differs from Anthropic’s, so local token estimates
+can run lower than real usage. Existing settings are preserved — the base URL is
+updated, keys and overrides are added only when missing, and the file is left
+untouched if it is not valid JSON.
 
 ### Manual setup
 
@@ -75,11 +78,37 @@ upstream Copilot Responses API behave like the Codex client expects:
 - `service_tier` nulling
 - stripping of unsupported tools
 
+### Automatic setup
+
+```bash
+./target/release/ghc-proxy --setup --codex
+```
+
+This patches `~/.codex/config.toml`, adding a `model_providers.ghc-proxy` block
+(pointing at `http://127.0.0.1:8314/v1`) and selecting it. Existing settings are
+preserved, and the file is left untouched if it is not valid TOML.
+
+### Manual setup
+
 Point the Codex CLI at the proxy's base URL:
 
 ```bash
 export OPENAI_BASE_URL="http://127.0.0.1:8314/v1"
 ```
+
+## Gemini CLI
+
+Configure the Gemini CLI automatically:
+
+```bash
+./target/release/ghc-proxy --setup --gemini
+```
+
+This writes `~/.gemini/.env` with `GOOGLE_GEMINI_BASE_URL`
+(`http://127.0.0.1:8314/v1beta`), `GEMINI_MODEL`, and disables telemetry, and
+selects api-key auth in `~/.gemini/settings.json` to skip the first-launch
+prompt. Any user-set `GEMINI_API_KEY` is preserved. The Gemini surface is served
+at `/v1beta/models/{model}:generateContent` (plus streaming and token counting).
 
 ## Tips
 

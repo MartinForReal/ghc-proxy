@@ -48,6 +48,8 @@ Reload config:  POST http://127.0.0.1:8314/api/config/reload
 OpenAI API:     http://127.0.0.1:8314/v1/chat/completions
 Responses API:  http://127.0.0.1:8314/v1/responses
 Anthropic API:  http://127.0.0.1:8314/v1/messages
+Gemini API:     http://127.0.0.1:8314/v1beta/models/{model}:generateContent
+OpenAPI spec:   http://127.0.0.1:8314/openapi.json
 ```
 
 ## Authentication
@@ -85,13 +87,14 @@ It walks through:
 3. **Model mappings** — fetches the live model catalog and lets you map the
    `opus` / `sonnet` / `haiku` aliases to specific models, or keep the
    recommended defaults.
-4. **Claude Code** — optionally configure `~/.claude/settings.json` to route
-   through the proxy (`ANTHROPIC_BASE_URL` and `ANTHROPIC_API_KEY`; existing
-   API key values are preserved).
+4. **Client setup** — optionally configure Claude Code
+   (`~/.claude/settings.json`), Codex (`~/.codex/config.toml`), and the Gemini
+   CLI (`~/.gemini/.env`) to route through the proxy. Existing settings are
+   preserved and any user-set API key is left untouched.
 
-Pass `--default` to start from built-in defaults, or `--claudecode` to include
-the Claude Code step automatically. The wizard only runs when attached to a
-terminal, so automated launches are unaffected.
+Pass `--default` to start from built-in defaults, or `--claudecode` / `--codex`
+/ `--gemini` to include the matching client-setup step automatically. The wizard
+only runs when attached to a terminal, so automated launches are unaffected.
 
 ## Config directory
 

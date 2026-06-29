@@ -92,6 +92,17 @@ impl AppState {
         self.config.read().unwrap().model_mappings.clone()
     }
 
+    /// The configured endpoint API key, if authentication is enabled.
+    pub fn api_key(&self) -> Option<String> {
+        self.config
+            .read()
+            .unwrap()
+            .api_key
+            .as_ref()
+            .filter(|k| !k.is_empty())
+            .cloned()
+    }
+
     pub fn copilot_base_url(&self) -> String {
         self.config.read().unwrap().copilot_base_url()
     }
@@ -300,6 +311,26 @@ impl AppState {
             return false;
         }
         self.model_supports_endpoint(model, "/v1/messages").await
+    }
+
+    /// Returns the tokenizer name advertised by the model's catalog entry
+    /// (`capabilities.tokenizer`), used to pick a tiktoken encoder for local
+    /// token estimation. Falls back to `cl100k_base` when unknown.
+    pub async fn model_tokenizer(&self, model: &str) -> String {
+        let models = self.models.read().await;
+        models
+            .as_ref()
+            .and_then(|m| m.get("data"))
+            .and_then(|d| d.as_array())
+            .and_then(|arr| {
+                arr.iter()
+                    .find(|m| m.get("id").and_then(|i| i.as_str()) == Some(model))
+                    .and_then(|m| m.get("capabilities"))
+                    .and_then(|c| c.get("tokenizer"))
+                    .and_then(|t| t.as_str())
+                    .map(|s| s.to_string())
+            })
+            .unwrap_or_else(|| "cl100k_base".to_string())
     }
 
     /// Whether the named model advertises an extended (>200K) context window,
