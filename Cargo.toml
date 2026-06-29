@@ -35,6 +35,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tiktoken-rs = "0.12"
 dialoguer = { version = "0.12", default-features = false, features = ["fuzzy-select"] }
 self_update = "0.44"
-toml = "0.8"
+toml = "1.1"
 
 [dev-dependencies]
