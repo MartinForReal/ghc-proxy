@@ -149,7 +149,7 @@ fn prompt_server_settings(defaults: &Config) -> dialoguer::Result<ServerSettings
         .unwrap_or(0);
     let idx = Select::with_theme(&theme)
         .with_prompt("Copilot account type")
-        .items(&types)
+        .items(types)
         .default(current)
         .interact()?;
 

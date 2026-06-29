@@ -79,7 +79,10 @@ pub fn gemini_to_openai(req: &Value, model: &str, stream: bool) -> Value {
     let mut messages: Vec<Value> = Vec::new();
 
     // System instruction -> system message.
-    if let Some(sys) = req.get("systemInstruction").or_else(|| req.get("system_instruction")) {
+    if let Some(sys) = req
+        .get("systemInstruction")
+        .or_else(|| req.get("system_instruction"))
+    {
         let parts = arr(sys, "parts");
         let text = parts_text(&parts);
         if !text.is_empty() {
@@ -88,7 +91,10 @@ pub fn gemini_to_openai(req: &Value, model: &str, stream: bool) -> Value {
     }
 
     for content in arr(req, "contents") {
-        let role = content.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+        let role = content
+            .get("role")
+            .and_then(|r| r.as_str())
+            .unwrap_or("user");
         let parts = arr(&content, "parts");
 
         // Function responses become OpenAI tool messages.
@@ -156,14 +162,20 @@ pub fn gemini_to_openai(req: &Value, model: &str, stream: bool) -> Value {
     out.insert("stream".into(), Value::Bool(stream));
 
     // generationConfig -> top-level OpenAI sampling params.
-    if let Some(gc) = req.get("generationConfig").or_else(|| req.get("generation_config")) {
+    if let Some(gc) = req
+        .get("generationConfig")
+        .or_else(|| req.get("generation_config"))
+    {
         if let Some(v) = gc.get("temperature") {
             out.insert("temperature".into(), v.clone());
         }
         if let Some(v) = gc.get("topP").or_else(|| gc.get("top_p")) {
             out.insert("top_p".into(), v.clone());
         }
-        if let Some(v) = gc.get("maxOutputTokens").or_else(|| gc.get("max_output_tokens")) {
+        if let Some(v) = gc
+            .get("maxOutputTokens")
+            .or_else(|| gc.get("max_output_tokens"))
+        {
             out.insert("max_tokens".into(), v.clone());
         }
         if let Some(v) = gc.get("stopSequences").or_else(|| gc.get("stop_sequences")) {
@@ -207,7 +219,10 @@ pub fn map_finish_reason(reason: Option<&str>) -> &'static str {
 
 /// Builds a Gemini `usageMetadata` object from an OpenAI `usage` object.
 fn usage_to_gemini(usage: &Value) -> Value {
-    let prompt = usage.get("prompt_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+    let prompt = usage
+        .get("prompt_tokens")
+        .and_then(|t| t.as_u64())
+        .unwrap_or(0);
     let completion = usage
         .get("completion_tokens")
         .and_then(|t| t.as_u64())
@@ -369,7 +384,10 @@ mod tests {
             "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
         });
         let out = openai_to_gemini(&resp);
-        assert_eq!(out["candidates"][0]["content"]["parts"][0]["text"], "hello there");
+        assert_eq!(
+            out["candidates"][0]["content"]["parts"][0]["text"],
+            "hello there"
+        );
         assert_eq!(out["candidates"][0]["finishReason"], "STOP");
         assert_eq!(out["usageMetadata"]["promptTokenCount"], 10);
         assert_eq!(out["usageMetadata"]["candidatesTokenCount"], 5);

@@ -297,8 +297,7 @@ fn merge_codex_config(
 ) -> Result<String, String> {
     use toml::Value;
     let mut root: Value = match existing {
-        Some(contents) if !contents.trim().is_empty() => contents
-            .parse::<Value>()
+        Some(contents) if !contents.trim().is_empty() => toml::from_str::<Value>(contents)
             .map_err(|e| format!("existing config.toml is not valid TOML: {e}"))?,
         _ => Value::Table(toml::map::Map::new()),
     };
@@ -610,8 +609,7 @@ fn print_setup_guide(
                 println!("  Failed to update Gemini CLI settings: {e}");
                 println!(
                     "  Manually set GOOGLE_GEMINI_BASE_URL=http://{}:{}/v1beta in ~/.gemini/.env",
-                    cfg.address,
-                    cfg.port
+                    cfg.address, cfg.port
                 );
             }
         }
@@ -770,9 +768,7 @@ async fn main() {
             }
         } else {
             match config::write_config(&cfg) {
-                Ok(path) => {
-                    print_setup_guide(&cfg, &path, cli.claudecode, codex_flag, gemini_flag)
-                }
+                Ok(path) => print_setup_guide(&cfg, &path, cli.claudecode, codex_flag, gemini_flag),
                 Err(e) => eprintln!("Failed to write config: {e}"),
             }
         }
@@ -962,8 +958,9 @@ mod tests {
 
     #[test]
     fn codex_config_new_file() {
-        let out = merge_codex_config(None, "http://127.0.0.1:8314", "gpt-5.5", Some(272000)).unwrap();
-        let v: toml::Value = out.parse().unwrap();
+        let out =
+            merge_codex_config(None, "http://127.0.0.1:8314", "gpt-5.5", Some(272000)).unwrap();
+        let v: toml::Value = toml::from_str(&out).unwrap();
         assert_eq!(v["model"].as_str(), Some("gpt-5.5"));
         assert_eq!(v["model_provider"].as_str(), Some("ghc-proxy"));
         assert_eq!(v["model_context_window"].as_integer(), Some(272000));
@@ -981,7 +978,7 @@ mod tests {
     fn codex_config_preserves_existing_keys() {
         let existing = "approval_policy = \"on-request\"\n[tui]\ntheme = \"dark\"\n";
         let out = merge_codex_config(Some(existing), "http://x", "gpt-5.5", None).unwrap();
-        let v: toml::Value = out.parse().unwrap();
+        let v: toml::Value = toml::from_str(&out).unwrap();
         // Unrelated keys preserved.
         assert_eq!(v["approval_policy"].as_str(), Some("on-request"));
         assert_eq!(v["tui"]["theme"].as_str(), Some("dark"));
@@ -1007,7 +1004,8 @@ mod tests {
 
     #[test]
     fn gemini_env_preserves_user_key_and_other_vars() {
-        let existing = "FOO=bar\nGEMINI_API_KEY=real-key\nGOOGLE_GEMINI_BASE_URL=http://old/v1beta\n";
+        let existing =
+            "FOO=bar\nGEMINI_API_KEY=real-key\nGOOGLE_GEMINI_BASE_URL=http://old/v1beta\n";
         let out = super::merge_gemini_env(Some(existing), "http://x", "m");
         // Unrelated var preserved.
         assert!(out.contains("FOO=bar"));

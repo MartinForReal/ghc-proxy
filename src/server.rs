@@ -108,7 +108,11 @@ fn presented_api_key(headers: &HeaderMap) -> Option<String> {
 /// Authentication middleware. When an API key is configured, every request to a
 /// protected LLM endpoint must present a matching key. When no key is
 /// configured, all requests pass through unchanged.
-async fn auth_middleware(State(state): State<SharedState>, request: Request, next: Next) -> Response {
+async fn auth_middleware(
+    State(state): State<SharedState>,
+    request: Request,
+    next: Next,
+) -> Response {
     let Some(expected) = state.api_key() else {
         return next.run(request).await;
     };
@@ -1213,7 +1217,10 @@ async fn gemini_generate(
         let parsed: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
         let gemini_resp = gemini::openai_to_gemini(&parsed);
         let usage = parsed.get("usage").cloned().unwrap_or(json!({}));
-        let input_tokens = usage.get("prompt_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+        let input_tokens = usage
+            .get("prompt_tokens")
+            .and_then(|t| t.as_u64())
+            .unwrap_or(0);
         let output_tokens = usage
             .get("completion_tokens")
             .and_then(|t| t.as_u64())

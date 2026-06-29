@@ -371,7 +371,9 @@ pub fn render_config_yaml(cfg: &Config) -> String {
         }
         if let Some(ref key) = cfg.api_key {
             if !key.is_empty() {
-                s.push_str("# API key required on LLM endpoints (Bearer / x-api-key / x-goog-api-key)\n");
+                s.push_str(
+                    "# API key required on LLM endpoints (Bearer / x-api-key / x-goog-api-key)\n",
+                );
                 let _ = writeln!(s, "api_key: {}", yaml_scalar(key));
             }
         }
