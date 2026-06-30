@@ -1,0 +1,23 @@
+src/main.rs
+  s_4328714ed0a0d0::t_9c0c4ab6741178 630-631
+Cargo.lock
+  s_4328714ed0a0d0::t_64c0b2fd9f864c 35-43,158-163,185-193,291-296,342-350,360-406,413-423,435-444,492-522,571-586,601,695-704,745,1332-1341,1474,1484-1493,1792-1793,1804,1808-1809,1907-1917,1949-1958,2014-2023,2067-2077,2419-2424,2952-2961,3065-3096,3102-3113
+Cargo.toml
+  s_4328714ed0a0d0::t_5dafe66fc5667a 3,37
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.3",
+  "base_commit_sha": "460a03ae2f678a5d1c8cc3e5c389190078e12c5f",
+  "prompts": {},
+  "sessions": {
+    "s_4328714ed0a0d0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "cd1f8143-87b0-40a7-8746-a40af0d42600",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Fan Shangxiang <fanshangxiang@gmail.com>"
+    }
+  }
+}
