@@ -627,6 +627,8 @@ fn maybe_auto_upgrade(enabled: bool) {
         .repo_owner("MartinForReal")
         .repo_name("ghc-proxy")
         .bin_name("ghc-proxy")
+        .bin_path_in_archive("ghc-proxy-v{{ version }}-{{ target }}/{{ bin }}")
+        .no_confirm(true)
         .show_download_progress(true)
         .current_version(VERSION)
         .build()
