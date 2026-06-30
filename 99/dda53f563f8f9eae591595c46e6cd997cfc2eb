@@ -1,0 +1,21 @@
+Cargo.lock
+  s_4328714ed0a0d0::t_5e1fa63733a5bc 1462,1464,2236,2243,2442-2450
+Cargo.toml
+  s_4328714ed0a0d0::t_b0e0537de99cbc 37
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.3",
+  "base_commit_sha": "99dda53f563f8f9eae591595c46e6cd997cfc2eb",
+  "prompts": {},
+  "sessions": {
+    "s_4328714ed0a0d0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "cd1f8143-87b0-40a7-8746-a40af0d42600",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Fan Shangxiang <fanshangxiang@gmail.com>"
+    }
+  }
+}
