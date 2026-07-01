@@ -206,6 +206,57 @@ impl AppState {
         h
     }
 
+    /// Token used for GitHub Models requests: the dedicated `github_models.token`
+    /// when configured, otherwise the resolved GitHub token. This token must
+    /// carry the `models` scope (classic/OAuth) or `models: read` permission
+    /// (fine-grained PAT).
+    pub async fn github_models_token(&self) -> String {
+        if let Some(token) = self.config_snapshot().github_models.token {
+            if !token.is_empty() {
+                return token;
+            }
+        }
+        self.tokens.lock().await.github_token.clone()
+    }
+
+    /// Headers for a GitHub Models inference request. Unlike the Copilot path,
+    /// this authenticates with the raw GitHub token via `Authorization: Bearer`
+    /// and sends the standard GitHub REST API headers. None of the Copilot
+    /// impersonation headers are included.
+    pub async fn github_models_headers(&self) -> HeaderMap {
+        let cfg = self.config_snapshot();
+        let token = self.github_models_token().await;
+        let mut h = HeaderMap::new();
+        insert(&mut h, "Authorization", &format!("Bearer {token}"));
+        h.insert("Content-Type", HeaderValue::from_static("application/json"));
+        h.insert(
+            "Accept",
+            HeaderValue::from_static("application/vnd.github+json"),
+        );
+        insert(
+            &mut h,
+            "X-GitHub-Api-Version",
+            &cfg.github_models.api_version,
+        );
+        insert(&mut h, "User-Agent", &cfg.user_agent());
+        h
+    }
+
+    /// Resolves the upstream chat-completions `(url, headers, is_github_models)`
+    /// for a given (translated) model. Routes to GitHub Models inference when
+    /// the model uses the `publisher/model` convention and GitHub Models is
+    /// enabled; otherwise uses the Copilot upstream. The `vision` flag only
+    /// affects the Copilot headers.
+    pub async fn chat_upstream(&self, model: &str, vision: bool) -> (String, HeaderMap, bool) {
+        if self.config_snapshot().routes_to_github_models(model) {
+            let url = self.config_snapshot().github_models_inference_url();
+            (url, self.github_models_headers().await, true)
+        } else {
+            let url = format!("{}/chat/completions", self.copilot_base_url());
+            (url, self.copilot_headers(vision).await, false)
+        }
+    }
+
     /// Refreshes the Copilot token if it is missing or within 60 seconds of
     /// expiry.
     pub async fn ensure_copilot_token(&self) -> Result<(), String> {
@@ -238,7 +289,9 @@ impl AppState {
         Ok(())
     }
 
-    /// Fetches the list of available models from upstream and caches it.
+    /// Fetches the list of available models from upstream and caches it. When
+    /// GitHub Models is enabled, its catalog is appended (best-effort) so those
+    /// models also appear in `/v1/models` and the dashboard.
     pub async fn load_models(&self) -> Result<(), String> {
         self.ensure_copilot_token().await?;
         let url = format!("{}/models", self.copilot_base_url());
@@ -253,16 +306,78 @@ impl AppState {
         if !resp.status().is_success() {
             return Err(format!("Failed to fetch models: {}", resp.status()));
         }
-        let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-        let count = json
+        let mut json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+        let mut count = json
             .get("data")
             .and_then(|d| d.as_array())
             .map(|a| a.len())
             .unwrap_or(0);
+
+        if self.config_snapshot().github_models.enabled {
+            match self.load_github_models_catalog().await {
+                Ok(entries) => {
+                    let added = entries.len();
+                    if let Some(data) = json.get_mut("data").and_then(|d| d.as_array_mut()) {
+                        data.extend(entries);
+                        count += added;
+                    }
+                    tracing::info!("Loaded {added} GitHub Models catalog entries");
+                }
+                Err(e) => tracing::warn!("GitHub Models catalog unavailable: {e}"),
+            }
+        }
+
         *self.models.write().await = Some(json);
         *self.models_loaded_at.lock().await = Some(Instant::now());
         tracing::info!("Loaded {count} models");
         Ok(())
+    }
+
+    /// Fetches the GitHub Models catalog (`GET /catalog/models`) and normalizes
+    /// each entry into the model-list shape used by `/v1/models`
+    /// (`id` / `name` / `vendor`). Returns an error the caller can log without
+    /// failing the primary Copilot model load.
+    async fn load_github_models_catalog(&self) -> Result<Vec<serde_json::Value>, String> {
+        let url = self.config_snapshot().github_models_catalog_url();
+        let headers = self.github_models_headers().await;
+        let resp = self
+            .http
+            .get(&url)
+            .headers(headers)
+            .timeout(Duration::from_secs(15))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !resp.status().is_success() {
+            return Err(format!("catalog fetch returned {}", resp.status()));
+        }
+        let catalog: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+        // The catalog is documented as a bare array; tolerate `{models|data:[…]}`
+        // wrappers as well.
+        let arr = catalog
+            .as_array()
+            .cloned()
+            .or_else(|| catalog.get("models").and_then(|m| m.as_array()).cloned())
+            .or_else(|| catalog.get("data").and_then(|m| m.as_array()).cloned())
+            .unwrap_or_default();
+        let entries = arr
+            .iter()
+            .filter_map(|m| {
+                let id = m.get("id").and_then(|i| i.as_str())?;
+                let name = m.get("name").and_then(|n| n.as_str()).unwrap_or(id);
+                let vendor = m
+                    .get("publisher")
+                    .and_then(|p| p.as_str())
+                    .unwrap_or("github-models");
+                Some(serde_json::json!({
+                    "id": id,
+                    "name": name,
+                    "vendor": vendor,
+                    "source": "github-models",
+                }))
+            })
+            .collect();
+        Ok(entries)
     }
 
     pub async fn ensure_models_fresh(&self, max_age: Duration) -> Result<(), String> {

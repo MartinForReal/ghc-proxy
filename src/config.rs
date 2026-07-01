@@ -33,6 +33,15 @@ pub const GITHUB_CLIENT_ID: &str = "01ab8ac9400c4e429b23";
 /// GitHub REST API base URL.
 pub const GITHUB_API: &str = "https://api.github.com";
 
+/// GitHub Models inference service base URL (https://models.github.ai).
+/// Exposes OpenAI-compatible chat completions, embeddings, and a model catalog.
+pub const GITHUB_MODELS_BASE: &str = "https://models.github.ai";
+
+/// Default `X-GitHub-Api-Version` header value sent to the GitHub Models API.
+/// This is the REST API versioning header, independent of the Copilot
+/// `api_version`, and matches the value in GitHub's Models quickstart.
+pub const GITHUB_MODELS_API_VERSION: &str = "2022-11-28";
+
 /// Default listen address.
 pub const DEFAULT_ADDRESS: &str = "127.0.0.1";
 /// Default listen port.
@@ -45,6 +54,52 @@ pub struct ModelMappings {
     pub exact: BTreeMap<String, String>,
     #[serde(default)]
     pub prefix: BTreeMap<String, String>,
+}
+
+/// GitHub Models inference settings. When enabled, requests whose (translated)
+/// model id uses the `publisher/model` convention (i.e. it contains a `/`, such
+/// as `openai/gpt-4o`) are routed to the GitHub Models API at
+/// `https://models.github.ai` instead of the Copilot upstream. These ids never
+/// collide with Copilot model ids, which never contain a `/`.
+///
+/// GitHub Models authenticates with the raw GitHub token, which must carry the
+/// `models` scope (classic/OAuth tokens) or the `models: read` permission
+/// (fine-grained PATs).
+#[derive(Debug, Clone, Deserialize)]
+pub struct GithubModels {
+    /// Enable routing of `publisher/model` ids to GitHub Models. Default: true.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Optional organization to attribute inference to. When set, requests use
+    /// `POST /orgs/{org}/inference/chat/completions`.
+    #[serde(default)]
+    pub org: Option<String>,
+    /// Optional dedicated token for GitHub Models (e.g. a fine-grained PAT with
+    /// the `models: read` permission). Falls back to the resolved GitHub token
+    /// when unset/empty.
+    #[serde(default)]
+    pub token: Option<String>,
+    /// `X-GitHub-Api-Version` header value for GitHub Models requests.
+    #[serde(default = "default_models_api_version")]
+    pub api_version: String,
+}
+
+impl Default for GithubModels {
+    fn default() -> Self {
+        GithubModels {
+            enabled: true,
+            org: None,
+            token: None,
+            api_version: default_models_api_version(),
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+fn default_models_api_version() -> String {
+    GITHUB_MODELS_API_VERSION.to_string()
 }
 
 /// Parsed representation of `config.yaml`.
@@ -68,6 +123,10 @@ pub struct Config {
     pub copilot_version: String,
     #[serde(default)]
     pub model_mappings: ModelMappings,
+    /// GitHub Models inference settings (routing of `publisher/model` ids to
+    /// `https://models.github.ai`).
+    #[serde(default)]
+    pub github_models: GithubModels,
     #[serde(default)]
     pub system_prompt_remove: Vec<String>,
     #[serde(default)]
@@ -151,6 +210,7 @@ impl Default for Config {
             api_version: default_api_version(),
             copilot_version: default_copilot_version(),
             model_mappings: default_model_mappings(),
+            github_models: GithubModels::default(),
             system_prompt_remove: Vec::new(),
             system_prompt_add: Vec::new(),
             tool_result_suffix_remove: Vec::new(),
@@ -183,6 +243,30 @@ impl Config {
 
     pub fn user_agent(&self) -> String {
         format!("GitHubCopilotChat/{}", self.copilot_version)
+    }
+
+    /// Whether a (translated) model id should be routed to the GitHub Models
+    /// inference API rather than the Copilot upstream. True when GitHub Models
+    /// is enabled and the id uses the `publisher/model` convention (contains a
+    /// `/`), which never collides with Copilot model ids.
+    pub fn routes_to_github_models(&self, model: &str) -> bool {
+        self.github_models.enabled && model.contains('/')
+    }
+
+    /// GitHub Models chat-completions inference URL, using the org-attributed
+    /// path when an organization is configured.
+    pub fn github_models_inference_url(&self) -> String {
+        match self.github_models.org.as_deref() {
+            Some(org) if !org.is_empty() => {
+                format!("{GITHUB_MODELS_BASE}/orgs/{org}/inference/chat/completions")
+            }
+            _ => format!("{GITHUB_MODELS_BASE}/inference/chat/completions"),
+        }
+    }
+
+    /// GitHub Models catalog URL used to list available models.
+    pub fn github_models_catalog_url(&self) -> String {
+        format!("{GITHUB_MODELS_BASE}/catalog/models")
     }
 }
 
@@ -313,6 +397,31 @@ pub fn render_config_yaml(cfg: &Config) -> String {
     s.push_str("  prefix:\n");
     for (k, v) in &cfg.model_mappings.prefix {
         let _ = writeln!(s, "    {}: {}", yaml_scalar(k), yaml_scalar(v));
+    }
+    s.push('\n');
+    s.push_str("# GitHub Models (https://models.github.ai) inference\n");
+    s.push_str("# When enabled, requests whose model id uses the publisher/model form\n");
+    s.push_str("# (e.g. openai/gpt-4o) route to GitHub Models instead of Copilot. The GitHub\n");
+    s.push_str("# token must carry the `models` scope (classic/OAuth) or `models: read`\n");
+    s.push_str("# permission (fine-grained PAT).\n");
+    s.push_str("github_models:\n");
+    let _ = writeln!(s, "  enabled: {}", cfg.github_models.enabled);
+    match cfg.github_models.org.as_deref() {
+        Some(org) if !org.is_empty() => {
+            let _ = writeln!(s, "  org: {}", yaml_scalar(org));
+        }
+        _ => s.push_str("  # org: my-org            # attribute inference to an organization\n"),
+    }
+    match cfg.github_models.token.as_deref() {
+        Some(tok) if !tok.is_empty() => {
+            let _ = writeln!(s, "  token: {}", yaml_scalar(tok));
+        }
+        _ => s.push_str(
+            "  # token: ghp_xxx          # dedicated token with the models scope / models:read\n",
+        ),
+    }
+    if cfg.github_models.api_version != GITHUB_MODELS_API_VERSION {
+        let _ = writeln!(s, "  api_version: \"{}\"", cfg.github_models.api_version);
     }
     s.push('\n');
     s.push_str("# Content Filtering\n");
@@ -600,6 +709,24 @@ pub fn load_config_with_options(write_back_on_migration: bool) -> Config {
         tracing::info!("API key auth enabled via GHC_PROXY_API_KEY");
     }
 
+    if let Ok(val) = std::env::var("GHC_PROXY_GITHUB_MODELS_ENABLED") {
+        cfg.github_models.enabled = val.eq_ignore_ascii_case("true") || val == "1";
+        tracing::info!(
+            "✓ Overriding github_models.enabled from GHC_PROXY_GITHUB_MODELS_ENABLED: {}",
+            cfg.github_models.enabled
+        );
+    }
+    if let Ok(val) = std::env::var("GHC_PROXY_GITHUB_MODELS_ORG") {
+        let trimmed = val.trim();
+        cfg.github_models.org = (!trimmed.is_empty()).then(|| trimmed.to_string());
+        tracing::info!("✓ Overriding github_models.org from GHC_PROXY_GITHUB_MODELS_ORG");
+    }
+    if let Ok(val) = std::env::var("GHC_PROXY_GITHUB_MODELS_TOKEN") {
+        let trimmed = val.trim();
+        cfg.github_models.token = (!trimmed.is_empty()).then(|| trimmed.to_string());
+        tracing::info!("GitHub Models token set via GHC_PROXY_GITHUB_MODELS_TOKEN");
+    }
+
     cfg
 }
 
@@ -647,4 +774,117 @@ fn migrate_config(cfg: &mut Config) -> bool {
     }
 
     changed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn github_models_defaults_enabled() {
+        let gm = GithubModels::default();
+        assert!(gm.enabled);
+        assert!(gm.org.is_none());
+        assert!(gm.token.is_none());
+        assert_eq!(gm.api_version, GITHUB_MODELS_API_VERSION);
+        // The default Config carries the same enabled-by-default value.
+        assert!(Config::default().github_models.enabled);
+    }
+
+    #[test]
+    fn routes_publisher_model_ids_to_github_models() {
+        let cfg = Config::default();
+        // `publisher/model` ids route to GitHub Models...
+        assert!(cfg.routes_to_github_models("openai/gpt-4o"));
+        assert!(cfg.routes_to_github_models("meta/llama-4-maverick"));
+        // ...while plain Copilot ids never do (they contain no slash).
+        assert!(!cfg.routes_to_github_models("claude-opus-4.8"));
+        assert!(!cfg.routes_to_github_models("gpt-4o"));
+        assert!(!cfg.routes_to_github_models("gemini-2.5-pro"));
+    }
+
+    #[test]
+    fn disabled_github_models_never_routes() {
+        let mut cfg = Config::default();
+        cfg.github_models.enabled = false;
+        assert!(!cfg.routes_to_github_models("openai/gpt-4o"));
+    }
+
+    #[test]
+    fn inference_url_uses_org_when_set() {
+        let mut cfg = Config::default();
+        assert_eq!(
+            cfg.github_models_inference_url(),
+            "https://models.github.ai/inference/chat/completions"
+        );
+        cfg.github_models.org = Some("my-org".to_string());
+        assert_eq!(
+            cfg.github_models_inference_url(),
+            "https://models.github.ai/orgs/my-org/inference/chat/completions"
+        );
+        // An empty org string falls back to the non-attributed endpoint.
+        cfg.github_models.org = Some(String::new());
+        assert_eq!(
+            cfg.github_models_inference_url(),
+            "https://models.github.ai/inference/chat/completions"
+        );
+    }
+
+    #[test]
+    fn catalog_url_is_stable() {
+        assert_eq!(
+            Config::default().github_models_catalog_url(),
+            "https://models.github.ai/catalog/models"
+        );
+    }
+
+    #[test]
+    fn rendered_config_roundtrips_github_models() {
+        // Rendered YAML must parse back into an equivalent config.
+        let mut cfg = Config::default();
+        cfg.github_models.org = Some("acme".to_string());
+        let yaml = render_config_yaml(&cfg);
+        let parsed: Config = serde_norway::from_str(&yaml).expect("render must re-parse");
+        assert!(parsed.github_models.enabled);
+        assert_eq!(parsed.github_models.org.as_deref(), Some("acme"));
+        assert_eq!(parsed.github_models.api_version, GITHUB_MODELS_API_VERSION);
+    }
+
+    #[test]
+    fn absent_github_models_key_defaults_enabled() {
+        // Legacy config files predating this feature omit the key entirely.
+        let yaml = "config_version: 2\naddress: 127.0.0.1\nport: 8314\n";
+        let parsed: Config = serde_norway::from_str(yaml).expect("legacy config parses");
+        assert!(parsed.github_models.enabled);
+    }
+
+    #[test]
+    fn default_rendered_config_reparses() {
+        // The default document is written on first run and on corruption rebuild;
+        // it must always re-parse. In the default case org/token render as
+        // comments and api_version is omitted, so the block is just `enabled`.
+        let yaml = default_config_yaml();
+        let parsed: Config = serde_norway::from_str(&yaml).expect("default config re-parses");
+        assert!(parsed.github_models.enabled);
+        assert!(parsed.github_models.org.is_none());
+        assert!(parsed.github_models.token.is_none());
+        assert_eq!(parsed.github_models.api_version, GITHUB_MODELS_API_VERSION);
+        // api_version is only emitted when non-default, so the default value
+        // never appears in the rendered document.
+        assert!(!yaml.contains(GITHUB_MODELS_API_VERSION));
+    }
+
+    #[test]
+    fn rendered_token_and_custom_api_version_roundtrip() {
+        // Exercise the token (yaml_scalar) and non-default api_version branches
+        // that the org-only case leaves untested.
+        let mut cfg = Config::default();
+        cfg.github_models.token = Some("ghp_abc123".to_string());
+        cfg.github_models.api_version = "2099-01-01".to_string();
+        let yaml = render_config_yaml(&cfg);
+        assert!(yaml.contains("api_version: \"2099-01-01\""));
+        let parsed: Config = serde_norway::from_str(&yaml).expect("render must re-parse");
+        assert_eq!(parsed.github_models.token.as_deref(), Some("ghp_abc123"));
+        assert_eq!(parsed.github_models.api_version, "2099-01-01");
+    }
 }

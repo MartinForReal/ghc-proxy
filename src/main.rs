@@ -145,6 +145,9 @@ Environment Variables:
   GHC_PROXY_RATE_LIMIT_SECONDS      Minimum seconds between requests
   GHC_PROXY_RATE_LIMIT_WAIT         Wait instead of rejecting when limited (true/1)
   GHC_PROXY_MANUAL_APPROVE          Require manual approval per request (true/1)
+  GHC_PROXY_GITHUB_MODELS_ENABLED   Route publisher/model ids to GitHub Models (true/1)
+  GHC_PROXY_GITHUB_MODELS_ORG       Attribute GitHub Models inference to an org
+  GHC_PROXY_GITHUB_MODELS_TOKEN     Dedicated token for GitHub Models (models scope)
 
 Priority: CLI flags > Environment variables > Config file > Defaults",
         port = config::DEFAULT_PORT,

@@ -48,6 +48,14 @@ model_mappings:
   prefix:
     claude-sonnet-4-: claude-opus-4.8
 
+# GitHub Models (https://models.github.ai) inference
+# Route publisher/model ids (e.g. openai/gpt-4o) to GitHub Models instead of
+# Copilot. The GitHub token must carry the `models` scope / `models: read`.
+github_models:
+  enabled: true
+  # org: my-org
+  # token: ghp_xxx
+
 # Content filtering
 system_prompt_remove: []
 system_prompt_add: []
@@ -83,6 +91,24 @@ Controls the upstream base URL only:
 | `enterprise`   | `https://api.enterprise.githubcopilot.com` |
 
 Set this to match the Copilot seat your token actually has.
+
+### GitHub Models
+
+[GitHub Models](https://models.github.ai) is GitHub's OpenAI-compatible model
+**inference** service, separate from Copilot. When `github_models.enabled` is
+true (the default), any request whose *translated* model id uses the
+`publisher/model` form (contains a `/`, e.g. `openai/gpt-4o`) is routed there
+instead of Copilot. These ids never collide with Copilot ids, so mappings and
+existing behavior are unaffected. Routing applies to `/v1/chat/completions`,
+`/v1/messages` (translated), and the Gemini endpoints.
+
+GitHub Models authenticates with the **raw GitHub token** (not the Copilot
+token) via `Authorization: Bearer`. That token must carry the **`models`** scope
+(classic/OAuth tokens — the Device Flow requests it automatically) or the
+**`models: read`** permission (fine-grained PATs). Set `github_models.token` (or
+`GHC_PROXY_GITHUB_MODELS_TOKEN`) to use a dedicated token, and `github_models.org`
+to attribute inference to an organization. The catalog is merged into
+`GET /v1/models`.
 
 ## Command-line options
 
@@ -138,6 +164,9 @@ Every config field has a `GHC_PROXY_*` override:
 | `GHC_PROXY_RATE_LIMIT_WAIT` | Wait instead of rejecting when limited (`true`/`1`) |
 | `GHC_PROXY_MANUAL_APPROVE` | Require manual approval per request (`true`/`1`) |
 | `GHC_PROXY_API_KEY` | Require this key on LLM endpoints (empty = disabled) |
+| `GHC_PROXY_GITHUB_MODELS_ENABLED` | Route `publisher/model` ids to GitHub Models (`true`/`1`) |
+| `GHC_PROXY_GITHUB_MODELS_ORG` | Attribute GitHub Models inference to an organization |
+| `GHC_PROXY_GITHUB_MODELS_TOKEN` | Dedicated token for GitHub Models (`models` scope) |
 
 Token-related variables (`COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN`) are
 covered in [Getting Started](getting-started.md#authentication).

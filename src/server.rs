@@ -458,12 +458,6 @@ async fn get_models_full(State(state): State<SharedState>) -> Response {
 
 async fn chat_completions(State(state): State<SharedState>, body: Bytes) -> Response {
     let start = Instant::now();
-    if let Err(e) = state.ensure_copilot_token().await {
-        return error_response(StatusCode::INTERNAL_SERVER_ERROR, e);
-    }
-    if let Err(e) = state.apply_request_gate("/v1/chat/completions").await {
-        return error_response(StatusCode::TOO_MANY_REQUESTS, e);
-    }
     let mut req = match parse_body(&body) {
         Ok(v) => v,
         Err(r) => return r,
@@ -476,6 +470,18 @@ async fn chat_completions(State(state): State<SharedState>, body: Bytes) -> Resp
     let translated = translate::translate(&state.model_mappings(), &original_model);
     if translated != original_model {
         req["model"] = Value::String(translated.clone());
+    }
+
+    // GitHub Models requests use the raw GitHub token, not the Copilot token, so
+    // only ensure the Copilot token when the request routes to Copilot.
+    let to_github_models = state.config_snapshot().routes_to_github_models(&translated);
+    if !to_github_models {
+        if let Err(e) = state.ensure_copilot_token().await {
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, e);
+        }
+    }
+    if let Err(e) = state.apply_request_gate("/v1/chat/completions").await {
+        return error_response(StatusCode::TOO_MANY_REQUESTS, e);
     }
 
     let messages = req
@@ -500,12 +506,19 @@ async fn chat_completions(State(state): State<SharedState>, body: Bytes) -> Resp
         )
     });
 
-    let mut headers = state.copilot_headers(vision).await;
-    set_initiator(&mut headers, agent);
+    let (url, mut headers, is_github_models) = state.chat_upstream(&translated, vision).await;
+    if !is_github_models {
+        set_initiator(&mut headers, agent);
+    }
 
     let req_size = body.len();
-    let url = format!("{}/chat/completions", state.copilot_base_url());
     let is_stream = req.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
+    // GitHub Models (strict OpenAI-compatible) only emits a final usage chunk on
+    // streaming requests when asked. Copilot emits it unconditionally, so only
+    // opt in for GitHub Models and only when the client hasn't set its own.
+    if is_github_models && is_stream && req.get("stream_options").is_none() {
+        req["stream_options"] = json!({"include_usage": true});
+    }
     let payload = serde_json::to_vec(&req).unwrap_or_default();
     log_debug_request(&state, "/v1/chat/completions", &req);
 
@@ -721,12 +734,6 @@ async fn responses(State(state): State<SharedState>, body: Bytes) -> Response {
 
 async fn messages(State(state): State<SharedState>, body: Bytes) -> Response {
     let start = Instant::now();
-    if let Err(e) = state.ensure_copilot_token().await {
-        return anthropic_error(StatusCode::INTERNAL_SERVER_ERROR, e);
-    }
-    if let Err(e) = state.apply_request_gate("/v1/messages").await {
-        return anthropic_error(StatusCode::TOO_MANY_REQUESTS, e);
-    }
     let mut req = match parse_body(&body) {
         Ok(v) => v,
         Err(r) => return r,
@@ -740,11 +747,26 @@ async fn messages(State(state): State<SharedState>, body: Bytes) -> Response {
     if translated != original_model {
         req["model"] = Value::String(translated.clone());
     }
+
+    // Only the Copilot upstream needs the Copilot token; GitHub Models uses the
+    // raw GitHub token via the translated chat-completions path.
+    let to_github_models = state.config_snapshot().routes_to_github_models(&translated);
+    if !to_github_models {
+        if let Err(e) = state.ensure_copilot_token().await {
+            return anthropic_error(StatusCode::INTERNAL_SERVER_ERROR, e);
+        }
+    }
+    if let Err(e) = state.apply_request_gate("/v1/messages").await {
+        return anthropic_error(StatusCode::TOO_MANY_REQUESTS, e);
+    }
     let cfg = state.config_snapshot();
     req = anthropic::apply_system_prompt(&req, &cfg);
     req = anthropic::apply_tool_result_suffix(&req, &cfg);
 
-    if state.use_direct_anthropic(&translated).await {
+    // GitHub Models is OpenAI-shaped, never Anthropic-native, so it must always
+    // take the translated path. Make that invariant explicit here rather than
+    // relying on the merged catalog entries lacking a `/v1/messages` endpoint.
+    if !to_github_models && state.use_direct_anthropic(&translated).await {
         messages_direct(state, req, original_model, translated, start).await
     } else {
         messages_translated(state, req, original_model, translated, start).await
@@ -944,7 +966,6 @@ async fn messages_translated(
     start: Instant,
 ) -> Response {
     let vision = anthropic::has_image(&req);
-    let url = format!("{}/chat/completions", state.copilot_base_url());
     let is_stream = req.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
 
     let mut current = req.clone();
@@ -963,8 +984,10 @@ async fn messages_translated(
                 })
             })
             .unwrap_or(false);
-        let mut headers = state.copilot_headers(vision).await;
-        set_initiator(&mut headers, agent);
+        let (url, mut headers, is_github_models) = state.chat_upstream(&translated, vision).await;
+        if !is_github_models {
+            set_initiator(&mut headers, agent);
+        }
         let req_size = serde_json::to_vec(&current).map(|v| v.len()).unwrap_or(0);
         let payload = serde_json::to_vec(&openai_req).unwrap_or_default();
         log_debug_request(&state, "/v1/messages", &openai_req);
@@ -1148,10 +1171,6 @@ async fn gemini_generate(
     let start = Instant::now();
     let (raw_model, action) = split_model_action(&model_action);
 
-    if let Err(e) = state.ensure_copilot_token().await {
-        return gemini_error(StatusCode::INTERNAL_SERVER_ERROR, e);
-    }
-
     let req = match parse_body(&body) {
         Ok(v) => v,
         Err(r) => return r,
@@ -1160,6 +1179,7 @@ async fn gemini_generate(
     let translated = translate::translate(&state.model_mappings(), &raw_model);
 
     // countTokens: translate and defer to the chat-completions-based estimate.
+    // This is a local estimate and needs no upstream token.
     if action == "countTokens" || action == "counttokens" {
         let openai_req = gemini::gemini_to_openai(&req, &translated, false);
         let text = collect_text_for_count(&openai_req);
@@ -1170,6 +1190,14 @@ async fn gemini_generate(
 
     let is_stream = action == "streamGenerateContent" || action == "streamgeneratecontent";
 
+    // GitHub Models uses the raw GitHub token; only ensure the Copilot token
+    // when the request routes to Copilot.
+    let to_github_models = state.config_snapshot().routes_to_github_models(&translated);
+    if !to_github_models {
+        if let Err(e) = state.ensure_copilot_token().await {
+            return gemini_error(StatusCode::INTERNAL_SERVER_ERROR, e);
+        }
+    }
     if let Err(e) = state.apply_request_gate("/v1beta/models").await {
         return gemini_error(StatusCode::TOO_MANY_REQUESTS, e);
     }
@@ -1177,10 +1205,11 @@ async fn gemini_generate(
     let openai_req = gemini::gemini_to_openai(&req, &translated, is_stream);
     let vision = gemini::has_image(&req);
     let agent = gemini::is_agent(&req);
-    let mut headers = state.copilot_headers(vision).await;
-    set_initiator(&mut headers, agent);
+    let (url, mut headers, is_github_models) = state.chat_upstream(&translated, vision).await;
+    if !is_github_models {
+        set_initiator(&mut headers, agent);
+    }
 
-    let url = format!("{}/chat/completions", state.copilot_base_url());
     let req_size = body.len();
     let payload = serde_json::to_vec(&openai_req).unwrap_or_default();
     log_debug_request(&state, "/v1beta/models", &openai_req);
@@ -1311,6 +1340,21 @@ async fn stream_gemini(
         Err(e) => return gemini_error(StatusCode::GATEWAY_TIMEOUT, e.to_string()),
     };
     let status = upstream.status().as_u16();
+    // Surface a non-2xx upstream (JSON error, not SSE) as a normal error.
+    if !(200..300).contains(&status) {
+        let text = upstream.text().await.unwrap_or_default();
+        log_debug_response(&state, "/v1beta/models", &text);
+        log_error(
+            "/v1beta/models",
+            &json!({"model": &translated}),
+            &text,
+            status,
+        );
+        return gemini_error(
+            StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+            text,
+        );
+    }
     let model_json = Value::String(translated.clone());
     let stream = async_stream::stream! {
         use futures_util::StreamExt;
@@ -1531,6 +1575,18 @@ async fn stream_openai(
         Err(e) => return error_response(StatusCode::GATEWAY_TIMEOUT, e.to_string()),
     };
     let status = upstream.status().as_u16();
+    // A non-2xx upstream (e.g. GitHub Models returning 401/403 as JSON when the
+    // token lacks the `models` scope) is not an SSE stream — surface it as a
+    // normal error instead of forwarding a broken "stream".
+    if !(200..300).contains(&status) {
+        let text = upstream.text().await.unwrap_or_default();
+        log_debug_response(&state, endpoint, &text);
+        log_error(endpoint, &json!({"model": &translated}), &text, status);
+        return passthrough_error(
+            StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+            text,
+        );
+    }
     let model = translated.clone();
     let stream = async_stream::stream! {
         use futures_util::StreamExt;
@@ -1785,6 +1841,21 @@ async fn stream_anthropic_translated(
         Err(e) => return anthropic_error(StatusCode::GATEWAY_TIMEOUT, e.to_string()),
     };
     let status = upstream.status().as_u16();
+    // Surface a non-2xx upstream (JSON error, not SSE) as a normal error.
+    if !(200..300).contains(&status) {
+        let text = upstream.text().await.unwrap_or_default();
+        log_debug_response(&state, "/v1/messages", &text);
+        log_error(
+            "/v1/messages",
+            &json!({"model": &translated}),
+            &text,
+            status,
+        );
+        return passthrough_error(
+            StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+            text,
+        );
+    }
     let stream = async_stream::stream! {
         use futures_util::StreamExt;
         let mut byte_stream = upstream.bytes_stream();

@@ -43,6 +43,11 @@ file.
 - **Gemini-compatible** `/v1beta/models/{model}:generateContent`,
   `:streamGenerateContent`, and `:countTokens` endpoints (translated through chat
   completions).
+- **GitHub Models inference** — requests whose model id uses the
+  `publisher/model` form (e.g. `openai/gpt-4o`) are transparently routed to the
+  [GitHub Models](https://models.github.ai) API instead of Copilot, authenticated
+  with the raw GitHub token (which must carry the `models` scope). Enabled by
+  default; the catalog is merged into `/v1/models`.
 - **Optional API-key authentication** on the LLM endpoints
   (`Authorization: Bearer`, `x-api-key`, or `x-goog-api-key`), disabled by
   default and compared in constant time.
@@ -106,6 +111,11 @@ The GitHub token is exchanged for a short-lived **Copilot token** via
 `https://api.github.com/copilot_internal/v2/token`, which is refreshed
 automatically before it expires.
 
+The interactive Device Flow requests the `read:user copilot models` scopes. The
+`models` scope authorizes the [GitHub Models](#github-models) inference API; if
+you supply your own token instead, give it the `models` scope (classic/OAuth
+token) or the `models: read` permission (fine-grained PAT) to use GitHub Models.
+
 ## Endpoint Authentication
 
 By default the proxy accepts all local requests. To require a key, set `api_key`
@@ -162,6 +172,10 @@ model_mappings:
     haiku: claude-haiku-4.5
   prefix:
     claude-sonnet-4-: claude-opus-4.8
+github_models:
+  enabled: true                     # route publisher/model ids to GitHub Models
+  # org: my-org                     # attribute inference to an organization
+  # token: ghp_xxx                  # dedicated token (models scope / models:read)
 system_prompt_remove: []
 system_prompt_add: []
 tool_result_suffix_remove: []
@@ -171,6 +185,52 @@ max_connection_retries: 3
 # x-goog-api-key). Omit or leave empty to disable authentication.
 # api_key: my-secret-key
 ```
+
+## GitHub Models
+
+Besides Copilot, GitHub offers a separate model **inference** service —
+[GitHub Models](https://models.github.ai) — exposing OpenAI-compatible endpoints
+for models from OpenAI, Meta, Mistral, xAI, DeepSeek, and others. This proxy
+routes to it transparently.
+
+**Routing.** GitHub Models identifies models by a `publisher/model` id (e.g.
+`openai/gpt-4o`, `meta/llama-4-maverick`). When `github_models.enabled` is true
+(the default), any request whose *translated* model id contains a `/` is sent to
+GitHub Models instead of Copilot. Because Copilot model ids never contain a `/`,
+the two never collide, and existing model mappings are unaffected. This works on
+`/v1/chat/completions`, `/v1/messages` (translated), and the Gemini endpoints.
+
+```bash
+curl http://127.0.0.1:8314/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "openai/gpt-4o", "messages": [{"role": "user", "content": "Hi!"}]}'
+```
+
+**Authentication.** GitHub Models uses the raw GitHub token (not the Copilot
+token) via `Authorization: Bearer`. The token must carry the **`models`** scope
+(classic/OAuth tokens, including the one minted by the Device Flow) or the
+**`models: read`** permission (fine-grained PATs). Tokens without it get an
+`Unauthorized` response from GitHub. To use a dedicated token — e.g. a
+fine-grained PAT scoped only to `models: read` — set `github_models.token` or the
+`GHC_PROXY_GITHUB_MODELS_TOKEN` environment variable.
+
+**Configuration.**
+
+```yaml
+github_models:
+  enabled: true          # set false to always use Copilot
+  org: my-org            # optional: attribute inference to an organization
+  token: ghp_xxx         # optional: dedicated token (models scope / models:read)
+```
+
+| Environment variable | Effect |
+|----------------------|--------|
+| `GHC_PROXY_GITHUB_MODELS_ENABLED` | Enable/disable routing (`true`/`1`) |
+| `GHC_PROXY_GITHUB_MODELS_ORG` | Attribute inference to an organization |
+| `GHC_PROXY_GITHUB_MODELS_TOKEN` | Dedicated token for GitHub Models |
+
+The GitHub Models catalog is merged into `GET /v1/models` so those ids show up in
+the dashboard and model listings.
 
 ## API Endpoints
 
