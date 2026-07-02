@@ -619,6 +619,20 @@ async fn responses(State(state): State<SharedState>, body: Bytes) -> Response {
         req["model"] = Value::String(translated.clone());
     }
 
+    // /v1/responses is the Codex Responses API — Copilot-only.
+    // GitHub Models models (publisher/model convention) are not supported here.
+    if state
+        .config_snapshot()
+        .routes_to_github_models(&translated)
+    {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Model '{original_model}' routes to GitHub Models which does not support \
+                 the Responses API. Use /v1/chat/completions with '{translated}' instead."
+            ),
+        );
+    }
     if !state
         .model_supports_endpoint(&translated, "/responses")
         .await
@@ -748,13 +762,11 @@ async fn messages(State(state): State<SharedState>, body: Bytes) -> Response {
         req["model"] = Value::String(translated.clone());
     }
 
-    // Only the Copilot upstream needs the Copilot token; GitHub Models uses the
-    // raw GitHub token via the translated chat-completions path.
-    let to_github_models = state.config_snapshot().routes_to_github_models(&translated);
-    if !to_github_models {
-        if let Err(e) = state.ensure_copilot_token().await {
-            return anthropic_error(StatusCode::INTERNAL_SERVER_ERROR, e);
-        }
+    // /v1/messages is the Anthropic Messages API used by Claude Code.
+    // GitHub Models only exposes an OpenAI-compatible chat-completions surface,
+    // so we never route this endpoint there — always use Copilot.
+    if let Err(e) = state.ensure_copilot_token().await {
+        return anthropic_error(StatusCode::INTERNAL_SERVER_ERROR, e);
     }
     if let Err(e) = state.apply_request_gate("/v1/messages").await {
         return anthropic_error(StatusCode::TOO_MANY_REQUESTS, e);
@@ -763,10 +775,7 @@ async fn messages(State(state): State<SharedState>, body: Bytes) -> Response {
     req = anthropic::apply_system_prompt(&req, &cfg);
     req = anthropic::apply_tool_result_suffix(&req, &cfg);
 
-    // GitHub Models is OpenAI-shaped, never Anthropic-native, so it must always
-    // take the translated path. Make that invariant explicit here rather than
-    // relying on the merged catalog entries lacking a `/v1/messages` endpoint.
-    if !to_github_models && state.use_direct_anthropic(&translated).await {
+    if state.use_direct_anthropic(&translated).await {
         messages_direct(state, req, original_model, translated, start).await
     } else {
         messages_translated(state, req, original_model, translated, start).await
@@ -984,10 +993,13 @@ async fn messages_translated(
                 })
             })
             .unwrap_or(false);
-        let (url, mut headers, is_github_models) = state.chat_upstream(&translated, vision).await;
-        if !is_github_models {
-            set_initiator(&mut headers, agent);
-        }
+        // /v1/messages always targets Copilot; GitHub Models routing is handled
+        // at the /v1/chat/completions level only.
+        let url = format!("{}/chat/completions", state.copilot_base_url());
+        let mut headers = state.copilot_headers(vision).await;
+        let is_github_models = false;
+        set_initiator(&mut headers, agent);
+        let _ = is_github_models; // used below for store record
         let req_size = serde_json::to_vec(&current).map(|v| v.len()).unwrap_or(0);
         let payload = serde_json::to_vec(&openai_req).unwrap_or_default();
         log_debug_request(&state, "/v1/messages", &openai_req);
