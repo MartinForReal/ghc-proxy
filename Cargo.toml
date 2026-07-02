@@ -1,6 +1,6 @@
 [package]
 name = "ghc-proxy"
-version = "1.2.0"
+version = "1.2.1"
 edition = "2021"
 description = "GitHub Copilot API Proxy - Provides OpenAI and Anthropic compatible endpoints via GitHub Copilot (Rust port of ghc-tunnel)"
 license = "MIT"
