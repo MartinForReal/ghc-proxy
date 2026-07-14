@@ -263,7 +263,7 @@ pub async fn check_models_token_access(
     let url = format!("{GITHUB_MODELS_BASE}/catalog/models");
     let resp = client
         .get(&url)
-        .header("Authorization", format!("{}{}", "Bearer ", token))
+        .header("Authorization", format!("Bearer {token}"))
         .header("Accept", "application/vnd.github+json")
         .header("X-GitHub-Api-Version", api_version)
         .header("User-Agent", "ghc-proxy")
