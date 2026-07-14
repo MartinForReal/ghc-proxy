@@ -124,11 +124,13 @@ pub async fn device_flow(client: &reqwest::Client) -> Option<String> {
         .header("Accept", "application/json")
         .form(&[
             ("client_id", GITHUB_CLIENT_ID),
-            // `models` unlocks the GitHub Models inference API
-            // (https://models.github.ai). Classic/OAuth tokens use the `models`
-            // scope; fine-grained PATs use the `models: read` permission. Without
-            // it the models endpoint returns 401/Unauthorized.
-            ("scope", "read:user copilot models"),
+            // Only request scopes the Copilot OAuth app supports. `models` is
+            // NOT a valid classic OAuth scope, so requesting it here makes the
+            // device-code request fail with `invalid_scope`, blocking all
+            // authentication. GitHub Models (https://models.github.ai) instead
+            // needs a fine-grained PAT with the `models: read` permission,
+            // supplied via `github_models.token` in the config.
+            ("scope", "read:user copilot"),
         ])
         .send()
         .await;

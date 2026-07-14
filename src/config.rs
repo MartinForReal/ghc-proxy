@@ -62,9 +62,9 @@ pub struct ModelMappings {
 /// `https://models.github.ai` instead of the Copilot upstream. These ids never
 /// collide with Copilot model ids, which never contain a `/`.
 ///
-/// GitHub Models authenticates with the raw GitHub token, which must carry the
-/// `models` scope (classic/OAuth tokens) or the `models: read` permission
-/// (fine-grained PATs).
+/// GitHub Models authenticates with a token that carries the `models: read`
+/// permission (a fine-grained PAT). The Device Flow token does not have this
+/// permission, so supply a dedicated token via `github_models.token`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct GithubModels {
     /// Enable routing of `publisher/model` ids to GitHub Models. Default: true.
@@ -401,9 +401,9 @@ pub fn render_config_yaml(cfg: &Config) -> String {
     s.push('\n');
     s.push_str("# GitHub Models (https://models.github.ai) inference\n");
     s.push_str("# When enabled, requests whose model id uses the publisher/model form\n");
-    s.push_str("# (e.g. openai/gpt-4o) route to GitHub Models instead of Copilot. The GitHub\n");
-    s.push_str("# token must carry the `models` scope (classic/OAuth) or `models: read`\n");
-    s.push_str("# permission (fine-grained PAT).\n");
+    s.push_str("# (e.g. openai/gpt-4o) route to GitHub Models instead of Copilot. GitHub\n");
+    s.push_str("# Models needs a token with the `models: read` permission (a fine-grained\n");
+    s.push_str("# PAT). The Device Flow token lacks it, so set `token` below.\n");
     s.push_str("github_models:\n");
     let _ = writeln!(s, "  enabled: {}", cfg.github_models.enabled);
     match cfg.github_models.org.as_deref() {
@@ -417,7 +417,7 @@ pub fn render_config_yaml(cfg: &Config) -> String {
             let _ = writeln!(s, "  token: {}", yaml_scalar(tok));
         }
         _ => s.push_str(
-            "  # token: ghp_xxx          # dedicated token with the models scope / models:read\n",
+            "  # token: ghp_xxx          # dedicated token with the models:read permission\n",
         ),
     }
     if cfg.github_models.api_version != GITHUB_MODELS_API_VERSION {

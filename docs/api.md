@@ -136,7 +136,7 @@ window (those advertising `max_context_window_tokens` greater than 200,000).
 - **GitHub Models routing** — when enabled (default), requests whose translated
   model id uses the `publisher/model` form (e.g. `openai/gpt-4o`) are routed to
   the [GitHub Models](https://models.github.ai) inference API instead of Copilot,
-  authenticated with the raw GitHub token (which must have the `models` scope).
+  authenticated with a token that has the `models: read` permission.
   See [Configuration](configuration.md#github-models).
 - **Model translation** — model names are rewritten per your
   [mappings](configuration.md#model-mappings) before being forwarded.

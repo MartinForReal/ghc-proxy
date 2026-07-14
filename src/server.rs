@@ -1588,7 +1588,7 @@ async fn stream_openai(
     };
     let status = upstream.status().as_u16();
     // A non-2xx upstream (e.g. GitHub Models returning 401/403 as JSON when the
-    // token lacks the `models` scope) is not an SSE stream — surface it as a
+    // token lacks the `models: read` permission) is not an SSE stream — surface it as a
     // normal error instead of forwarding a broken "stream".
     if !(200..300).contains(&status) {
         let text = upstream.text().await.unwrap_or_default();

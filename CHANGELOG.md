@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- Fixed GitHub Device Flow failing with `invalid_scope` (`The scopes requested are invalid: models.`)
+  - The Copilot OAuth app does not support a `models` classic OAuth scope, so requesting it broke all authentication
+  - Device Flow now requests only the supported `read:user copilot` scopes
+  - GitHub Models access now requires a dedicated token with the `models: read` permission (fine-grained PAT) via `github_models.token`; documentation updated accordingly
+
 ## [1.2.1] - 2026-07-02
 
 ### Fixed

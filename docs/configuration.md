@@ -50,7 +50,7 @@ model_mappings:
 
 # GitHub Models (https://models.github.ai) inference
 # Route publisher/model ids (e.g. openai/gpt-4o) to GitHub Models instead of
-# Copilot. The GitHub token must carry the `models` scope / `models: read`.
+# Copilot. Needs a token with the `models: read` permission (fine-grained PAT).
 github_models:
   enabled: true
   # org: my-org
@@ -166,7 +166,7 @@ Every config field has a `GHC_PROXY_*` override:
 | `GHC_PROXY_API_KEY` | Require this key on LLM endpoints (empty = disabled) |
 | `GHC_PROXY_GITHUB_MODELS_ENABLED` | Route `publisher/model` ids to GitHub Models (`true`/`1`) |
 | `GHC_PROXY_GITHUB_MODELS_ORG` | Attribute GitHub Models inference to an organization |
-| `GHC_PROXY_GITHUB_MODELS_TOKEN` | Dedicated token for GitHub Models (`models` scope) |
+| `GHC_PROXY_GITHUB_MODELS_TOKEN` | Dedicated token for GitHub Models (`models: read` permission) |
 
 Token-related variables (`COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN`) are
 covered in [Getting Started](getting-started.md#authentication).
