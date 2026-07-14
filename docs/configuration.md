@@ -103,12 +103,13 @@ existing behavior are unaffected. Routing applies to `/v1/chat/completions`,
 `/v1/messages` (translated), and the Gemini endpoints.
 
 GitHub Models authenticates with the **raw GitHub token** (not the Copilot
-token) via `Authorization: Bearer`. That token must carry the **`models`** scope
-(classic/OAuth tokens — the Device Flow requests it automatically) or the
-**`models: read`** permission (fine-grained PATs). Set `github_models.token` (or
-`GHC_PROXY_GITHUB_MODELS_TOKEN`) to use a dedicated token, and `github_models.org`
-to attribute inference to an organization. The catalog is merged into
-`GET /v1/models`.
+token) via `Authorization: Bearer`. That token must carry the **`models: read`**
+permission (a fine-grained PAT). This is **not** covered by the Device Flow login
+(`models` is not a valid classic OAuth scope), so supply a dedicated token via
+`github_models.token` (or `GHC_PROXY_GITHUB_MODELS_TOKEN`); otherwise GitHub
+Models requests fall back to the Device Flow token, which lacks this permission.
+Set `github_models.org` to attribute inference to an organization. The catalog is
+merged into `GET /v1/models`.
 
 ## Command-line options
 
