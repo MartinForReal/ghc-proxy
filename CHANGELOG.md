@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.2.2] - 2026-07-14
+
 ### Added
 - Setup wizard now configures the GitHub Models token
   - New "GitHub Models" step lets you enable/disable `publisher/model` routing
