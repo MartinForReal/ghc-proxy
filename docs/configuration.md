@@ -108,8 +108,9 @@ permission (a fine-grained PAT). This is **not** covered by the Device Flow logi
 (`models` is not a valid classic OAuth scope), so supply a dedicated token via
 `github_models.token` (or `GHC_PROXY_GITHUB_MODELS_TOKEN`); otherwise GitHub
 Models requests fall back to the Device Flow token, which lacks this permission.
-Set `github_models.org` to attribute inference to an organization. The catalog is
-merged into `GET /v1/models`.
+The [setup wizard](getting-started.md#the-setup-wizard) can capture and validate
+this token for you. Set `github_models.org` to attribute inference to an
+organization. The catalog is merged into `GET /v1/models`.
 
 ## Command-line options
 

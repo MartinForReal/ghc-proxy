@@ -93,7 +93,12 @@ It walks through:
 3. **Model mappings** — fetches the live model catalog and lets you map the
    `opus` / `sonnet` / `haiku` aliases to specific models, or keep the
    recommended defaults.
-4. **Client setup** — optionally configure Claude Code
+4. **GitHub Models** — optionally enable routing of `publisher/model` ids to the
+   [GitHub Models](configuration.md#github-models) inference API. The wizard
+   checks whether your GitHub token already grants access and, if not, guides you
+   to create a fine-grained PAT with the `models: read` permission, validates the
+   token against the catalog, and saves it to `github_models.token`.
+5. **Client setup** — optionally configure Claude Code
    (`~/.claude/settings.json`), Codex (`~/.codex/config.toml`), and the Gemini
    CLI (`~/.gemini/.env`) to route through the proxy. Existing settings are
    preserved and any user-set API key is left untouched.

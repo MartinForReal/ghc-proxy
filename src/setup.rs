@@ -11,7 +11,7 @@ use std::io::IsTerminal;
 use std::sync::Arc;
 
 use dialoguer::theme::ColorfulTheme;
-use dialoguer::{Confirm, FuzzySelect, Input, Select};
+use dialoguer::{Confirm, FuzzySelect, Input, Password, Select};
 use ghc_proxy::config::{self, Config, ModelMappings};
 use ghc_proxy::{auth, state::AppState};
 
@@ -101,7 +101,10 @@ pub async fn run(starting: Config, claudecode_flag: bool) -> Option<Outcome> {
         }
     }
 
-    // --- Step 5: Claude Code ---------------------------------------------
+    // --- Step 5: GitHub Models token -------------------------------------
+    configure_github_models(&mut cfg, &token, &client).await;
+
+    // --- Step 6: Claude Code ---------------------------------------------
     let configure_claude_code = if claudecode_flag {
         true
     } else {
@@ -219,6 +222,158 @@ fn prompt_claude_code() -> dialoguer::Result<bool> {
         .with_prompt("Configure Claude Code (~/.claude/settings.json) to use this proxy?")
         .default(false)
         .interact()
+}
+
+/// Interactive GitHub Models step. Confirms whether to route `publisher/model`
+/// ids to the GitHub Models inference API and, when enabled, ensures a working
+/// token with the `models: read` permission is available.
+///
+/// GitHub Models cannot be authorized through the Device Flow (`models` is not a
+/// valid classic OAuth scope), so this step first checks whether the already
+/// resolved GitHub token happens to grant access; if not, it guides the user to
+/// create a fine-grained PAT, validates the pasted token against the catalog,
+/// and stores it in the configuration.
+async fn configure_github_models(cfg: &mut Config, github_token: &str, client: &reqwest::Client) {
+    section("GitHub Models");
+    println!(
+        "GitHub Models (https://models.github.ai) serves `publisher/model` ids\n\
+         (e.g. openai/gpt-4o) from a service separate from Copilot."
+    );
+
+    let default_enabled = cfg.github_models.enabled;
+    let enable = matches!(
+        tokio::task::spawn_blocking(move || prompt_enable_models(default_enabled)).await,
+        Ok(Ok(true))
+    );
+    cfg.github_models.enabled = enable;
+    if !enable {
+        println!("GitHub Models routing disabled.");
+        return;
+    }
+
+    let api_version = cfg.github_models.api_version.clone();
+
+    // 1. If a dedicated token is already configured, validate and keep it.
+    if let Some(existing) = cfg
+        .github_models
+        .token
+        .as_deref()
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+    {
+        match auth::check_models_token_access(client, &existing, &api_version).await {
+            Ok(n) => {
+                println!("✓ Configured GitHub Models token works ({n} models available).");
+                prompt_and_set_org(cfg).await;
+                return;
+            }
+            Err(e) => {
+                println!("⚠ The configured GitHub Models token no longer works ({e}).");
+            }
+        }
+    }
+
+    // 2. Otherwise, see if the resolved GitHub token already has models access.
+    match auth::check_models_token_access(client, github_token, &api_version).await {
+        Ok(n) => {
+            println!(
+                "✓ Your GitHub sign-in token already has GitHub Models access \
+                 ({n} models available)."
+            );
+            println!("  No separate token is needed.");
+            cfg.github_models.token = None;
+            prompt_and_set_org(cfg).await;
+            return;
+        }
+        Err(_) => {
+            println!(
+                "\nYour GitHub sign-in token does not grant GitHub Models access.\n\
+                 GitHub Models needs a fine-grained personal access token with the\n\
+                 \"Models\" account permission set to Read-only.\n\n\
+                 Create one here (Account permissions → Models → Read-only):\n\
+                 \x20   https://github.com/settings/personal-access-tokens/new\n"
+            );
+        }
+    }
+
+    // 3. Guided capture + validation of a dedicated token.
+    loop {
+        let entered = match tokio::task::spawn_blocking(prompt_models_token).await {
+            Ok(Ok(t)) => t.trim().to_string(),
+            _ => String::new(),
+        };
+        if entered.is_empty() {
+            println!(
+                "⚠ Skipping GitHub Models token. Requests for publisher/model ids will\n\
+                 \x20 fail until you set `github_models.token` in the config."
+            );
+            break;
+        }
+        match auth::check_models_token_access(client, &entered, &api_version).await {
+            Ok(n) => {
+                cfg.github_models.token = Some(entered);
+                println!("✓ Token accepted ({n} models available).");
+                break;
+            }
+            Err(e) => {
+                println!("✗ That token could not access GitHub Models ({e}).");
+                let retry = matches!(
+                    tokio::task::spawn_blocking(prompt_retry).await,
+                    Ok(Ok(true))
+                );
+                if !retry {
+                    println!("⚠ Continuing without a GitHub Models token.");
+                    break;
+                }
+            }
+        }
+    }
+
+    prompt_and_set_org(cfg).await;
+}
+
+/// Prompts for an optional organization to attribute GitHub Models inference to
+/// and records it on the config. An empty answer clears any existing value.
+async fn prompt_and_set_org(cfg: &mut Config) {
+    let current = cfg.github_models.org.clone().unwrap_or_default();
+    let org = match tokio::task::spawn_blocking(move || prompt_models_org(current)).await {
+        Ok(Ok(o)) => o.trim().to_string(),
+        _ => return,
+    };
+    cfg.github_models.org = (!org.is_empty()).then_some(org);
+}
+
+fn prompt_enable_models(default: bool) -> dialoguer::Result<bool> {
+    let theme = ColorfulTheme::default();
+    Confirm::with_theme(&theme)
+        .with_prompt("Enable GitHub Models routing?")
+        .default(default)
+        .interact()
+}
+
+fn prompt_models_token() -> dialoguer::Result<String> {
+    let theme = ColorfulTheme::default();
+    Password::with_theme(&theme)
+        .with_prompt("Paste a GitHub Models token (models: read), or leave blank to skip")
+        .allow_empty_password(true)
+        .interact()
+}
+
+fn prompt_retry() -> dialoguer::Result<bool> {
+    let theme = ColorfulTheme::default();
+    Confirm::with_theme(&theme)
+        .with_prompt("Try a different token?")
+        .default(true)
+        .interact()
+}
+
+fn prompt_models_org(default: String) -> dialoguer::Result<String> {
+    let theme = ColorfulTheme::default();
+    Input::with_theme(&theme)
+        .with_prompt("Attribute inference to an organization (optional, blank for none)")
+        .default(default)
+        .allow_empty(true)
+        .interact_text()
 }
 
 /// Resolves a Copilot token and fetches the available model ids, returning a

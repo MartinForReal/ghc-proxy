@@ -33,7 +33,7 @@ chrono = { version = "0.4", features = ["clock"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tiktoken-rs = "0.12"
-dialoguer = { version = "0.12", default-features = false, features = ["fuzzy-select"] }
+dialoguer = { version = "0.12", default-features = false, features = ["fuzzy-select", "password"] }
 self_update = { version = "0.44", default-features = false, features = ["reqwest", "rustls", "archive-tar", "compression-flate2", "archive-zip", "compression-zip-deflate"] }
 toml = "1.1"
 
