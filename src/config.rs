@@ -417,7 +417,7 @@ pub fn render_config_yaml(cfg: &Config) -> String {
             let _ = writeln!(s, "  token: {}", yaml_scalar(tok));
         }
         _ => s.push_str(
-            "  # token: ghp_xxx          # dedicated token with the models:read permission\n",
+            "  # token: ghp_xxx          # dedicated token with the models: read permission\n",
         ),
     }
     if cfg.github_models.api_version != GITHUB_MODELS_API_VERSION {

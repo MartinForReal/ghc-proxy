@@ -176,7 +176,7 @@ model_mappings:
 github_models:
   enabled: true                     # route publisher/model ids to GitHub Models
   # org: my-org                     # attribute inference to an organization
-  # token: ghp_xxx                  # dedicated token (models:read permission)
+  # token: ghp_xxx                  # dedicated token (models: read permission)
 system_prompt_remove: []
 system_prompt_add: []
 tool_result_suffix_remove: []
@@ -221,7 +221,7 @@ permission get an `Unauthorized` response from GitHub.
 github_models:
   enabled: true          # set false to always use Copilot
   org: my-org            # optional: attribute inference to an organization
-  token: ghp_xxx         # optional: dedicated token (models:read permission)
+  token: ghp_xxx         # optional: dedicated token (models: read permission)
 ```
 
 | Environment variable | Effect |
