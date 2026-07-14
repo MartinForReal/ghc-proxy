@@ -208,8 +208,8 @@ impl AppState {
 
     /// Token used for GitHub Models requests: the dedicated `github_models.token`
     /// when configured, otherwise the resolved GitHub token. This token must
-    /// carry the `models` scope (classic/OAuth) or `models: read` permission
-    /// (fine-grained PAT).
+    /// carry the `models: read` permission (a fine-grained PAT); the Device Flow
+    /// token does not have it.
     pub async fn github_models_token(&self) -> String {
         if let Some(token) = self.config_snapshot().github_models.token {
             if !token.is_empty() {

@@ -66,10 +66,11 @@ The GitHub token is exchanged for a short-lived **Copilot token** via
 `https://api.github.com/copilot_internal/v2/token`, which the proxy refreshes
 automatically before it expires.
 
-The Device Flow requests the `read:user copilot models` scopes; the `models`
-scope authorizes the [GitHub Models](configuration.md#github-models) inference
-API. If you bring your own token, give it the `models` scope (classic/OAuth) or
-`models: read` permission (fine-grained PAT) to use GitHub Models.
+The Device Flow requests the `read:user copilot` scopes. The
+[GitHub Models](configuration.md#github-models) inference API is not covered by
+the Device Flow token (`models` is not a valid classic OAuth scope); to use it,
+supply a dedicated token with the `models: read` permission (a fine-grained PAT)
+via `github_models.token`.
 
 To authenticate without starting the server (useful for CI/headless setups):
 
@@ -92,7 +93,12 @@ It walks through:
 3. **Model mappings** — fetches the live model catalog and lets you map the
    `opus` / `sonnet` / `haiku` aliases to specific models, or keep the
    recommended defaults.
-4. **Client setup** — optionally configure Claude Code
+4. **GitHub Models** — optionally enable routing of `publisher/model` ids to the
+   [GitHub Models](configuration.md#github-models) inference API. The wizard
+   checks whether your GitHub token already grants access and, if not, guides you
+   to create a fine-grained PAT with the `models: read` permission, validates the
+   token against the catalog, and saves it to `github_models.token`.
+5. **Client setup** — optionally configure Claude Code
    (`~/.claude/settings.json`), Codex (`~/.codex/config.toml`), and the Gemini
    CLI (`~/.gemini/.env`) to route through the proxy. Existing settings are
    preserved and any user-set API key is left untouched.

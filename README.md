@@ -46,7 +46,7 @@ file.
 - **GitHub Models inference** — requests whose model id uses the
   `publisher/model` form (e.g. `openai/gpt-4o`) are transparently routed to the
   [GitHub Models](https://models.github.ai) API instead of Copilot, authenticated
-  with the raw GitHub token (which must carry the `models` scope). Enabled by
+  with a token that has the `models: read` permission. Enabled by
   default; the catalog is merged into `/v1/models`.
 - **Optional API-key authentication** on the LLM endpoints
   (`Authorization: Bearer`, `x-api-key`, or `x-goog-api-key`), disabled by
@@ -111,10 +111,11 @@ The GitHub token is exchanged for a short-lived **Copilot token** via
 `https://api.github.com/copilot_internal/v2/token`, which is refreshed
 automatically before it expires.
 
-The interactive Device Flow requests the `read:user copilot models` scopes. The
-`models` scope authorizes the [GitHub Models](#github-models) inference API; if
-you supply your own token instead, give it the `models` scope (classic/OAuth
-token) or the `models: read` permission (fine-grained PAT) to use GitHub Models.
+The interactive Device Flow requests the `read:user copilot` scopes. GitHub
+Models is **not** covered by the Device Flow token (`models` is not a valid
+classic OAuth scope). To use the [GitHub Models](#github-models) inference API,
+supply a dedicated token with the `models: read` permission (a fine-grained PAT)
+via `github_models.token`.
 
 ## Endpoint Authentication
 
@@ -175,7 +176,7 @@ model_mappings:
 github_models:
   enabled: true                     # route publisher/model ids to GitHub Models
   # org: my-org                     # attribute inference to an organization
-  # token: ghp_xxx                  # dedicated token (models scope / models:read)
+  # token: ghp_xxx                  # dedicated token (models: read permission)
 system_prompt_remove: []
 system_prompt_add: []
 tool_result_suffix_remove: []
@@ -207,12 +208,12 @@ curl http://127.0.0.1:8314/v1/chat/completions \
 ```
 
 **Authentication.** GitHub Models uses the raw GitHub token (not the Copilot
-token) via `Authorization: Bearer`. The token must carry the **`models`** scope
-(classic/OAuth tokens, including the one minted by the Device Flow) or the
-**`models: read`** permission (fine-grained PATs). Tokens without it get an
-`Unauthorized` response from GitHub. To use a dedicated token — e.g. a
-fine-grained PAT scoped only to `models: read` — set `github_models.token` or the
-`GHC_PROXY_GITHUB_MODELS_TOKEN` environment variable.
+token) via `Authorization: Bearer`. The token must carry the **`models: read`**
+permission (a fine-grained PAT). The token minted by the Device Flow does **not**
+have this permission (`models` is not a valid classic OAuth scope), so set a
+dedicated token via `github_models.token` or the
+`GHC_PROXY_GITHUB_MODELS_TOKEN` environment variable. Tokens without the
+permission get an `Unauthorized` response from GitHub.
 
 **Configuration.**
 
@@ -220,7 +221,7 @@ fine-grained PAT scoped only to `models: read` — set `github_models.token` or 
 github_models:
   enabled: true          # set false to always use Copilot
   org: my-org            # optional: attribute inference to an organization
-  token: ghp_xxx         # optional: dedicated token (models scope / models:read)
+  token: ghp_xxx         # optional: dedicated token (models: read permission)
 ```
 
 | Environment variable | Effect |

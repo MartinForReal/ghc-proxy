@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+## [1.2.2] - 2026-07-14
+
+### Added
+- Setup wizard now configures the GitHub Models token
+  - New "GitHub Models" step lets you enable/disable `publisher/model` routing
+  - Checks whether the resolved GitHub token already has models access; if not, guides you to create a fine-grained PAT with the `models: read` permission
+  - Validates the pasted token against the GitHub Models catalog before saving it to `github_models.token`
+  - Optionally captures an organization to attribute inference to
+
+### Fixed
+- Fixed GitHub Device Flow failing with `invalid_scope` (`The scopes requested are invalid: models.`)
+  - The Copilot OAuth app does not support a `models` classic OAuth scope, so requesting it broke all authentication
+  - Device Flow now requests only the supported `read:user copilot` scopes
+  - GitHub Models access now requires a dedicated token with the `models: read` permission (fine-grained PAT) via `github_models.token`; documentation updated accordingly
+
 ## [1.2.1] - 2026-07-02
 
 ### Fixed

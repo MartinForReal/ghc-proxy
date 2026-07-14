@@ -50,7 +50,7 @@ model_mappings:
 
 # GitHub Models (https://models.github.ai) inference
 # Route publisher/model ids (e.g. openai/gpt-4o) to GitHub Models instead of
-# Copilot. The GitHub token must carry the `models` scope / `models: read`.
+# Copilot. Needs a token with the `models: read` permission (fine-grained PAT).
 github_models:
   enabled: true
   # org: my-org
@@ -103,12 +103,14 @@ existing behavior are unaffected. Routing applies to `/v1/chat/completions`,
 `/v1/messages` (translated), and the Gemini endpoints.
 
 GitHub Models authenticates with the **raw GitHub token** (not the Copilot
-token) via `Authorization: Bearer`. That token must carry the **`models`** scope
-(classic/OAuth tokens — the Device Flow requests it automatically) or the
-**`models: read`** permission (fine-grained PATs). Set `github_models.token` (or
-`GHC_PROXY_GITHUB_MODELS_TOKEN`) to use a dedicated token, and `github_models.org`
-to attribute inference to an organization. The catalog is merged into
-`GET /v1/models`.
+token) via `Authorization: Bearer`. That token must carry the **`models: read`**
+permission (a fine-grained PAT). This is **not** covered by the Device Flow login
+(`models` is not a valid classic OAuth scope), so supply a dedicated token via
+`github_models.token` (or `GHC_PROXY_GITHUB_MODELS_TOKEN`); otherwise GitHub
+Models requests fall back to the Device Flow token, which lacks this permission.
+The [setup wizard](getting-started.md#the-setup-wizard) can capture and validate
+this token for you. Set `github_models.org` to attribute inference to an
+organization. The catalog is merged into `GET /v1/models`.
 
 ## Command-line options
 
@@ -166,7 +168,7 @@ Every config field has a `GHC_PROXY_*` override:
 | `GHC_PROXY_API_KEY` | Require this key on LLM endpoints (empty = disabled) |
 | `GHC_PROXY_GITHUB_MODELS_ENABLED` | Route `publisher/model` ids to GitHub Models (`true`/`1`) |
 | `GHC_PROXY_GITHUB_MODELS_ORG` | Attribute GitHub Models inference to an organization |
-| `GHC_PROXY_GITHUB_MODELS_TOKEN` | Dedicated token for GitHub Models (`models` scope) |
+| `GHC_PROXY_GITHUB_MODELS_TOKEN` | Dedicated token for GitHub Models (`models: read` permission) |
 
 Token-related variables (`COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN`) are
 covered in [Getting Started](getting-started.md#authentication).

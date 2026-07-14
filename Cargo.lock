@@ -430,6 +430,7 @@ dependencies = [
  "console",
  "fuzzy-matcher",
  "shell-words",
+ "zeroize",
 ]
 
 [[package]]
@@ -742,7 +743,7 @@ dependencies = [
 
 [[package]]
 name = "ghc-proxy"
-version = "1.2.0"
+version = "1.2.2"
 dependencies = [
  "async-stream",
  "axum",
