@@ -621,10 +621,7 @@ async fn responses(State(state): State<SharedState>, body: Bytes) -> Response {
 
     // /v1/responses is the Codex Responses API — Copilot-only.
     // GitHub Models models (publisher/model convention) are not supported here.
-    if state
-        .config_snapshot()
-        .routes_to_github_models(&translated)
-    {
+    if state.config_snapshot().routes_to_github_models(&translated) {
         return error_response(
             StatusCode::BAD_REQUEST,
             format!(

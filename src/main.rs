@@ -236,24 +236,6 @@ fn merge_claude_settings(existing: Option<&str>, base_url: &str) -> Result<Strin
             serde_json::Value::String(CLAUDE_CODE_PROXY_API_KEY.to_string()),
         );
     }
-    // Make Claude Code compact context earlier. Because the proxy routes through
-    // Copilot, whose tokenizer differs from Anthropic's, local token estimates
-    // can run lower than real usage and bump into the model's full window. These
-    // defaults trigger auto-compaction at ~85% of the reported window. Existing
-    // user values are preserved.
-    if !env_obj.contains_key("CLAUDE_CODE_AUTO_COMPACT_WINDOW") {
-        env_obj.insert(
-            "CLAUDE_CODE_AUTO_COMPACT_WINDOW".to_string(),
-            serde_json::Value::String("1".to_string()),
-        );
-    }
-    if !env_obj.contains_key("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE") {
-        env_obj.insert(
-            "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE".to_string(),
-            serde_json::Value::String("85".to_string()),
-        );
-    }
-
     serde_json::to_string_pretty(&root).map_err(|e| e.to_string())
 }
 
@@ -1044,17 +1026,15 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["env"]["ANTHROPIC_BASE_URL"], "http://127.0.0.1:8314");
         assert_eq!(v["env"]["ANTHROPIC_API_KEY"], "ghc-proxy");
-        assert_eq!(v["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "1");
-        assert_eq!(v["env"]["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"], "85");
     }
 
     #[test]
-    fn preserves_existing_compaction_overrides() {
+    fn does_not_inject_default_compaction_settings() {
         let existing = r#"{"env":{"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE":"70"}}"#;
         let out = merge_claude_settings(Some(existing), "http://x").unwrap();
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["env"]["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"], "70");
-        assert_eq!(v["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "1");
+        assert!(v["env"].get("CLAUDE_CODE_AUTO_COMPACT_WINDOW").is_none());
     }
 
     #[test]
