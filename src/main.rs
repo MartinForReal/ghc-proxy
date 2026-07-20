@@ -1029,7 +1029,7 @@ mod tests {
     }
 
     #[test]
-    fn preserves_existing_compaction_overrides_without_adding_defaults() {
+    fn does_not_inject_default_compaction_settings() {
         let existing = r#"{"env":{"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE":"70"}}"#;
         let out = merge_claude_settings(Some(existing), "http://x").unwrap();
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
