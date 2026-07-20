@@ -22,12 +22,8 @@ Run the setup wizard with the Claude Code step enabled:
 
 This patches `~/.claude/settings.json`, merging `env.ANTHROPIC_BASE_URL` and
 `env.ANTHROPIC_API_KEY` so Claude Code routes its Anthropic API calls through the
-proxy. It also sets `CLAUDE_CODE_AUTO_COMPACT_WINDOW` and
-`CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` (default 85%) so Claude Code compacts context
-earlier — Copilot’s tokenizer differs from Anthropic’s, so local token estimates
-can run lower than real usage. Existing settings are preserved — the base URL is
-updated, keys and overrides are added only when missing, and the file is left
-untouched if it is not valid JSON.
+proxy. Existing settings are preserved — the base URL is updated, keys are added
+only when missing, and the file is left untouched if it is not valid JSON.
 
 ### Manual setup
 
