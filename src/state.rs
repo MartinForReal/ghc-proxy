@@ -35,6 +35,8 @@ pub struct AppState {
     /// Per-process session id (`vscode-sessionid` header): a UUID followed by a
     /// 13-digit millisecond timestamp, matching the real Copilot client format.
     pub session_id: String,
+    /// Instant the process started serving, used to report uptime on `/health`.
+    pub started_at: Instant,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -56,7 +58,12 @@ fn now_millis() -> u128 {
 
 impl AppState {
     pub fn new(config: Config, github_token: String) -> Self {
+        // No global request timeout: SSE responses are long-lived streams. Only
+        // the connect phase and idle pooled connections are bounded so a dead
+        // upstream cannot wedge a request forever.
         let http = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(30))
+            .pool_idle_timeout(Duration::from_secs(90))
             .build()
             .expect("failed to build HTTP client");
         AppState {
@@ -73,7 +80,49 @@ impl AppState {
             last_request: Mutex::new(None),
             machine_id: auth::load_or_create_machine_id(),
             session_id: format!("{}{}", uuid::Uuid::new_v4(), now_millis()),
+            started_at: Instant::now(),
         }
+    }
+
+    /// Seconds this process has been running.
+    pub fn uptime_secs(&self) -> u64 {
+        self.started_at.elapsed().as_secs()
+    }
+
+    /// Copilot token status as `(present, seconds_until_expiry)`. The remaining
+    /// lifetime is zero when the token is missing or already expired.
+    pub async fn copilot_token_status(&self) -> (bool, u64) {
+        let tokens = self.tokens.lock().await;
+        let present = tokens.copilot_token.is_some();
+        let remaining = tokens.expires_at.saturating_sub(now_secs());
+        (present, if present { remaining } else { 0 })
+    }
+
+    /// Number of models currently held in the catalog cache.
+    pub async fn model_count(&self) -> usize {
+        self.models
+            .read()
+            .await
+            .as_ref()
+            .and_then(|m| m.get("data"))
+            .and_then(|d| d.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0)
+    }
+
+    /// Looks up a single entry from the cached model catalog by id.
+    pub async fn find_model(&self, id: &str) -> Option<serde_json::Value> {
+        self.models
+            .read()
+            .await
+            .as_ref()
+            .and_then(|m| m.get("data"))
+            .and_then(|d| d.as_array())
+            .and_then(|arr| {
+                arr.iter()
+                    .find(|m| m.get("id").and_then(|i| i.as_str()) == Some(id))
+                    .cloned()
+            })
     }
 
     pub fn config_snapshot(&self) -> Config {
@@ -426,6 +475,26 @@ impl AppState {
             return false;
         }
         self.model_supports_endpoint(model, "/v1/messages").await
+    }
+
+    /// Maximum output tokens advertised for a model
+    /// (`capabilities.limits.max_output_tokens`). Used to fill in a missing
+    /// `max_tokens`, which some Copilot models reject the request without.
+    pub async fn model_max_output_tokens(&self, model: &str) -> Option<u64> {
+        self.models
+            .read()
+            .await
+            .as_ref()
+            .and_then(|m| m.get("data"))
+            .and_then(|d| d.as_array())
+            .and_then(|arr| {
+                arr.iter()
+                    .find(|m| m.get("id").and_then(|i| i.as_str()) == Some(model))
+                    .and_then(|m| m.get("capabilities"))
+                    .and_then(|c| c.get("limits"))
+                    .and_then(|l| l.get("max_output_tokens"))
+                    .and_then(|t| t.as_u64())
+            })
     }
 
     /// Returns the tokenizer name advertised by the model's catalog entry

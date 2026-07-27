@@ -22,14 +22,16 @@ require a key on the LLM endpoints; see [Authentication](#authentication) below.
 | `POST /v1/chat/completions` | OpenAI chat completions (also `/chat/completions`) |
 | `POST /v1/responses` | OpenAI Responses API for Codex (also `/responses`) |
 | `POST /v1/messages` | Anthropic Messages API |
-| `POST /v1/messages/count_tokens` | Anthropic token counting (real BPE) |
+| `POST /v1/messages/count_tokens` | Anthropic token counting (real BPE, local estimate fallback) |
 | `POST /v1beta/models/{model}:generateContent` | Gemini generate content |
 | `POST /v1beta/models/{model}:streamGenerateContent` | Gemini streaming (SSE) |
 | `POST /v1beta/models/{model}:countTokens` | Gemini token counting |
 | `POST /v1/embeddings` | Embeddings (also `/embeddings`) |
 | `GET /v1/models` | List available models (also `/models`, `/api/models`) |
+| `GET /v1/models/{model}` | Retrieve a single model (also `/models/{model}`) |
 | `GET /v1/models/full/` | Raw upstream model catalog with capabilities |
 | `GET /usage` | Copilot plan and quota usage |
+| `GET /health` | Liveness/readiness probe |
 | `GET /` | Web analytics dashboard |
 | `GET /metrics/dashboard` | Metrics dashboard UI |
 | `GET /metrics` | OpenMetrics exposition endpoint |
@@ -44,6 +46,58 @@ require a key on the LLM endpoints; see [Authentication](#authentication) below.
 Streaming (SSE) is supported on the chat, responses, and messages endpoints by
 setting `"stream": true` in the request body. The Gemini surface streams via the
 dedicated `:streamGenerateContent` action.
+
+## Health check
+
+`GET /health` answers without contacting the upstream, so it is cheap enough for
+a service supervisor or container probe to poll frequently. It is never guarded
+by the optional API key.
+
+```bash
+curl http://127.0.0.1:8314/health
+```
+
+```json
+{
+  "status": "ok",
+  "ready": true,
+  "version": "1.3.0",
+  "uptime_seconds": 128,
+  "copilot_token": { "present": true, "expires_in_seconds": 1487 },
+  "models_loaded": 77,
+  "requests_served": 42,
+  "auth_required": false
+}
+```
+
+`ready` is true once a Copilot token has been obtained **and** the model catalog
+has loaded. A degraded proxy still answers `200` with `ready: false` so probes
+can distinguish "process alive" from "able to serve traffic". Add `?strict=true`
+to get `503 Service Unavailable` instead when the proxy is not ready.
+
+## Retrieve a model
+
+`GET /v1/models/{model}` returns a single catalog entry in the OpenAI shape,
+including the raw `capabilities` and `supported_endpoints` reported upstream.
+Model aliases from `model_mappings` are resolved, so `/v1/models/opus` returns
+the mapped Copilot model. Unknown ids return `404` with an OpenAI-style error
+body.
+
+```bash
+curl http://127.0.0.1:8314/v1/models/claude-opus-4.8
+```
+
+## Token counting
+
+`POST /v1/messages/count_tokens` forwards to the upstream Anthropic
+`count_tokens` endpoint for models that expose the native `/v1/messages`
+surface, returning exact counts. For every other model (and whenever the
+upstream call fails) the proxy falls back to a local tiktoken estimate using the
+tokenizer advertised in the model catalog. Estimated responses are marked:
+
+```json
+{ "input_tokens": 812, "estimated": true }
+```
 
 ## OpenAI SDK
 
@@ -131,6 +185,23 @@ curl http://127.0.0.1:8314/v1/models/full/
 This is the authoritative source for which models support a 1M-token context
 window (those advertising `max_context_window_tokens` greater than 200,000).
 
+## Audit API
+
+`GET /api/audit` returns recent request records with their extracted audit
+fields. All filters are optional and combine with AND:
+
+| Parameter | Effect |
+|-----------|--------|
+| `endpoint` | Substring match on the endpoint path |
+| `status` | Exact HTTP status code |
+| `tool_name` | Keeps records whose request offered a matching tool |
+| `agent` | `true`/`false` — agent- vs user-initiated requests |
+| `model` | Substring match on the requested or translated model |
+| `page`, `per_page` | Pagination (`per_page` is clamped to 500) |
+
+`GET /api/audit/summary` aggregates the same records into top tools, stop-reason
+counts, estimated cost, and prompt-cache hit rate.
+
 ## Notable behaviors
 
 - **GitHub Models routing** — when enabled (default), requests whose translated
@@ -152,5 +223,39 @@ window (those advertising `max_context_window_tokens` greater than 200,000).
 - **Adaptive-thinking migration** — when an upstream model rejects
   `thinking.type = "enabled"`, the proxy automatically retries using the
   adaptive format.
+- **Upstream errors are never disguised as streams** — a non-2xx upstream
+  response on a `"stream": true` request is returned as a normal error response
+  with the upstream status code, not as a `200` SSE body.
+- **Interrupted streams are reported, not silently truncated** — if the upstream
+  connection drops mid-response, the proxy emits a protocol-appropriate
+  terminator (`data: {"error": …}` + `[DONE]` for OpenAI, `event: error` for
+  Anthropic and Responses, `finishReason: "OTHER"` for Gemini) and records the
+  request as `502`. Anthropic streams that end without a `finish_reason` are
+  also closed with `message_stop`, so clients never block on a half-open
+  message or keep a partial answer as a completed turn.
+- **Byte-exact streaming** — SSE parsing buffers raw bytes and decodes only
+  complete lines, so multi-byte characters split across network chunks are
+  never mangled into `U+FFFD` or dropped.
+- **SSE keepalive** — a `: keepalive` comment is emitted after 15 seconds of
+  silence so extended thinking does not trip the ~60 second idle timeout
+  enforced by the upstream load balancer. Comments are ignored by every
+  spec-compliant SSE client.
+- **`anthropic-beta` passthrough** — the client's beta flags are forwarded and
+  merged with the ones the proxy derives (`context-1m-2025-08-07` for extended
+  context models, `context-management-2025-06-27` when the request uses
+  `context_management`).
+- **MCP tool results** — a `tool_result` whose `content` is an array of blocks
+  is normalized before translation: text blocks are joined and image blocks
+  become `image_url` data URLs. Images nested there also enable the vision
+  header.
+- **Parameter migration** — a model that rejects `max_tokens` in favour of
+  `max_completion_tokens` is retried once with the renamed parameter, and a
+  missing `max_tokens` is filled from the model catalog.
+- **Cost estimates use the served model** — the `estimated_cost_usd` field and
+  the `ghc_proxy_estimated_cost_usd_total` metric price requests using the model
+  actually sent upstream (after translation), not the alias the client asked
+  for.
+- **Graceful shutdown** — on Ctrl-C (or `SIGTERM` on Unix) the proxy stops
+  accepting connections and lets in-flight requests and SSE streams finish.
 - **Content filtering** — system-prompt add/remove and tool-result suffix
   removal are applied per your configuration.

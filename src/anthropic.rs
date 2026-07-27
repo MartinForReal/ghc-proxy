@@ -69,16 +69,10 @@ pub fn anthropic_to_openai(req: &Value, cfg: &Config) -> Value {
                         .cloned()
                         .collect();
                     for tr in tool_results {
-                        let mut c = tr
-                            .get("content")
-                            .cloned()
-                            .unwrap_or(Value::String(String::new()));
-                        if let Value::String(s) = &c {
-                            c = Value::String(strip_tool_result_suffix(
-                                s,
-                                &cfg.tool_result_suffix_remove,
-                            ));
-                        }
+                        let c = normalize_tool_result_content(
+                            tr.get("content"),
+                            &cfg.tool_result_suffix_remove,
+                        );
                         messages.push(json!({
                             "role": "tool",
                             "tool_call_id": tr.get("tool_use_id").cloned().unwrap_or(Value::Null),
@@ -214,6 +208,85 @@ pub fn anthropic_to_openai(req: &Value, cfg: &Config) -> Value {
     Value::Object(out)
 }
 
+/// Normalizes the `content` of an Anthropic `tool_result` block into something
+/// the OpenAI chat-completions API accepts on a `tool` message.
+///
+/// Anthropic allows `content` to be either a plain string or an array of
+/// content blocks, and MCP servers routinely return the array form (a
+/// screenshot, or text plus an image). Forwarding that array unchanged makes
+/// the upstream reject the whole request with
+/// `type has to be either 'image_url' or 'text'`, so every MCP tool that
+/// returns anything but a bare string fails. Text blocks are joined and image
+/// blocks are rewritten as `image_url` data URLs; a pure-text result collapses
+/// back to a plain string, which is what the API expects most of the time.
+fn normalize_tool_result_content(content: Option<&Value>, suffixes: &[String]) -> Value {
+    match content {
+        None | Some(Value::Null) => Value::String(String::new()),
+        Some(Value::String(s)) => Value::String(strip_tool_result_suffix(s, suffixes)),
+        Some(Value::Array(blocks)) => {
+            let has_image = blocks.iter().any(|b| type_of(b) == "image");
+            if !has_image {
+                let text = blocks
+                    .iter()
+                    .filter_map(|b| match type_of(b) {
+                        "text" => b.get("text").and_then(|t| t.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                return Value::String(strip_tool_result_suffix(&text, suffixes));
+            }
+            let mut out: Vec<Value> = Vec::new();
+            for b in blocks {
+                match type_of(b) {
+                    "text" => {
+                        let text = b.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                        out.push(json!({
+                            "type": "text",
+                            "text": strip_tool_result_suffix(text, suffixes)
+                        }));
+                    }
+                    "image" => out.push(image_block_to_image_url(b)),
+                    _ => {}
+                }
+            }
+            Value::Array(out)
+        }
+        // Anything else (a number, an object) is forwarded as a JSON string so
+        // the upstream still receives valid `tool` content.
+        Some(other) => Value::String(other.to_string()),
+    }
+}
+
+/// Converts an Anthropic `image` content block into an OpenAI `image_url` part.
+/// Both the `base64` and `url` source forms are supported.
+fn image_block_to_image_url(block: &Value) -> Value {
+    let src = block.get("source");
+    let source_type = src
+        .and_then(|s| s.get("type"))
+        .and_then(|t| t.as_str())
+        .unwrap_or("base64");
+    if source_type == "url" {
+        let url = src
+            .and_then(|s| s.get("url"))
+            .and_then(|u| u.as_str())
+            .unwrap_or("");
+        return json!({"type": "image_url", "image_url": {"url": url}});
+    }
+    let media = src
+        .and_then(|s| s.get("media_type"))
+        .and_then(|m| m.as_str())
+        .unwrap_or("image/png");
+    let data = src
+        .and_then(|s| s.get("data"))
+        .and_then(|d| d.as_str())
+        .unwrap_or("");
+    json!({
+        "type": "image_url",
+        "image_url": {"url": format!("data:{media};base64,{data}")}
+    })
+}
+
 /// Extracts the OpenAI `content` value (string or multimodal array) from a set
 /// of Anthropic user content blocks.
 fn extract_user_content(blocks: &[Value]) -> Option<Value> {
@@ -248,21 +321,7 @@ fn extract_user_content(blocks: &[Value]) -> Option<Value> {
             match type_of(b) {
                 "text" => out.push(json!({"type": "text", "text": b.get("text")})),
                 "thinking" => out.push(json!({"type": "text", "text": b.get("thinking")})),
-                "image" => {
-                    let src = b.get("source");
-                    let media = src
-                        .and_then(|s| s.get("media_type"))
-                        .and_then(|m| m.as_str())
-                        .unwrap_or("");
-                    let data = src
-                        .and_then(|s| s.get("data"))
-                        .and_then(|d| d.as_str())
-                        .unwrap_or("");
-                    out.push(json!({
-                        "type": "image_url",
-                        "image_url": {"url": format!("data:{media};base64,{data}")}
-                    }));
-                }
+                "image" => out.push(image_block_to_image_url(b)),
                 _ => {}
             }
         }
@@ -450,6 +509,8 @@ pub struct AnthropicStreamState {
     message_start_sent: bool,
     content_block_index: i64,
     content_block_open: bool,
+    /// Set once a terminating `message_stop` has been emitted.
+    finished: bool,
     /// OpenAI tool-call index -> anthropic content block index.
     tool_calls: std::collections::HashMap<i64, i64>,
 }
@@ -607,8 +668,47 @@ impl AnthropicStreamState {
                 "usage": usage_out
             }));
             events.push(json!({"type": "message_stop"}));
+            self.finished = true;
         }
 
+        events
+    }
+
+    /// Whether the upstream already delivered a `finish_reason`, i.e. the
+    /// Anthropic event sequence was properly terminated.
+    pub fn is_finished(&self) -> bool {
+        self.finished
+    }
+
+    /// Closes an unterminated stream.
+    ///
+    /// When the upstream connection drops (or simply ends) before sending a
+    /// `finish_reason`, no `message_stop` was emitted. Anthropic clients block
+    /// waiting for one, and a partially received assistant turn can end up
+    /// recorded as if it were complete. This emits the missing
+    /// `content_block_stop` / `message_delta` / `message_stop` sequence with an
+    /// explicit `stop_reason`, so the client sees a terminated — and, when
+    /// `stop_reason` is `"error"`, visibly incomplete — message.
+    ///
+    /// Returns no events when the stream was already terminated or never
+    /// started.
+    pub fn finish(&mut self, stop_reason: &str) -> Vec<Value> {
+        if self.finished || !self.message_start_sent {
+            self.finished = true;
+            return Vec::new();
+        }
+        let mut events = Vec::new();
+        if self.content_block_open {
+            events.push(json!({"type": "content_block_stop", "index": self.content_block_index}));
+            self.content_block_open = false;
+        }
+        events.push(json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": stop_reason, "stop_sequence": Value::Null},
+            "usage": {"output_tokens": 0}
+        }));
+        events.push(json!({"type": "message_stop"}));
+        self.finished = true;
         events
     }
 }
@@ -630,7 +730,48 @@ const ALLOWED_ANTHROPIC_KEYS: &[&str] = &[
     "thinking",
     "output_config",
     "service_tier",
+    // Claude Code's automatic context editing. Copilot accepts this once the
+    // matching beta is requested; silently dropping it disables compaction on
+    // the client without any diagnostic.
+    "context_management",
 ];
+
+/// Anthropic beta flag that unlocks the `context_management` request field.
+pub const CONTEXT_MANAGEMENT_BETA: &str = "context-management-2025-06-27";
+/// Anthropic beta flag that unlocks the 1M-token context window.
+pub const CONTEXT_1M_BETA: &str = "context-1m-2025-08-07";
+
+/// Builds the `anthropic-beta` header value for an upstream request.
+///
+/// The client's own `anthropic-beta` header is preserved — Claude Code sends
+/// flags there that the proxy has no business dropping — and the flags this
+/// proxy derives are appended when missing. Returns `None` when there is
+/// nothing to send.
+pub fn merge_anthropic_beta(client_value: Option<&str>, derived: &[&str]) -> Option<String> {
+    let mut flags: Vec<String> = Vec::new();
+    if let Some(value) = client_value {
+        for flag in value.split(',') {
+            let flag = flag.trim();
+            if !flag.is_empty() && !flags.iter().any(|f| f == flag) {
+                flags.push(flag.to_string());
+            }
+        }
+    }
+    for flag in derived {
+        if !flags.iter().any(|f| f == flag) {
+            flags.push((*flag).to_string());
+        }
+    }
+    (!flags.is_empty()).then(|| flags.join(","))
+}
+
+/// Whether the request asks for Claude Code's context-editing feature, which
+/// requires the `context-management-2025-06-27` beta to be requested.
+pub fn uses_context_management(req: &Value) -> bool {
+    req.get("context_management")
+        .map(|v| !v.is_null())
+        .unwrap_or(false)
+}
 
 fn clean_cache_control(block: &mut Value) {
     if let Some(cc) = block.get_mut("cache_control") {
@@ -897,13 +1038,134 @@ pub fn apply_tool_result_suffix(req: &Value, cfg: &Config) -> Value {
 }
 
 /// Whether the message list contains an image content block.
+///
+/// Images can appear either directly in a message's content or nested inside a
+/// `tool_result` block — the shape every MCP screenshot tool produces. Missing
+/// the nested case means the request goes upstream without
+/// `Copilot-Vision-Request`, so the image is silently ignored or rejected.
 pub fn has_image(req: &Value) -> bool {
     arr(req, "messages").iter().any(|m| {
         m.get("content")
             .and_then(|c| c.as_array())
-            .map(|blocks| blocks.iter().any(|b| type_of(b) == "image"))
+            .map(|blocks| blocks.iter().any(block_has_image))
             .unwrap_or(false)
     })
+}
+
+/// Whether a content block is an image, or carries one in its nested
+/// `tool_result` content.
+fn block_has_image(block: &Value) -> bool {
+    match type_of(block) {
+        "image" => true,
+        "tool_result" => block
+            .get("content")
+            .and_then(|c| c.as_array())
+            .map(|inner| inner.iter().any(|b| type_of(b) == "image"))
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+/// Object keys skipped when flattening a request for token estimation: opaque
+/// identifiers and, most importantly, base64 image payloads which would
+/// otherwise dominate the count.
+const NON_COUNTABLE_KEYS: &[&str] = &[
+    "data",
+    "type",
+    "id",
+    "tool_use_id",
+    "media_type",
+    "cache_control",
+];
+
+/// Recursively appends every string leaf of `value` to `out`.
+fn push_strings(value: &Value, out: &mut String) {
+    match value {
+        Value::String(s) => {
+            out.push_str(s);
+            out.push('\n');
+        }
+        Value::Array(items) => {
+            for item in items {
+                push_strings(item, out);
+            }
+        }
+        Value::Object(map) => {
+            for (k, v) in map {
+                if NON_COUNTABLE_KEYS.contains(&k.as_str()) {
+                    continue;
+                }
+                push_strings(v, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Flattens the countable text of an Anthropic Messages request: the system
+/// prompt, every message content block, and the tool definitions. Used for the
+/// local token estimate served by `/v1/messages/count_tokens` when the upstream
+/// native counting endpoint is unavailable.
+pub fn collect_countable_text(req: &Value) -> String {
+    let mut out = String::new();
+    if let Some(system) = req.get("system") {
+        push_strings(system, &mut out);
+    }
+    for msg in arr(req, "messages") {
+        if let Some(content) = msg.get("content") {
+            push_strings(content, &mut out);
+        }
+    }
+    for tool in arr(req, "tools") {
+        push_strings(&tool, &mut out);
+    }
+    out
+}
+
+/// Fixed token overhead the API charges for each message's role/framing.
+const PER_MESSAGE_OVERHEAD: u64 = 4;
+/// Fixed token overhead for each tool definition beyond its serialized schema.
+const PER_TOOL_OVERHEAD: u64 = 8;
+/// Fixed overhead charged once per request.
+const REQUEST_OVERHEAD: u64 = 8;
+
+/// Estimates the input token count of an Anthropic Messages request when the
+/// upstream native counting endpoint is unavailable.
+///
+/// Counting only the visible text under-reports badly: the API also charges for
+/// per-message framing and for the full JSON schema of every tool definition.
+/// A client that trusts a low number (Claude Code decides when to compact from
+/// it) keeps growing the conversation until the request is hard-rejected, so
+/// this deliberately errs on the side of the structural overhead being present.
+pub fn estimate_input_tokens(req: &Value, tokenizer: &str) -> u64 {
+    use crate::filters::count_tokens;
+
+    let mut total = REQUEST_OVERHEAD;
+
+    if let Some(system) = req.get("system") {
+        let mut text = String::new();
+        push_strings(system, &mut text);
+        total += count_tokens(&text, tokenizer);
+    }
+
+    for msg in arr(req, "messages") {
+        total += PER_MESSAGE_OVERHEAD;
+        if let Some(content) = msg.get("content") {
+            let mut text = String::new();
+            push_strings(content, &mut text);
+            total += count_tokens(&text, tokenizer);
+        }
+    }
+
+    // Tool definitions are sent as JSON, so the schema punctuation and keys are
+    // billed too — counting only the description would miss most of it.
+    for tool in arr(req, "tools") {
+        total += PER_TOOL_OVERHEAD;
+        let serialized = serde_json::to_string(&tool).unwrap_or_default();
+        total += count_tokens(&serialized, tokenizer);
+    }
+
+    total
 }
 
 #[cfg(test)]
@@ -930,6 +1192,41 @@ mod tests {
     }
 
     #[test]
+    fn countable_text_covers_system_messages_and_tools() {
+        let req = json!({
+            "system": [{"type": "text", "text": "system rules"}],
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "hello there"}]},
+                {"role": "assistant", "content": "sure thing"}
+            ],
+            "tools": [{"name": "read_file", "description": "reads a file"}]
+        });
+        let text = collect_countable_text(&req);
+        assert!(text.contains("system rules"));
+        assert!(text.contains("hello there"));
+        assert!(text.contains("sure thing"));
+        assert!(text.contains("read_file"));
+        assert!(text.contains("reads a file"));
+    }
+
+    #[test]
+    fn countable_text_skips_base64_image_payloads() {
+        let blob = "A".repeat(5000);
+        let req = json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe"},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": blob}}
+                ]
+            }]
+        });
+        let text = collect_countable_text(&req);
+        assert!(text.contains("describe"));
+        assert!(!text.contains("AAAA"));
+    }
+
+    #[test]
     fn tool_result_becomes_tool_message() {
         let cfg = Config::default();
         let req = json!({
@@ -943,6 +1240,153 @@ mod tests {
         assert_eq!(out["messages"][0]["role"], "tool");
         assert_eq!(out["messages"][0]["tool_call_id"], "abc");
         assert_eq!(out["messages"][0]["content"], "ok");
+    }
+
+    #[test]
+    fn tool_result_block_array_is_flattened_to_text() {
+        // MCP servers commonly return `content` as an array of blocks. Passing
+        // the array through unchanged makes the upstream reject the request.
+        let cfg = Config::default();
+        let req = json!({
+            "model": "claude-3",
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "abc",
+                    "content": [
+                        {"type": "text", "text": "line one"},
+                        {"type": "text", "text": "line two"}
+                    ]
+                }]
+            }]
+        });
+        let out = anthropic_to_openai(&req, &cfg);
+        assert_eq!(out["messages"][0]["role"], "tool");
+        assert_eq!(out["messages"][0]["content"], "line one\nline two");
+    }
+
+    #[test]
+    fn tool_result_image_block_becomes_image_url() {
+        let cfg = Config::default();
+        let req = json!({
+            "model": "claude-3",
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "abc",
+                    "content": [
+                        {"type": "text", "text": "screenshot:"},
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "QUJD"}}
+                    ]
+                }]
+            }]
+        });
+        let out = anthropic_to_openai(&req, &cfg);
+        let content = &out["messages"][0]["content"];
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[1]["type"], "image_url");
+        assert_eq!(content[1]["image_url"]["url"], "data:image/png;base64,QUJD");
+    }
+
+    #[test]
+    fn url_source_images_are_passed_through() {
+        let block =
+            json!({"type": "image", "source": {"type": "url", "url": "https://example.com/a.png"}});
+        let out = image_block_to_image_url(&block);
+        assert_eq!(out["image_url"]["url"], "https://example.com/a.png");
+    }
+
+    #[test]
+    fn vision_is_detected_inside_tool_results() {
+        let img = json!({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "x"}});
+        // Directly in the message content.
+        let direct = json!({"messages": [{"role": "user", "content": [img.clone()]}]});
+        assert!(has_image(&direct));
+        // Nested in a tool_result — the shape MCP screenshot tools produce.
+        let nested = json!({"messages": [{
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "t", "content": [
+                {"type": "text", "text": "here"}, img
+            ]}]
+        }]});
+        assert!(has_image(&nested));
+        // No image anywhere.
+        let none =
+            json!({"messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]});
+        assert!(!has_image(&none));
+        // A string-content tool_result must not panic or false-positive.
+        let plain = json!({"messages": [{
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "t", "content": "ok"}]
+        }]});
+        assert!(!has_image(&plain));
+    }
+
+    #[test]
+    fn tool_result_suffix_is_stripped_inside_blocks() {
+        let suffixes = vec!["\n[end]".to_string()];
+        let content = json!([{"type": "text", "text": "result\n[end]"}]);
+        let out = normalize_tool_result_content(Some(&content), &suffixes);
+        assert_eq!(out, json!("result"));
+    }
+
+    #[test]
+    fn beta_header_merges_client_and_derived_flags() {
+        // The client's flags are preserved and derived ones appended.
+        assert_eq!(
+            merge_anthropic_beta(Some("claude-code-20250219"), &[CONTEXT_1M_BETA]),
+            Some(format!("claude-code-20250219,{CONTEXT_1M_BETA}"))
+        );
+        // Duplicates are collapsed.
+        assert_eq!(
+            merge_anthropic_beta(Some(CONTEXT_1M_BETA), &[CONTEXT_1M_BETA]),
+            Some(CONTEXT_1M_BETA.to_string())
+        );
+        // Whitespace around client flags is tolerated.
+        assert_eq!(
+            merge_anthropic_beta(Some("a , b"), &[]),
+            Some("a,b".to_string())
+        );
+        // Nothing to send.
+        assert_eq!(merge_anthropic_beta(None, &[]), None);
+        assert_eq!(merge_anthropic_beta(Some(""), &[]), None);
+    }
+
+    #[test]
+    fn context_management_survives_sanitization() {
+        let req = json!({
+            "model": "m",
+            "messages": [],
+            "context_management": {"edits": [{"type": "clear_tool_uses_20250919"}]}
+        });
+        assert!(uses_context_management(&req));
+        let out = sanitize_anthropic_request(&req);
+        assert!(out.get("context_management").is_some());
+    }
+
+    #[test]
+    fn token_estimate_includes_message_and_tool_overhead() {
+        let bare = json!({"messages": [{"role": "user", "content": "hello"}]});
+        let with_tools = json!({
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": [{
+                "name": "read_file",
+                "description": "Read a file from disk",
+                "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}}
+            }]
+        });
+        let bare_count = estimate_input_tokens(&bare, "cl100k_base");
+        let tool_count = estimate_input_tokens(&with_tools, "cl100k_base");
+        // The tool schema must be billed, otherwise clients compact too late.
+        assert!(
+            tool_count > bare_count + 10,
+            "tools added only {} tokens",
+            tool_count - bare_count
+        );
+        // Even a bare request carries per-message framing overhead.
+        assert!(bare_count > crate::filters::count_tokens("hello", "cl100k_base"));
     }
 
     #[test]
@@ -980,6 +1424,49 @@ mod tests {
         assert_eq!(start[0]["type"], "message_start");
         let end = st.process(&json!({"choices": [{"delta": {}, "finish_reason": "stop"}]}));
         assert!(end.iter().any(|e| e["type"] == "message_stop"));
+        assert!(st.is_finished());
+        // A properly terminated stream needs no synthetic closing events.
+        assert!(st.finish("error").is_empty());
+    }
+
+    #[test]
+    fn finish_closes_a_stream_cut_before_finish_reason() {
+        let mut st = AnthropicStreamState::new();
+        st.process(&json!({"id": "1", "model": "m", "choices": [{"delta": {"content": "par"}}]}));
+        assert!(!st.is_finished());
+        // Upstream died here: no finish_reason, so no message_stop was sent and
+        // an Anthropic client would block forever.
+        let events = st.finish("error");
+        assert_eq!(events[0]["type"], "content_block_stop");
+        assert_eq!(events[1]["type"], "message_delta");
+        assert_eq!(events[1]["delta"]["stop_reason"], "error");
+        assert_eq!(events[2]["type"], "message_stop");
+        assert!(st.is_finished());
+        // Idempotent.
+        assert!(st.finish("error").is_empty());
+    }
+
+    #[test]
+    fn finish_is_noop_before_any_chunk_arrived() {
+        // Nothing was ever emitted, so there is no half-open message to close.
+        let mut st = AnthropicStreamState::new();
+        assert!(st.finish("error").is_empty());
+    }
+
+    #[test]
+    fn finish_closes_an_open_tool_use_block() {
+        let mut st = AnthropicStreamState::new();
+        st.process(&json!({
+            "id": "1",
+            "model": "m",
+            "choices": [{"delta": {"tool_calls": [
+                {"index": 0, "id": "toolu_1", "function": {"name": "read_file", "arguments": "{\"p"}}
+            ]}}]
+        }));
+        // The tool_use block is open with truncated JSON arguments.
+        let events = st.finish("error");
+        assert_eq!(events[0]["type"], "content_block_stop");
+        assert!(events.iter().any(|e| e["type"] == "message_stop"));
     }
 
     #[test]

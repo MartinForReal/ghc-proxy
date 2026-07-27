@@ -19,8 +19,34 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  verify:
+    name: Verify tag matches Cargo.toml
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      # A release whose binary reports a different version than its tag makes
+      # the built-in auto-upgrade re-download the same release on every start,
+      # because `current_version` never catches up with the tag. Fail loudly
+      # instead of publishing that.
+      - name: Compare tag with package version
+        shell: bash
+        run: |
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          crate_version=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          echo "tag=$tag crate_version=$crate_version"
+          if [ "$tag" != "v$crate_version" ]; then
+            echo "::error::Tag $tag does not match Cargo.toml version $crate_version." \
+                 "Bump Cargo.toml (and Cargo.lock) before tagging."
+            exit 1
+          fi
+
   build:
     name: Build ${{ matrix.target }}
+    needs: verify
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false

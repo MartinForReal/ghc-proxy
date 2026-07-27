@@ -240,11 +240,13 @@ the dashboard and model listings.
 | `POST /v1/chat/completions` | OpenAI chat completions |
 | `POST /v1/responses` | OpenAI responses API (Codex) |
 | `GET /v1/models` | List available models |
+| `GET /v1/models/{model}` | Retrieve a single model (aliases resolved) |
 | `POST /v1/messages` | Anthropic messages API |
-| `POST /v1/messages/count_tokens` | Anthropic token counting |
+| `POST /v1/messages/count_tokens` | Anthropic token counting (local estimate fallback) |
 | `POST /v1beta/models/{model}:generateContent` | Gemini generate content |
 | `POST /v1beta/models/{model}:streamGenerateContent` | Gemini streaming (SSE) |
 | `POST /v1beta/models/{model}:countTokens` | Gemini token counting |
+| `GET /health` | Liveness/readiness probe (`?strict=true` for 503 when not ready) |
 | `GET /openapi.json` | OpenAPI v3 specification |
 | `GET /` | Web dashboard |
 | `GET /metrics/dashboard` | Metrics dashboard UI |
