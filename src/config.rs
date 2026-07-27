@@ -10,7 +10,7 @@ use std::path::PathBuf;
 /// Kept in sync with the `engines.vscode` baseline of the latest
 /// `microsoft/vscode-copilot-chat` release (see "Mimicking the Copilot client"
 /// in the README for how to refresh these values).
-pub const VSCODE_VERSION: &str = "1.123.0";
+pub const VSCODE_VERSION: &str = "1.130.0";
 /// Default GitHub Copilot API version header value (`X-GitHub-Api-Version`),
 /// matching the `X-GitHub-Api-Version` constant in the Copilot Chat client
 /// source (`src/platform/networking/common/networking.ts`).

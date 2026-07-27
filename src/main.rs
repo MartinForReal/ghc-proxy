@@ -602,6 +602,14 @@ fn print_setup_guide(
     println!("{bar}");
 }
 
+/// Checks GitHub releases and replaces this binary when a newer version is
+/// available.
+///
+/// This is fully blocking: `self_update` builds its own blocking HTTP client,
+/// which stands up a private Tokio runtime. Dropping that runtime from inside
+/// an async context panics with "Cannot drop a runtime in a context where
+/// blocking is not allowed", so [`run_auto_upgrade`] must keep this on a
+/// blocking thread.
 fn maybe_auto_upgrade(enabled: bool) {
     if !enabled {
         return;
@@ -637,6 +645,21 @@ fn maybe_auto_upgrade(enabled: bool) {
             }
         }
         Err(e) => tracing::warn!("Auto-upgrade check/update failed: {e}"),
+    }
+}
+
+/// Runs the auto-upgrade check on a blocking thread.
+///
+/// `self_update` is synchronous and owns a private Tokio runtime internally.
+/// Calling it directly from the async `main` panicked the process on startup
+/// ("Cannot drop a runtime in a context where blocking is not allowed"), which
+/// made `auto_upgrade: true` unusable.
+async fn run_auto_upgrade(enabled: bool) {
+    if !enabled {
+        return;
+    }
+    if let Err(e) = tokio::task::spawn_blocking(move || maybe_auto_upgrade(enabled)).await {
+        tracing::warn!("Auto-upgrade task failed: {e}");
     }
 }
 
@@ -838,7 +861,7 @@ async fn main() {
     }
 
     // Optionally self-update from GitHub releases before serving traffic.
-    maybe_auto_upgrade(cfg.auto_upgrade);
+    run_auto_upgrade(cfg.auto_upgrade).await;
 
     // Optionally refresh the VS Code version used in upstream headers.
     if cfg.dynamic_vscode_version {
@@ -895,7 +918,9 @@ async fn main() {
     {
         let state = app_state.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30 * 60));
+            let period = std::time::Duration::from_secs(30 * 60);
+            let mut interval =
+                tokio::time::interval_at(tokio::time::Instant::now() + period, period);
             loop {
                 interval.tick().await;
                 if let Err(e) = state.load_models().await {
@@ -917,6 +942,7 @@ async fn main() {
 
     println!("\nStarting GitHub Copilot API Proxy on {host}:{port}");
     println!("Dashboard:      http://{host}:{port}/");
+    println!("Health check:   http://{host}:{port}/health");
     println!("Metrics UI:     http://{host}:{port}/metrics/dashboard");
     println!("OpenMetrics:    http://{host}:{port}/metrics");
     println!("Reload config:  POST http://{host}:{port}/api/config/reload");
@@ -933,10 +959,48 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    if let Err(e) = axum::serve(listener, app).await {
+    if let Err(e) = axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+    {
         eprintln!("Server error: {e}");
         std::process::exit(1);
     }
+    tracing::info!("Server stopped.");
+}
+
+/// Resolves when the process receives Ctrl-C (all platforms) or SIGTERM (Unix),
+/// letting in-flight requests and SSE streams finish before the socket closes.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::warn!("Failed to install Ctrl-C handler: {e}");
+            // Never resolve, so shutdown is only driven by the other signal.
+            std::future::pending::<()>().await;
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(e) => {
+                tracing::warn!("Failed to install SIGTERM handler: {e}");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+    tracing::info!("Shutdown signal received; draining in-flight requests...");
 }
 
 #[cfg(test)]

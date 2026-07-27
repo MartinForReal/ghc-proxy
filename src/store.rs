@@ -115,4 +115,124 @@ impl RequestStore {
             .collect();
         (items, total)
     }
+
+    /// Runs `f` over the retained records (newest first) while holding the
+    /// store lock. Used by aggregation endpoints (`/metrics`, the audit APIs)
+    /// so they never clone the entire ring buffer — records may carry captured
+    /// request/response bodies when debug mode is enabled.
+    pub fn with_records<R>(
+        &self,
+        f: impl FnOnce(&mut dyn Iterator<Item = &RequestRecord>) -> R,
+    ) -> R {
+        let inner = self.inner.lock().unwrap();
+        let mut iter = inner.records.iter();
+        f(&mut iter)
+    }
+
+    /// Returns the records matching `predicate` for a page, plus the total
+    /// number of matches. Filtering happens under the lock so only the records
+    /// actually returned are cloned.
+    pub fn filtered_page(
+        &self,
+        per_page: usize,
+        offset: usize,
+        predicate: impl Fn(&RequestRecord) -> bool,
+    ) -> (Vec<RequestRecord>, usize) {
+        let inner = self.inner.lock().unwrap();
+        let total = inner.records.iter().filter(|r| predicate(r)).count();
+        let items = inner
+            .records
+            .iter()
+            .filter(|r| predicate(r))
+            .skip(offset)
+            .take(per_page)
+            .cloned()
+            .collect();
+        (items, total)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(endpoint: &str, status: u16) -> RequestRecord {
+        RequestRecord {
+            id: endpoint.to_string(),
+            timestamp: String::new(),
+            endpoint: endpoint.to_string(),
+            model: "m".into(),
+            translated_model: None,
+            status_code: status,
+            request_size: 1,
+            response_size: 2,
+            input_tokens: 3,
+            output_tokens: 4,
+            duration: 0.5,
+            request_body: None,
+            response_body: None,
+            message_count: None,
+            tool_count: None,
+            tool_names: None,
+            stop_reason: None,
+            tools_called: None,
+            is_agent_initiated: None,
+            estimated_cost_usd: None,
+            prompt_cache_hit: None,
+        }
+    }
+
+    #[test]
+    fn evicts_oldest_beyond_capacity() {
+        let store = RequestStore::new(2);
+        store.add(record("a", 200));
+        store.add(record("b", 200));
+        store.add(record("c", 200));
+        let (items, total) = store.recent(10, 0);
+        assert_eq!(total, 2);
+        // Newest first; the oldest record was evicted.
+        assert_eq!(items[0].endpoint, "c");
+        assert_eq!(items[1].endpoint, "b");
+        // Aggregate stats keep counting evicted requests.
+        assert_eq!(store.stats().request_count, 3);
+        assert_eq!(store.stats().total_input_tokens, 9);
+    }
+
+    #[test]
+    fn filtered_page_paginates_matches_only() {
+        let store = RequestStore::new(10);
+        store.add(record("/v1/messages", 200));
+        store.add(record("/v1/chat/completions", 500));
+        store.add(record("/v1/messages", 429));
+
+        let (items, total) = store.filtered_page(10, 0, |r| r.endpoint == "/v1/messages");
+        assert_eq!(total, 2);
+        assert_eq!(items.len(), 2);
+
+        // Offset applies to the filtered set, not the raw store.
+        let (items, total) = store.filtered_page(1, 1, |r| r.endpoint == "/v1/messages");
+        assert_eq!(total, 2);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].status_code, 200);
+    }
+
+    #[test]
+    fn with_records_visits_every_record() {
+        let store = RequestStore::new(10);
+        store.add(record("a", 200));
+        store.add(record("b", 404));
+        let (count, errors) = store.with_records(|records| {
+            let mut count = 0;
+            let mut errors = 0;
+            for r in records {
+                count += 1;
+                if r.status_code >= 400 {
+                    errors += 1;
+                }
+            }
+            (count, errors)
+        });
+        assert_eq!(count, 2);
+        assert_eq!(errors, 1);
+    }
 }
