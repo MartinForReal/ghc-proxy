@@ -541,10 +541,15 @@ pub fn load_config_with_options(write_back_on_migration: bool) -> Config {
                     cfg.model_mappings = default_model_mappings();
                     needs_write_back = true;
                 }
-                if migrate_config(&mut cfg) {
+                // A schema-version bump means this release added or changed
+                // properties. Persist the re-rendered document unconditionally
+                // so the file on disk gains the new keys with their defaults,
+                // instead of waiting for an explicit `--update-config` run.
+                let version_upgraded = migrate_config(&mut cfg);
+                if version_upgraded {
                     needs_write_back = true;
                 }
-                if needs_write_back && write_back_on_migration {
+                if needs_write_back && (write_back_on_migration || version_upgraded) {
                     if let Err(e) = write_config(&cfg) {
                         tracing::warn!(
                             "Failed to persist migrated config to {}: {e}",
@@ -736,11 +741,17 @@ pub fn load_config() -> Config {
 }
 
 /// Applies in-place config migrations from older schema versions.
-/// Returns true when the config was modified and should be written back.
+///
+/// Returns true when the persisted file predates `CONFIG_VERSION`. Because
+/// missing keys are filled from the `serde` defaults at parse time, rewriting
+/// the file after a version bump is what materializes properties introduced by
+/// a newer release with their default values.
 fn migrate_config(cfg: &mut Config) -> bool {
-    let mut changed = false;
+    if cfg.config_version >= CONFIG_VERSION {
+        return false;
+    }
 
-    if cfg.config_version < CONFIG_VERSION {
+    if cfg.config_version < 2 {
         // Ensure new aliases introduced with Opus 4.8 exist in legacy files.
         let opus = DEFAULT_OPUS.to_string();
         for k in ["opus4-8", "4-8[1m]"] {
@@ -768,12 +779,13 @@ fn migrate_config(cfg: &mut Config) -> bool {
                 }
             }
         }
-
-        cfg.config_version = CONFIG_VERSION;
-        changed = true;
     }
 
-    changed
+    // Any older schema version is lifted to the current one; the caller
+    // persists the re-rendered document so newly introduced properties appear
+    // on disk with their defaults.
+    cfg.config_version = CONFIG_VERSION;
+    true
 }
 
 #[cfg(test)]
@@ -886,5 +898,50 @@ mod tests {
         let parsed: Config = serde_norway::from_str(&yaml).expect("render must re-parse");
         assert_eq!(parsed.github_models.token.as_deref(), Some("ghp_abc123"));
         assert_eq!(parsed.github_models.api_version, "2099-01-01");
+    }
+
+    #[test]
+    fn legacy_config_gains_new_properties_with_defaults() {
+        // A file written by an older release omits properties added since. They
+        // parse as their defaults, and the migration reports that the document
+        // must be rewritten so the new keys are materialized on disk.
+        let yaml = "config_version: 1\naddress: 0.0.0.0\nport: 9000\n";
+        let mut cfg: Config = serde_norway::from_str(yaml).expect("legacy config parses");
+        assert!(migrate_config(&mut cfg));
+        assert_eq!(cfg.config_version, CONFIG_VERSION);
+        // User-set values survive the migration...
+        assert_eq!(cfg.address, "0.0.0.0");
+        assert_eq!(cfg.port, 9000);
+        // ...while properties the old file never had take their defaults.
+        assert!(cfg.github_models.enabled);
+        assert_eq!(cfg.max_connection_retries, default_max_retries());
+        assert_eq!(cfg.api_version, API_VERSION);
+        // The re-rendered document carries them forward.
+        let rendered = render_config_yaml(&cfg);
+        assert!(rendered.contains(&format!("config_version: {CONFIG_VERSION}")));
+        assert!(rendered.contains("github_models:"));
+    }
+
+    #[test]
+    fn current_version_config_is_not_rewritten() {
+        // Nothing to migrate: an up-to-date file must not be rewritten on load.
+        let mut cfg = Config::default();
+        assert!(!migrate_config(&mut cfg));
+        assert_eq!(cfg.config_version, CONFIG_VERSION);
+    }
+
+    #[test]
+    fn opus_alias_migration_only_applies_to_pre_v2_files() {
+        // The v2 alias backfill must not clobber customizations in files that
+        // are already at v2 or newer.
+        let mut cfg = Config::default();
+        cfg.model_mappings
+            .exact
+            .insert("opus".to_string(), "my-model".to_string());
+        assert!(!migrate_config(&mut cfg));
+        assert_eq!(
+            cfg.model_mappings.exact.get("opus").map(String::as_str),
+            Some("my-model")
+        );
     }
 }
