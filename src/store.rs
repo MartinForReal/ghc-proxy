@@ -17,6 +17,34 @@ pub struct RequestRecord {
     pub response_size: usize,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Whether `output_tokens` is the upstream's final figure.
+    ///
+    /// On an Anthropic stream the authoritative count arrives only in
+    /// `message_delta`, at the very end. A record finalized before that — a
+    /// client stall abort, an interrupted stream — carries the opening
+    /// placeholder from `message_start` instead, which is a single digit
+    /// against an eventual five-figure total. `Some(false)` marks the number
+    /// as unknown rather than letting the dashboard present it as fact.
+    /// `None` on paths that do not track this, so their counts render as
+    /// before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens_final: Option<bool>,
+    /// Portion of `input_tokens` that was served from a warm prompt cache.
+    /// Always serialized: the dashboard derives the cache hit ratio from it.
+    pub cache_read_input_tokens: u64,
+    /// Portion of `input_tokens` this request wrote into the cache.
+    pub cache_creation_input_tokens: u64,
+    /// Copilot premium-request cost, from the model catalog's
+    /// `billing.multiplier`. `None` when the model is unknown or the endpoint
+    /// carries no premium cost — never guessed as 1.0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub premium_multiplier: Option<f64>,
+    /// Longest silence between two upstream chunks, in milliseconds. Only set
+    /// on streaming responses. When a stream stalls this is what assigns
+    /// blame: a large value means the upstream went quiet, a small one means
+    /// it kept sending and the stall was downstream of here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_idle_max_ms: Option<u64>,
     pub duration: f64,
     /// Captured request body. Only populated when debug mode is enabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -47,9 +75,40 @@ pub struct RequestRecord {
     /// Whether prompt caching was used (hit or write)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_cache_hit: Option<bool>,
+    /// Client session this request belongs to, from `metadata.user_id`.
+    /// Several Claude Code instances can share one proxy; without this their
+    /// records interleave in the dashboard with no way to tell them apart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// Keepalive probes actually written to the client during this response.
+    /// Pairs with `upstream_idle_max_ms` to place blame on a stalled stream:
+    /// a long idle with probes sent means the proxy kept signalling and the
+    /// client ignored it; a long idle with zero probes means the keepalive
+    /// itself failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keepalive_probes: Option<u32>,
+    /// Why the request failed, when it did. `None` on a successful request.
+    /// Answers "which step broke" without needing a packet capture.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_kind: Option<String>,
     /// Estimated cost in USD based on token counts and model rates
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimated_cost_usd: Option<f64>,
+}
+
+/// Values for [`RequestRecord::failure_kind`], ordered by how far the request
+/// got before dying.
+pub mod failure {
+    /// Never left the proxy — token refresh or the rate gate rejected it.
+    pub const PRECONDITION: &str = "precondition_failed";
+    /// Sent, but the upstream never produced a response.
+    pub const CONNECT: &str = "connect_error";
+    /// The upstream answered with a non-2xx status.
+    pub const UPSTREAM_STATUS: &str = "upstream_status";
+    /// The upstream stream died partway through.
+    pub const STREAM_INTERRUPTED: &str = "stream_interrupted";
+    /// The client hung up before the response finished.
+    pub const CLIENT_DISCONNECTED: &str = "client_disconnected";
 }
 
 /// Aggregate statistics returned by `/api/stats`.
@@ -58,6 +117,13 @@ pub struct Stats {
     pub request_count: u64,
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
+    /// Input tokens served from cache, across every recorded request.
+    pub total_cache_read_tokens: u64,
+    /// Input tokens written into the cache, across every recorded request.
+    pub total_cache_creation_tokens: u64,
+    /// Copilot premium requests consumed. Fractional because some models
+    /// bill at a discounted multiplier.
+    pub premium_requests: f64,
     pub bytes_sent: u64,
     pub bytes_received: u64,
 }
@@ -90,6 +156,13 @@ impl RequestStore {
         inner.stats.request_count += 1;
         inner.stats.total_input_tokens += record.input_tokens;
         inner.stats.total_output_tokens += record.output_tokens;
+        inner.stats.total_cache_read_tokens += record.cache_read_input_tokens;
+        inner.stats.total_cache_creation_tokens += record.cache_creation_input_tokens;
+        // Only count what the catalog actually priced; an unknown multiplier
+        // is left out rather than assumed to be a full premium request.
+        if let Some(multiplier) = record.premium_multiplier {
+            inner.stats.premium_requests += multiplier;
+        }
         inner.stats.bytes_received += record.request_size as u64;
         inner.stats.bytes_sent += record.response_size as u64;
         inner.records.push_front(record);
@@ -168,6 +241,13 @@ mod tests {
             response_size: 2,
             input_tokens: 3,
             output_tokens: 4,
+            output_tokens_final: None,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+            premium_multiplier: None,
+            upstream_idle_max_ms: None,
+            session_id: None,
+            keepalive_probes: None,
             duration: 0.5,
             request_body: None,
             response_body: None,
@@ -179,6 +259,7 @@ mod tests {
             is_agent_initiated: None,
             estimated_cost_usd: None,
             prompt_cache_hit: None,
+            failure_kind: None,
         }
     }
 
@@ -214,6 +295,43 @@ mod tests {
         assert_eq!(total, 2);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].status_code, 200);
+    }
+
+    #[test]
+    fn stats_track_cache_buckets_and_premium_requests() {
+        let store = RequestStore::new(10);
+
+        // A fully-cached Claude Code turn: almost the entire prompt is a
+        // cache read, so the uncached remainder is a rounding error.
+        let mut cached = record("/v1/messages", 200);
+        cached.input_tokens = 103_673;
+        cached.cache_read_input_tokens = 101_940;
+        cached.cache_creation_input_tokens = 1_731;
+        cached.premium_multiplier = Some(1.0);
+        store.add(cached);
+
+        // A discounted model still counts, at its own rate.
+        let mut cheap = record("/v1/messages", 200);
+        cheap.input_tokens = 500;
+        cheap.premium_multiplier = Some(0.33);
+        store.add(cheap);
+
+        // Embeddings burn no premium allowance; an unknown multiplier must
+        // not be invented as 1.0.
+        let mut free = record("/v1/embeddings", 200);
+        free.input_tokens = 20;
+        free.premium_multiplier = None;
+        store.add(free);
+
+        let s = store.stats();
+        assert_eq!(s.total_input_tokens, 103_673 + 500 + 20);
+        assert_eq!(s.total_cache_read_tokens, 101_940);
+        assert_eq!(s.total_cache_creation_tokens, 1_731);
+        assert!(
+            (s.premium_requests - 1.33).abs() < 1e-9,
+            "premium_requests was {}",
+            s.premium_requests
+        );
     }
 
     #[test]
