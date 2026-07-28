@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- **Config schema upgrades apply automatically.** When a release introduces new
+  `config.yaml` properties (signalled by a `config_version` bump), the missing
+  keys are now filled with their defaults and written back to `config.yaml` on
+  the next start, instead of requiring an explicit `--update-config` run.
+  Existing values are preserved, and up-to-date files are never rewritten. The
+  Opus 4.8 alias backfill is now scoped to pre-v2 files so it cannot overwrite
+  customized mappings in current ones
+
 ## [1.3.0] - 2026-07-27
 
 ### Added

@@ -112,6 +112,17 @@ The [setup wizard](getting-started.md#the-setup-wizard) can capture and validate
 this token for you. Set `github_models.org` to attribute inference to an
 organization. The catalog is merged into `GET /v1/models`.
 
+### Schema upgrades
+
+`config_version` records the schema an existing `config.yaml` was written
+against. When a newer release introduces configuration properties, it bumps
+this number; on the next start the proxy fills the missing properties with
+their default values and rewrites `config.yaml` automatically, preserving every
+value you have set. No flag is needed for this.
+
+`--update-config` remains for the other, non-schema write-backs (for example
+restoring the built-in `model_mappings` when the file has none).
+
 ## Command-line options
 
 ```text
@@ -139,7 +150,7 @@ ghc-proxy [options]
       --no-fetch-version    Disable dynamic VS Code version fetching
       --auto-upgrade        Auto-upgrade app when a newer release is available
       --no-auto-upgrade     Disable app auto-upgrade
-      --update-config       Persist migrated config/default additions back to config.yaml
+      --update-config       Persist non-schema config write-backs (schema upgrades apply automatically)
   -v, --version             Show version
   -h, --help                Show help
 ```

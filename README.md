@@ -92,7 +92,7 @@ ghc-proxy [options]
       --no-fetch-version  Disable dynamic VS Code version fetching
       --auto-upgrade      Auto-upgrade app when a newer release is available
       --no-auto-upgrade   Disable app auto-upgrade
-      --update-config     Persist migrated config/default additions back to config.yaml
+      --update-config     Persist non-schema config write-backs (schema upgrades apply automatically)
   -v, --version           Show version
   -h, --help              Show help
 ```
