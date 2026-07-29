@@ -32,10 +32,11 @@ require a key on the LLM endpoints; see [Authentication](#authentication) below.
 | `GET /v1/models/full/` | Raw upstream model catalog with capabilities |
 | `GET /usage` | Copilot plan and quota usage |
 | `GET /health` | Liveness/readiness probe |
-| `GET /` | Web analytics dashboard |
+| `GET /` | Web analytics dashboard — overview |
 | `GET /metrics/dashboard` | Metrics dashboard UI |
 | `GET /metrics` | OpenMetrics exposition endpoint |
 | `GET /requests` | Request browser |
+| `GET /app.css` | Stylesheet shared by the three dashboard pages |
 | `GET /api/stats` | Dashboard statistics (JSON) |
 | `GET /api/cache` | Prompt-cache statistics, overall and per model |
 | `GET /api/requests` | Recent requests (JSON) |
@@ -210,7 +211,7 @@ the mapped Copilot model. Unknown ids return `404` with an OpenAI-style error
 body.
 
 ```bash
-curl http://127.0.0.1:8314/v1/models/claude-opus-4.8
+curl http://127.0.0.1:8314/v1/models/claude-opus-5
 ```
 
 ## Token counting

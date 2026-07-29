@@ -42,7 +42,12 @@ file.
   upstream model supports it, otherwise translated through chat completions).
 - **Gemini-compatible** `/v1beta/models/{model}:generateContent`,
   `:streamGenerateContent`, and `:countTokens` endpoints (translated through chat
-  completions).
+  completions). `generationConfig` parameters with an OpenAI counterpart are
+  carried across — `temperature`, `topP`, `maxOutputTokens`, `stopSequences`,
+  `candidateCount`, `seed`, the penalties, and `responseMimeType`/`responseSchema`
+  as `response_format`. `topK` and `safetySettings` have no counterpart and are
+  dropped, which the dashboard states rather than leaving you to assume they
+  took effect.
 - **GitHub Models inference** — requests whose model id uses the
   `publisher/model` form (e.g. `openai/gpt-4o`) are transparently routed to the
   [GitHub Models](https://models.github.ai) API instead of Copilot, authenticated
@@ -59,7 +64,23 @@ file.
 - **Copilot token management** with automatic refresh.
 - **Orphaned `tool_use_id` recovery** — retries with offending tool results
   stripped when the upstream returns the corresponding 400 error.
-- **Request analytics dashboard** at `/` and a request browser at `/requests`.
+- **The Responses API over WebSocket.** Ten models advertise a `ws:/responses`
+  transport in the Copilot catalog. `GET /v1/responses` with an `Upgrade:
+  websocket` header relays to it, recorded like any other request. A model that
+  does not advertise the transport is refused with an error frame naming the
+  endpoint that does work.
+- **Request analytics dashboard** across three pages: an overview at `/` led by
+  what Copilot actually billed (in AI units, read from `copilot_usage`, not
+  estimated from a price list), a request browser at `/requests` where each
+  exchange renders as a conversation with the raw frames a tab away, and a
+  metrics UI at `/metrics/dashboard`. Prompt-cache statistics per model at
+  `GET /api/cache` show where input tokens came from and what the cache was
+  worth. Failed attempts are counted separately rather than diluting the
+  statistics.
+- **Body capture toggled at runtime** from the dashboard or
+  `POST /api/config/debug`, so you can start recording request and response
+  bodies without a restart. Not persisted to `config.yaml`, since capture puts
+  prompts into memory and the log and should lapse on restart.
 - **Interactive setup wizard** (`--setup`, or first launch in a terminal):
   GitHub sign-in, live model catalog, and model-mapping configuration.
 - **1M-context support** — forwards the `anthropic-beta: context-1m-2025-08-07`
@@ -158,7 +179,7 @@ Config file: `~/.ghc-tunnel/config.yaml` (`%APPDATA%/ghc-tunnel/config.yaml`
 on Windows). It is generated on first run or with `--config`.
 
 ```yaml
-config_version: 2
+config_version: 4
 address: 127.0.0.1
 port: 8314
 debug: false
@@ -169,11 +190,11 @@ copilot_version: "0.48.1"
 auto_upgrade: true                  # self-update on startup; false to disable
 model_mappings:
   exact:
-    opus: claude-opus-4.8
-    sonnet: claude-opus-4.8
+    opus: claude-opus-5
+    sonnet: claude-opus-5
     haiku: claude-haiku-4.5
   prefix:
-    claude-sonnet-4-: claude-opus-4.8
+    claude-sonnet-4-: claude-opus-5
 github_models:
   enabled: true                     # route publisher/model ids to GitHub Models
   # org: my-org                     # attribute inference to an organization
@@ -241,6 +262,7 @@ the dashboard and model listings.
 |----------|-------------|
 | `POST /v1/chat/completions` | OpenAI chat completions |
 | `POST /v1/responses` | OpenAI responses API (Codex) |
+| `GET /v1/responses` *(with `Upgrade: websocket`)* | Responses API over WebSocket, for models advertising `ws:/responses` |
 | `GET /v1/models` | List available models |
 | `GET /v1/models/{model}` | Retrieve a single model (aliases resolved) |
 | `POST /v1/messages` | Anthropic messages API |
@@ -250,12 +272,19 @@ the dashboard and model listings.
 | `POST /v1beta/models/{model}:countTokens` | Gemini token counting |
 | `GET /health` | Liveness/readiness probe (`?strict=true` for 503 when not ready) |
 | `GET /openapi.json` | OpenAPI v3 specification |
-| `GET /` | Web dashboard |
+| `GET /` | Web dashboard — overview |
 | `GET /metrics/dashboard` | Metrics dashboard UI |
 | `GET /metrics` | OpenMetrics endpoint |
 | `GET /requests` | Request browser |
+| `GET /app.css` | Stylesheet shared by the three dashboard pages |
 | `POST /api/config/reload` | Reload config.yaml without restart |
+| `POST /api/config/debug` | Turn body capture on or off (`{"debug": true}`) |
+| `GET /api/stats` | Running totals, including what Copilot billed |
+| `GET /api/cache` | Prompt-cache statistics, overall and per model |
 | `GET /api/models` | All supported models (used by the dashboard) |
+
+The `/api/config/` routes are guarded by the API key when one is configured;
+the read-only dashboard endpoints stay open.
 
 ## Example Usage
 

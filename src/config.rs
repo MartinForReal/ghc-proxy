@@ -21,12 +21,16 @@ pub const COPILOT_VERSION: &str = "0.48.1";
 /// Config schema version used to detect when defaults/options changed and a
 /// persisted config should be rewritten with migrated values.
 ///
-/// Bumped to 3 for `upstream_read_timeout_seconds` and the `auto_upgrade`
-/// default flip, so existing files gain both on the next start.
-pub const CONFIG_VERSION: u32 = 3;
+/// Bumped to 4 for the Opus 5 / Sonnet 5 model mappings, so existing files gain
+/// the new aliases and have superseded targets lifted on the next start.
+pub const CONFIG_VERSION: u32 = 4;
 
 /// Default model name that Claude "opus"/"sonnet" requests are mapped to.
-pub const DEFAULT_OPUS: &str = "claude-opus-4.8";
+///
+/// The catalog carries `claude-opus-4.6` through `claude-opus-5`; this is the
+/// newest generally-available one, and it matches 4.8 on every published
+/// capability -- 1M context, 64k output, billing multiplier 1, vision.
+pub const DEFAULT_OPUS: &str = "claude-opus-5";
 /// Default model name that Claude "haiku" requests are mapped to.
 pub const DEFAULT_HAIKU: &str = "claude-haiku-4.5";
 
@@ -307,11 +311,17 @@ pub fn default_model_mappings() -> ModelMappings {
     let opus = DEFAULT_OPUS.to_string();
     let haiku = DEFAULT_HAIKU.to_string();
     let mut exact = BTreeMap::new();
-    for k in ["opus", "sonnet", "opus4-7", "opus4-8", "4-7[1m]", "4-8[1m]"] {
+    for k in [
+        "opus", "sonnet", "opus4-7", "opus4-8", "opus5", "4-7[1m]", "4-8[1m]", "5[1m]",
+    ] {
         exact.insert(k.to_string(), opus.clone());
     }
     exact.insert("haiku".to_string(), haiku.clone());
 
+    // Every spelling of a Claude model resolves to the current best one. The
+    // list is exhaustive rather than pattern-based because a request naming a
+    // model that has since been superseded should still be served, and because
+    // Anthropic writes the same version two ways (`4.8` and `4-8`).
     let mut prefix = BTreeMap::new();
     for k in [
         "claude-sonnet-4-",
@@ -319,6 +329,7 @@ pub fn default_model_mappings() -> ModelMappings {
         "claude-opus-4.6-",
         "claude-opus-4.7-",
         "claude-opus-4.8-",
+        "claude-opus-5-",
         "claude-opus-4-5-",
         "claude-opus-4-6-",
         "claude-opus-4-7-",
@@ -327,16 +338,21 @@ pub fn default_model_mappings() -> ModelMappings {
         "claude-opus-4.6",
         "claude-opus-4.7",
         "claude-opus-4.8",
+        "claude-opus-5",
         "claude-opus-4-6",
         "claude-opus-4-7",
         "claude-opus-4-8",
         "claude-opus-4-6[1m]",
         "claude-opus-4-7[1m]",
         "claude-opus-4-8[1m]",
+        "claude-opus-5[1m]",
         "claude-sonnet-4-7",
         "claude-sonnet-4-8",
         "claude-sonnet-4-6",
         "claude-sonnet-4-5",
+        "claude-sonnet-4.6",
+        "claude-sonnet-5-",
+        "claude-sonnet-5",
     ] {
         prefix.insert(k.to_string(), opus.clone());
     }
@@ -838,6 +854,39 @@ fn migrate_config(cfg: &mut Config) -> bool {
         }
     }
 
+    if cfg.config_version < 4 {
+        // Opus 5 and Sonnet 5 entered the catalog. Add their aliases so the new
+        // names resolve, and change nothing else.
+        //
+        // Deliberately no "lift stale defaults to the new one" pass. A value
+        // that equals the previous built-in default is indistinguishable from a
+        // version the user pinned on purpose -- and pinning is common: a real
+        // config in the wild carried `claude-opus-4-7: claude-opus-4.7` beside
+        // `haiku: claude-opus-4.7`, both of which such a pass would silently
+        // rewrite. Existing mappings keep pointing where they were told to;
+        // `--setup` or `--default` is how a user asks for the new defaults.
+        let opus = DEFAULT_OPUS.to_string();
+        for k in ["opus5", "5[1m]"] {
+            cfg.model_mappings
+                .exact
+                .entry(k.to_string())
+                .or_insert_with(|| opus.clone());
+        }
+        for k in [
+            "claude-opus-5-",
+            "claude-opus-5",
+            "claude-opus-5[1m]",
+            "claude-sonnet-5-",
+            "claude-sonnet-5",
+            "claude-sonnet-4.6",
+        ] {
+            cfg.model_mappings
+                .prefix
+                .entry(k.to_string())
+                .or_insert_with(|| opus.clone());
+        }
+    }
+
     // Any older schema version is lifted to the current one; the caller
     // persists the re-rendered document so newly introduced properties appear
     // on disk with their defaults.
@@ -1047,6 +1096,72 @@ mod tests {
         assert_eq!(
             cfg.model_mappings.exact.get("opus").map(String::as_str),
             Some("my-model")
+        );
+    }
+
+    #[test]
+    fn opus_5_migration_adds_aliases_without_touching_existing_ones() {
+        let yaml = "config_version: 3\n";
+        let mut cfg: Config = serde_norway::from_str(yaml).expect("v3 config parses");
+        // A hand-tuned file: version-specific pins, and a tier alias pointed
+        // somewhere the defaults would never put it. Both shapes were observed
+        // in a real config, and a migration that "lifts stale defaults" rewrites
+        // both, because a pin and a stale default look identical.
+        cfg.model_mappings
+            .exact
+            .insert("opus".to_string(), "claude-opus-4.8".to_string());
+        cfg.model_mappings
+            .exact
+            .insert("haiku".to_string(), "claude-opus-4.7".to_string());
+        cfg.model_mappings
+            .prefix
+            .insert("claude-opus-4-7".to_string(), "claude-opus-4.7".to_string());
+        cfg.model_mappings.prefix.insert(
+            "claude-sonnet-4.6".to_string(),
+            "pinned-by-hand".to_string(),
+        );
+
+        assert!(migrate_config(&mut cfg));
+        assert_eq!(cfg.config_version, CONFIG_VERSION);
+
+        // Nothing already in the file is rewritten, including a key this
+        // migration would otherwise seed.
+        for (k, want) in [("opus", "claude-opus-4.8"), ("haiku", "claude-opus-4.7")] {
+            assert_eq!(
+                cfg.model_mappings.exact.get(k).map(String::as_str),
+                Some(want),
+                "exact alias {k} must not be rewritten"
+            );
+        }
+        for (k, want) in [
+            ("claude-opus-4-7", "claude-opus-4.7"),
+            ("claude-sonnet-4.6", "pinned-by-hand"),
+        ] {
+            assert_eq!(
+                cfg.model_mappings.prefix.get(k).map(String::as_str),
+                Some(want),
+                "prefix {k} must not be rewritten"
+            );
+        }
+
+        // Names that were not in the file are seeded with the new default.
+        assert_eq!(
+            cfg.model_mappings.exact.get("opus5").map(String::as_str),
+            Some(DEFAULT_OPUS)
+        );
+        assert_eq!(
+            cfg.model_mappings
+                .prefix
+                .get("claude-opus-5")
+                .map(String::as_str),
+            Some(DEFAULT_OPUS)
+        );
+        assert_eq!(
+            cfg.model_mappings
+                .prefix
+                .get("claude-sonnet-5")
+                .map(String::as_str),
+            Some(DEFAULT_OPUS)
         );
     }
 }

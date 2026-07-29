@@ -50,16 +50,22 @@ export ANTHROPIC_API_KEY="ghc-proxy"
 
 Claude Code sends specific model names (for example `claude-opus-4-7[1m]`). Use
 [model mappings](configuration.md#model-mappings) to route those to whichever
-Copilot model you want. For example, to always use Claude Opus 4.8 with its
+Copilot model you want. For example, to always use Claude Opus 5 with its
 native 1M context:
 
 ```yaml
 model_mappings:
   exact:
-    claude-opus-4-8: claude-opus-4.8
+    opus: claude-opus-5
+    "5[1m]": claude-opus-5
   prefix:
-    claude-opus-4-7: claude-opus-4.8
+    claude-opus-4-7: claude-opus-5
+    claude-opus-4-8: claude-opus-5
 ```
+
+The built-in defaults already do this for every Claude spelling. They apply to
+a *new* config file only — an existing one keeps the targets it has, so if you
+wrote yours before Opus 5 shipped, either edit it or re-run `--setup`.
 
 Restart the proxy after editing `config.yaml` — mappings are read at startup.
 
@@ -109,7 +115,18 @@ at `/v1beta/models/{model}:generateContent` (plus streaming and token counting).
 ## Tips
 
 - Use `GET /usage` (or `ghc-proxy check-usage`) to monitor your Copilot quota.
-- The dashboard at `http://127.0.0.1:8314/` shows live request statistics and
-  the full list of supported models.
+- The dashboard has three pages: the overview at `http://127.0.0.1:8314/` leads
+  with what Copilot billed for the session in AI units, alongside quota, traffic
+  and prompt-cache statistics; `/requests` browses each exchange as a
+  conversation; `/metrics/dashboard` shows the raw metric list.
+- Prompt caching is where an agent session gets cheap or expensive. The cache
+  panel breaks the hit rate down per model, because a single global number
+  cannot tell you *which* conversation stopped matching its prefix. Copilot
+  needs a minimum cacheable prefix — around 4k tokens — before any of it is
+  eligible, so short prompts legitimately show nothing.
+- To inspect what a tool is actually sending, turn on body capture from the
+  overview or with `curl -X POST http://127.0.0.1:8314/api/config/debug -d
+  '{"debug": true}'`. It takes effect on the next request and lapses on
+  restart.
 - If a tool reports a model is unavailable, check `GET /v1/models` for the exact
   model id and add a mapping.

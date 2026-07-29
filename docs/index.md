@@ -33,6 +33,7 @@ so OpenAI- and Anthropic-native clients work unmodified.
 ## Highlights
 
 - **OpenAI-compatible** `/v1/chat/completions` and `/v1/responses` (Codex) endpoints.
+- **The Responses API over WebSocket** — `GET /v1/responses` with `Upgrade: websocket`, for the models whose catalog advertises `ws:/responses`.
 - **Anthropic-compatible** `/v1/messages` endpoint with native passthrough or translation.
 - **Gemini-compatible** `/v1beta/models/{model}:generateContent` (+ streaming and token counting).
 - **Embeddings**, **model listing**, **token counting**, and a **usage** endpoint.
@@ -43,7 +44,9 @@ so OpenAI- and Anthropic-native clients work unmodified.
 - **Optional API-key auth** on the LLM endpoints (Bearer / `x-api-key` / `x-goog-api-key`), off by default.
 - **One-click client setup** for Claude Code, Codex, and the Gemini CLI.
 - **OpenAPI spec** at `/openapi.json`.
-- **Analytics dashboard** at `/` and a request browser at `/requests`.
+- **Three-page dashboard** — an overview at `/` led by what Copilot actually billed, a request browser at `/requests` that renders each exchange as a conversation, and metrics at `/metrics/dashboard`.
+- **Spend and cache analytics** — billed AI units read from `copilot_usage` rather than estimated, and per-model prompt-cache statistics at `/api/cache`.
+- **Body capture toggled at runtime** via `POST /api/config/debug`, so you can start recording bodies without a restart.
 
 ## Quick start
 

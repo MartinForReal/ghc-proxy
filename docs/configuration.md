@@ -21,7 +21,7 @@ Windows). Generated on first run, with `--config`, or through the setup wizard.
 
 ```yaml
 # Schema version for migration/write-back behavior
-config_version: 2
+config_version: 4
 
 # Server settings
 address: 127.0.0.1
@@ -42,11 +42,11 @@ auto_upgrade: true
 # Model name mappings: exact (full match) and prefix (starts-with)
 model_mappings:
   exact:
-    opus: claude-opus-4.8
-    sonnet: claude-sonnet-4.6
+    opus: claude-opus-5
+    sonnet: claude-sonnet-5
     haiku: claude-haiku-4.5
   prefix:
-    claude-sonnet-4-: claude-opus-4.8
+    claude-sonnet-4-: claude-opus-5
 
 # GitHub Models (https://models.github.ai) inference
 # Route publisher/model ids (e.g. openai/gpt-4o) to GitHub Models instead of
@@ -84,6 +84,14 @@ Incoming model names are rewritten before the request is forwarded upstream:
 
 Exact matches take priority over prefix matches. Unmapped names pass through
 unchanged. Use the live catalog at `GET /v1/models` to discover valid targets.
+
+The built-in mappings point every Claude spelling at the newest generally
+available Opus — currently `claude-opus-5` — and every Haiku spelling at
+`claude-haiku-4.5`. Anthropic writes the same version two ways (`4.8` and
+`4-8`), so both forms are listed.
+
+These are defaults for a *new* config file. A file you already have is never
+rewritten to follow them: see [Schema upgrades](#schema-upgrades).
 
 ### Account type
 
@@ -124,6 +132,21 @@ against. When a newer release introduces configuration properties, it bumps
 this number; on the next start the proxy fills the missing properties with
 their default values and rewrites `config.yaml` automatically, preserving every
 value you have set. No flag is needed for this.
+
+**An upgrade only ever adds.** A model mapping already in the file keeps
+pointing where you told it to, even when a newer release changes the built-in
+default for that alias. There is no way to tell a mapping left at an old
+default apart from one deliberately pinned to that version, and pinning is
+common — so nothing existing is rewritten. To adopt the new defaults, run
+`--setup` or start it from built-in defaults with `--default`.
+
+Schema versions so far:
+
+| Version | Introduced |
+|---------|------------|
+| 2 | Opus 4.8 aliases |
+| 3 | `upstream_read_timeout_seconds`; `auto_upgrade` defaulting to true |
+| 4 | Opus 5 and Sonnet 5 aliases |
 
 `--update-config` remains for the other, non-schema write-backs (for example
 restoring the built-in `model_mappings` when the file has none).

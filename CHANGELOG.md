@@ -248,6 +248,22 @@ All notable changes to this project will be documented in this file.
   `--no-auto-upgrade`, or `GHC_PROXY_AUTO_UPGRADE=0` — worth doing when the
   binary is managed by a package manager, or lives in a build output directory
   that `cargo build`/`cargo clean` also writes to.
+- **Default model mappings point at Opus 5 and Sonnet 5.** The catalog now
+  carries `claude-opus-5` and `claude-sonnet-5`; both are generally available and
+  match `claude-opus-4.8` on every published capability — 1M context, 64k
+  output, billing multiplier 1, vision. `claude-opus-5` is the new built-in
+  target, and the table gained the `opus5` / `5[1m]` aliases along with the
+  `claude-opus-5*`, `claude-sonnet-5*` and `claude-sonnet-4.6` prefixes.
+
+  **Existing config files are only added to, never rewritten.** A mapping
+  already on disk keeps pointing where it was told to, even when it holds what
+  used to be the built-in default. A value equal to an old default is
+  indistinguishable from a version pinned on purpose, and pinning is common —
+  a config in the wild carried `claude-opus-4-7: claude-opus-4.7` beside
+  `haiku: claude-opus-4.7`, both of which a "lift stale defaults" pass would
+  silently retarget. Run `--setup`, or `--default`, to adopt the new defaults.
+- `config_version` bumped to `4`, so existing `config.yaml` files gain the new
+  aliases on the next start.
 - `config_version` bumped to `3`, so existing `config.yaml` files gain
   `upstream_read_timeout_seconds` and the new `auto_upgrade` default on the next
   start.

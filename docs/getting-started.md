@@ -42,6 +42,7 @@ Once running, the proxy prints the endpoints it serves:
 ```text
 Starting GitHub Copilot API Proxy on 127.0.0.1:8314
 Dashboard:      http://127.0.0.1:8314/
+Health check:   http://127.0.0.1:8314/health
 Metrics UI:     http://127.0.0.1:8314/metrics/dashboard
 OpenMetrics:    http://127.0.0.1:8314/metrics
 Reload config:  POST http://127.0.0.1:8314/api/config/reload
@@ -51,6 +52,10 @@ Anthropic API:  http://127.0.0.1:8314/v1/messages
 Gemini API:     http://127.0.0.1:8314/v1beta/models/{model}:generateContent
 OpenAPI spec:   http://127.0.0.1:8314/openapi.json
 ```
+
+The dashboard link is the overview; `/requests` browses individual exchanges.
+See the [API reference](api.md) for the rest, including the WebSocket transport
+and the statistics endpoints.
 
 ## Authentication
 
@@ -122,3 +127,5 @@ persisted `machine_id.txt` used for client disguise.
 - Tune behavior in the [Configuration](configuration.md) reference.
 - Explore the [API Reference](api.md) and client examples.
 - Wire up [Claude Code & Codex](claude-code.md).
+- Watch what it costs: the overview at `/` leads with the AI units Copilot
+  billed, and `/api/cache` breaks prompt-cache effectiveness down per model.
