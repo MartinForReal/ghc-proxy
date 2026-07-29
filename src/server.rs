@@ -1722,10 +1722,23 @@ async fn messages(
     req = anthropic::apply_tool_result_suffix(&req, &cfg);
 
     let client_beta = client_beta_header(&client_headers);
+    // What the client sent, counted once. The retry loops downstream mutate the
+    // request, so measuring it there would report the proxy's version of it and
+    // re-serialise the whole body on every attempt to do so.
+    let req_size = body.len();
     if state.use_direct_anthropic(&translated).await {
-        messages_direct(state, req, original_model, translated, client_beta, start).await
+        messages_direct(
+            state,
+            req,
+            original_model,
+            translated,
+            client_beta,
+            req_size,
+            start,
+        )
+        .await
     } else {
-        messages_translated(state, req, original_model, translated, start).await
+        messages_translated(state, req, original_model, translated, req_size, start).await
     }
 }
 
@@ -1771,6 +1784,7 @@ async fn messages_direct(
     original_model: String,
     translated: String,
     client_beta: Option<String>,
+    req_size: usize,
     start: Instant,
 ) -> Response {
     let vision = anthropic::has_image(&req);
@@ -1802,7 +1816,6 @@ async fn messages_direct(
     for _ in 0..4 {
         let mut sanitized = anthropic::sanitize_anthropic_request(&current);
         sanitized = anthropic::adjust_thinking_budget(&sanitized);
-        let req_size = serde_json::to_vec(&current).map(|v| v.len()).unwrap_or(0);
         let payload = serde_json::to_vec(&sanitized).unwrap_or_default();
         log_debug_request(&state, "/v1/messages", &sanitized);
 
@@ -1903,12 +1916,13 @@ async fn messages_direct(
         };
         let status = resp.status();
         if status.is_success() {
-            let parsed: Value = resp.json().await.unwrap_or(Value::Null);
-            log_debug_response(
-                &state,
-                "/v1/messages",
-                &serde_json::to_string(&parsed).unwrap_or_default(),
-            );
+            // Read once, then parse from that. Asking reqwest for JSON and
+            // re-serialising the tree costs two passes and reports a byte count
+            // that is not the one that came off the wire.
+            let text = resp.text().await.unwrap_or_default();
+            let resp_size = text.len();
+            log_debug_response(&state, "/v1/messages", &text);
+            let parsed: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
             let usage = parsed.get("usage").cloned().unwrap_or(json!({}));
             let usage = util::anthropic_usage(&usage);
             let billed = util::copilot_billed_nano_aiu(&parsed);
@@ -1940,7 +1954,7 @@ async fn messages_direct(
                 translated_model: (translated != original_model).then_some(translated.clone()),
                 status_code: status.as_u16(),
                 request_size: req_size,
-                response_size: serde_json::to_vec(&parsed).map(|v| v.len()).unwrap_or(0),
+                response_size: resp_size,
                 input_tokens: usage.input_tokens,
                 output_tokens: usage.output_tokens,
                 output_tokens_final: None,
@@ -2014,6 +2028,7 @@ async fn messages_translated(
     req: Value,
     original_model: String,
     translated: String,
+    req_size: usize,
     start: Instant,
 ) -> Response {
     let vision = anthropic::has_image(&req);
@@ -2040,7 +2055,6 @@ async fn messages_translated(
         let url = format!("{}/chat/completions", state.copilot_base_url());
         let mut headers = state.copilot_headers(vision).await;
         set_initiator(&mut headers, agent);
-        let req_size = serde_json::to_vec(&current).map(|v| v.len()).unwrap_or(0);
         let payload = serde_json::to_vec(&openai_req).unwrap_or_default();
         log_debug_request(&state, "/v1/messages", &openai_req);
 
@@ -2083,13 +2097,14 @@ async fn messages_translated(
         };
         let status = resp.status();
         if status.is_success() {
-            let parsed: Value = resp.json().await.unwrap_or(Value::Null);
+            // Read once, then parse from that: `resp.json()` followed by a
+            // re-serialisation costs two extra passes over the body and reports
+            // a size that is not the one that came off the wire.
+            let text = resp.text().await.unwrap_or_default();
+            let resp_size = text.len();
+            log_debug_response(&state, "/v1/messages", &text);
+            let parsed: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
             let anthropic_resp = anthropic::openai_to_anthropic(&parsed);
-            log_debug_response(
-                &state,
-                "/v1/messages",
-                &serde_json::to_string(&parsed).unwrap_or_default(),
-            );
             let usage = util::openai_usage(&parsed.get("usage").cloned().unwrap_or(json!({})));
             let billed = util::copilot_billed_nano_aiu(&parsed);
             let cache_saved = util::cache_saving_nano_aiu(&parsed, &usage);
@@ -2102,9 +2117,7 @@ async fn messages_translated(
                 translated_model: (translated != original_model).then_some(translated.clone()),
                 status_code: status.as_u16(),
                 request_size: req_size,
-                response_size: serde_json::to_vec(&anthropic_resp)
-                    .map(|v| v.len())
-                    .unwrap_or(0),
+                response_size: resp_size,
                 input_tokens: usage.input_tokens,
                 output_tokens: usage.output_tokens,
                 output_tokens_final: None,
