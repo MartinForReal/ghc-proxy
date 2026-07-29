@@ -714,7 +714,10 @@ mod tests {
             premium_multiplier_from_catalog(&catalog, "claude-opus-5"),
             Some(1.0)
         );
-        assert_eq!(premium_multiplier_from_catalog(&catalog, "gpt-4.1"), Some(0.0));
+        assert_eq!(
+            premium_multiplier_from_catalog(&catalog, "gpt-4.1"),
+            Some(0.0)
+        );
         assert_eq!(
             premium_multiplier_from_catalog(&catalog, "discounted"),
             Some(0.33)
@@ -725,7 +728,10 @@ mod tests {
             premium_multiplier_from_catalog(&catalog, "no-billing-block"),
             None
         );
-        assert_eq!(premium_multiplier_from_catalog(&catalog, "nonexistent"), None);
+        assert_eq!(
+            premium_multiplier_from_catalog(&catalog, "nonexistent"),
+            None
+        );
     }
 
     #[test]

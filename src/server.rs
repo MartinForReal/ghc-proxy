@@ -1320,9 +1320,16 @@ async fn messages_direct(
                 Ok(r) => r,
                 Err(e) => {
                     record_failure(
-                        &state, "/v1/messages", &original_model, Some(&translated),
-                        504, crate::store::failure::CONNECT, req_size,
-                        capture_json(&state, &sanitized), Some(e.to_string()), start,
+                        &state,
+                        "/v1/messages",
+                        &original_model,
+                        Some(&translated),
+                        504,
+                        crate::store::failure::CONNECT,
+                        req_size,
+                        capture_json(&state, &sanitized),
+                        Some(e.to_string()),
+                        start,
                         extract_session_id(&sanitized),
                     );
                     return anthropic_error(StatusCode::GATEWAY_TIMEOUT, e.to_string());
@@ -1346,9 +1353,16 @@ async fn messages_direct(
                     }
                 }
                 record_failure(
-                    &state, "/v1/messages", &original_model, Some(&translated),
-                    status.as_u16(), crate::store::failure::UPSTREAM_STATUS, req_size,
-                    capture_json(&state, &sanitized), Some(text.clone()), start,
+                    &state,
+                    "/v1/messages",
+                    &original_model,
+                    Some(&translated),
+                    status.as_u16(),
+                    crate::store::failure::UPSTREAM_STATUS,
+                    req_size,
+                    capture_json(&state, &sanitized),
+                    Some(text.clone()),
+                    start,
                     extract_session_id(&sanitized),
                 );
                 return passthrough_error(status, text);
@@ -1372,9 +1386,16 @@ async fn messages_direct(
             util::post_with_retry(&state, &url, headers.clone(), payload, "/v1/messages").await;
         let Some(resp) = resp else {
             record_failure(
-                &state, "/v1/messages", &original_model, Some(&translated),
-                504, crate::store::failure::CONNECT, req_size,
-                capture_json(&state, &sanitized), None, start,
+                &state,
+                "/v1/messages",
+                &original_model,
+                Some(&translated),
+                504,
+                crate::store::failure::CONNECT,
+                req_size,
+                capture_json(&state, &sanitized),
+                None,
+                start,
                 extract_session_id(&sanitized),
             );
             return anthropic_error(
@@ -1427,7 +1448,7 @@ async fn messages_direct(
                 cache_creation_input_tokens: usage.cache_creation_input_tokens,
                 premium_multiplier: state.model_premium_multiplier(&translated).await,
                 upstream_idle_max_ms: None,
-            keepalive_probes: None,
+                keepalive_probes: None,
                 duration: elapsed_secs(start),
                 request_body: capture_json(&state, &sanitized),
                 response_body: capture_json(&state, &parsed),
@@ -1468,9 +1489,16 @@ async fn messages_direct(
             }
         }
         record_failure(
-            &state, "/v1/messages", &original_model, Some(&translated),
-            status.as_u16(), crate::store::failure::UPSTREAM_STATUS, req_size,
-            capture_json(&state, &sanitized), Some(text.clone()), start,
+            &state,
+            "/v1/messages",
+            &original_model,
+            Some(&translated),
+            status.as_u16(),
+            crate::store::failure::UPSTREAM_STATUS,
+            req_size,
+            capture_json(&state, &sanitized),
+            Some(text.clone()),
+            start,
             extract_session_id(&sanitized),
         );
         return passthrough_error(status, text);
@@ -1533,9 +1561,16 @@ async fn messages_translated(
                 .await;
         let Some(resp) = resp else {
             record_failure(
-                &state, "/v1/messages", &original_model, Some(&translated),
-                504, crate::store::failure::CONNECT, req_size,
-                capture_json(&state, &openai_req), None, start,
+                &state,
+                "/v1/messages",
+                &original_model,
+                Some(&translated),
+                504,
+                crate::store::failure::CONNECT,
+                req_size,
+                capture_json(&state, &openai_req),
+                None,
+                start,
                 extract_session_id(&openai_req),
             );
             return anthropic_error(
@@ -1572,7 +1607,7 @@ async fn messages_translated(
                 cache_creation_input_tokens: usage.cache_creation_input_tokens,
                 premium_multiplier: state.model_premium_multiplier(&translated).await,
                 upstream_idle_max_ms: None,
-            keepalive_probes: None,
+                keepalive_probes: None,
                 duration: elapsed_secs(start),
                 request_body: capture_json(&state, &openai_req),
                 response_body: capture_json(&state, &parsed),
@@ -1603,9 +1638,16 @@ async fn messages_translated(
             }
         }
         record_failure(
-            &state, "/v1/messages", &original_model, Some(&translated),
-            status.as_u16(), crate::store::failure::UPSTREAM_STATUS, req_size,
-            capture_json(&state, &openai_req), Some(text.clone()), start,
+            &state,
+            "/v1/messages",
+            &original_model,
+            Some(&translated),
+            status.as_u16(),
+            crate::store::failure::UPSTREAM_STATUS,
+            req_size,
+            capture_json(&state, &openai_req),
+            Some(text.clone()),
+            start,
             extract_session_id(&openai_req),
         );
         return passthrough_error(status, text);
@@ -2516,11 +2558,23 @@ async fn stream_anthropic_direct(
     if !is_streamable_status(status) {
         let text = upstream.text().await.unwrap_or_default();
         log_debug_response(&state, "/v1/messages", &text);
-        log_error("/v1/messages", &json!({"model": &translated}), &text, status);
+        log_error(
+            "/v1/messages",
+            &json!({"model": &translated}),
+            &text,
+            status,
+        );
         record_failure(
-            &state, "/v1/messages", &translated, Some(&translated),
-            status, crate::store::failure::UPSTREAM_STATUS, req_size,
-            req_body.clone(), Some(text.clone()), start,
+            &state,
+            "/v1/messages",
+            &translated,
+            Some(&translated),
+            status,
+            crate::store::failure::UPSTREAM_STATUS,
+            req_size,
+            req_body.clone(),
+            Some(text.clone()),
+            start,
             session_id.clone(),
         );
         return passthrough_error(
@@ -2650,9 +2704,16 @@ async fn stream_anthropic_translated(
             status,
         );
         record_failure(
-            &state, "/v1/messages", &translated, Some(&translated),
-            status, crate::store::failure::UPSTREAM_STATUS, req_size,
-            req_body.clone(), Some(text.clone()), start,
+            &state,
+            "/v1/messages",
+            &translated,
+            Some(&translated),
+            status,
+            crate::store::failure::UPSTREAM_STATUS,
+            req_size,
+            req_body.clone(),
+            Some(text.clone()),
+            start,
             session_id.clone(),
         );
         return passthrough_error(
@@ -2819,7 +2880,10 @@ where
 /// when `buf` does not yet contain a whole event.
 fn last_event_boundary(buf: &[u8]) -> Option<usize> {
     let lf = buf.windows(2).rposition(|w| w == b"\n\n").map(|i| i + 2);
-    let crlf = buf.windows(4).rposition(|w| w == b"\r\n\r\n").map(|i| i + 4);
+    let crlf = buf
+        .windows(4)
+        .rposition(|w| w == b"\r\n\r\n")
+        .map(|i| i + 4);
     lf.max(crlf)
 }
 
@@ -3282,7 +3346,10 @@ async fn api_requests(
                 return false;
             }
             match session {
-                Some(want) => r.session_id.as_deref().is_some_and(|id| id.starts_with(want)),
+                Some(want) => r
+                    .session_id
+                    .as_deref()
+                    .is_some_and(|id| id.starts_with(want)),
                 None => true,
             }
         })
@@ -3637,7 +3704,8 @@ mod tests {
             );
             rec.resp_size = 4096;
             rec.usage.output_tokens = 77;
-            rec.debug_raw.extend_from_slice(b"event: message_start\ndata: {}\n\n");
+            rec.debug_raw
+                .extend_from_slice(b"event: message_start\ndata: {}\n\n");
             // Deliberately no finalize() — this models axum dropping the
             // response body when the client hangs up mid-stream.
         }
@@ -3679,7 +3747,10 @@ mod tests {
             rec.finalize(200, None, None, None);
         } // Drop runs here and must be a no-op.
         let (_, total) = state.store.recent(10, 0);
-        assert_eq!(total, 1, "finalize followed by drop must record exactly once");
+        assert_eq!(
+            total, 1,
+            "finalize followed by drop must record exactly once"
+        );
     }
 
     #[tokio::test]
@@ -3712,7 +3783,10 @@ mod tests {
         // so it takes two parses.
         let req = json!({"metadata": {"user_id":
             "{\"device_id\":\"d3427\",\"account_uuid\":\"\",\"session_id\":\"7dea551a-c9f5-4ba1\"}"}});
-        assert_eq!(extract_session_id(&req).as_deref(), Some("7dea551a-c9f5-4ba1"));
+        assert_eq!(
+            extract_session_id(&req).as_deref(),
+            Some("7dea551a-c9f5-4ba1")
+        );
     }
 
     #[test]
@@ -3835,7 +3909,10 @@ mod tests {
             next.is_ok(),
             "no keepalive emitted while upstream was stalled mid-event"
         );
-        assert_eq!(&next.unwrap().unwrap().unwrap()[..], ANTHROPIC_KEEPALIVE_PROBE);
+        assert_eq!(
+            &next.unwrap().unwrap().unwrap()[..],
+            ANTHROPIC_KEEPALIVE_PROBE
+        );
     }
 
     #[test]
@@ -3910,9 +3987,8 @@ mod tests {
         };
         let cache_aware = calculate_cost("claude-opus-5", &usage);
         let (base_in, base_out) = model_rates("claude-opus-5");
-        let naive = (usage.input_tokens as f64 * base_in
-            + usage.output_tokens as f64 * base_out)
-            / 1000.0;
+        let naive =
+            (usage.input_tokens as f64 * base_in + usage.output_tokens as f64 * base_out) / 1000.0;
         assert!(
             cache_aware < naive,
             "cache-aware {cache_aware} should be below naive {naive}"
