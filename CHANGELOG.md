@@ -59,13 +59,23 @@ All notable changes to this project will be documented in this file.
   tool-result round trips, stream terminators (`message_stop`, `[DONE]`,
   `response.completed`), token counting, and the error paths — an unknown model
   must not arrive as a `200` SSE stream that never produces an event.
+- **What Copilot actually billed, per request.** Every response carries
+  `copilot_usage.total_nano_aiu` — the AI units the turn cost — alongside a
+  `token_details` breakdown giving the per-token rate for each token type
+  charged. The total was verified against those rates on five responses. It is
+  now recorded on every request across all six paths (four protocols ×
+  streamed/not, plus WebSocket), totalled in `/api/stats` as `total_nano_aiu`,
+  and is the dashboard's headline figure, replacing an estimate derived from
+  published list prices that could not know a model is included at no charge.
+  Reasoning tokens are recorded beside it.
 - **Prompt-cache statistics** at `GET /api/cache` and on the dashboard: where
   input tokens came from (served from cache / written to cache / fresh), the
-  disposition of recent requests, and a per-model hit rate. A single global
-  number cannot tell you *which* conversation stopped matching its prefix, which
-  is the failure that quietly multiplies the bill. Savings are reported in both
-  directions — the read discount, the write premium, and the net — because
-  caching is not free.
+  disposition of recent requests, and a per-model hit rate with its own
+  distribution bar. A single global number cannot tell you *which* conversation
+  stopped matching its prefix, which is the failure that quietly multiplies the
+  bill. What the cache was worth is reported as `saved_nano_aiu`, net of the
+  write premium, because caching is not free — see below for where the rates
+  come from.
 - **Body capture can be toggled at runtime**, from the request browser or via
   `POST /api/config/debug`. It previously required restarting the proxy with
   `--debug`, by which point the request you wanted to inspect was gone; the flag
@@ -74,7 +84,8 @@ All notable changes to this project will be documented in this file.
   memory and the log and should lapse on restart. `GET /health` now reports it.
   The `/api/config/` routes are guarded by the API key when one is configured —
   read-only dashboard endpoints stay open, but turning on body capture must not
-  be something an unauthenticated caller can do.- `upstream_read_timeout_seconds` (default `900`, `0` disables, env
+  be something an unauthenticated caller can do.
+- `upstream_read_timeout_seconds` (default `900`, `0` disables, env
   `GHC_PROXY_UPSTREAM_READ_TIMEOUT`). Bounds the silence *between* reads from an
   upstream response rather than the total duration, so long streaming answers
   are unaffected. Without it a half-open connection yields no data, no error and
@@ -139,10 +150,11 @@ All notable changes to this project will be documented in this file.
   eight identically-weighted stat cards followed by the full 78-row model
   catalogue, so the number that tracks spend had no more prominence than
   `bytes_received`, and reference data dominated a page you open to check usage.
-  It now leads with premium requests, input tokens (with the cache-hit share)
-  and output tokens; quota bars per SKU sit directly beneath, since that is the
-  same quantity seen from the other end. Traffic and proxy health follow, then a
-  recent-requests preview, with the model catalogue folded away.
+  It now leads with what Copilot billed in AI units, input tokens (with the
+  cache-hit share) and output tokens (with the reasoning share); quota bars per
+  SKU sit directly beneath, since that is the same quantity seen from the other
+  end. Traffic, proxy health and the prompt-cache panel follow, with the model
+  catalogue folded away and the request list on its own tab.
   - The three pages share one stylesheet at `/app.css` instead of three drifting
     inline copies, and carry the same persistent nav with a live readiness and
     version indicator — previously each page offered only a lone
@@ -248,6 +260,24 @@ All notable changes to this project will be documented in this file.
   customized mappings in current ones
 
 ### Fixed
+- **Recorded request and response sizes on `/v1/messages` measured the wrong
+  bytes, and cost a full serialisation each to get.** Both paths built a byte
+  count by serialising the whole JSON tree —
+  `serde_json::to_vec(&current).map(|v| v.len())` — inside their four-attempt
+  retry loops, and the response was serialised twice more: once for a debug log
+  that discards it unless logging is on, once to measure it.
+
+  The numbers were also not the ones every other endpoint records.
+  `request_size` measured the proxy's version of the request, after system
+  prompt injection, the tool-result suffix and the model rename, so the
+  dashboard's "Sent" total was adding two definitions together. `response_size`
+  measured a re-serialisation of the parsed tree, which differs from the wire
+  bytes in whitespace, key order and number formatting.
+
+  Both now follow the pattern the rest of the file already used: the client's
+  `body.len()` taken once, and the response read as text once, then measured,
+  logged and parsed from that single copy. A 103-byte request returning 865
+  bytes now records exactly 103 and 865.
 - **Output token totals were not comparable across surfaces.** The two
   conventions for reasoning tokens disagree about whether they are already
   counted: a Responses turn reports `input 11 + output 17 == total 28` with 10
