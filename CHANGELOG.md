@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-07-29
+
 ### Added
 - **Live quota with no extra API call.** Copilot attaches per-SKU quota to every
   response (`x-quota-snapshot-chat`, `-completions`, `-premium_interactions`),
