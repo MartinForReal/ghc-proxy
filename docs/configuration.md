@@ -32,12 +32,12 @@ debug: false
 account_type: individual
 
 # Header version strings (mimic the VS Code Copilot Chat client)
-vscode_version: "1.123.0"
+vscode_version: "1.130.0"
 api_version: "2025-05-01"
 copilot_version: "0.48.1"
 
-# Self-update behavior
-auto_upgrade: false
+# Self-update behavior (enabled by default)
+auto_upgrade: true
 
 # Model name mappings: exact (full match) and prefix (starts-with)
 model_mappings:
@@ -63,6 +63,11 @@ tool_result_suffix_remove: []
 
 # Retry: max retries for upstream connection errors (0 = none)
 max_connection_retries: 3
+
+# Max seconds of silence from an upstream response before it is treated as
+# dead. Bounds silence, not total duration, so long streams are fine.
+# 0 disables the timeout.
+upstream_read_timeout_seconds: 900
 
 # Optional: require this key on all LLM endpoints (Bearer / x-api-key /
 # x-goog-api-key). Omit or leave empty to disable authentication.
@@ -149,6 +154,7 @@ ghc-proxy [options]
       --fetch-version       Fetch the latest VS Code version at startup
       --no-fetch-version    Disable dynamic VS Code version fetching
       --auto-upgrade        Auto-upgrade app when a newer release is available
+                            (default: on)
       --no-auto-upgrade     Disable app auto-upgrade
       --update-config       Persist non-schema config write-backs (schema upgrades apply automatically)
   -v, --version             Show version
@@ -169,10 +175,11 @@ Every config field has a `GHC_PROXY_*` override:
 | `GHC_PROXY_API_VERSION` | `X-GitHub-Api-Version` string |
 | `GHC_PROXY_COPILOT_VERSION` | Copilot Chat plugin version string |
 | `GHC_PROXY_MAX_CONNECTION_RETRIES` | Max connection retries |
+| `GHC_PROXY_UPSTREAM_READ_TIMEOUT` | Max seconds of upstream silence (`0` disables) |
 | `GHC_PROXY_REDIRECT_ANTHROPIC` | Always translate Anthropic via chat completions |
 | `GHC_PROXY_SHOW_TOKEN` | Log tokens on refresh (`true`/`1`) |
 | `GHC_PROXY_DYNAMIC_VSCODE_VERSION` | Fetch latest VS Code version (`true`/`1`) |
-| `GHC_PROXY_AUTO_UPGRADE` | Auto-upgrade app on startup (`true`/`1`) |
+| `GHC_PROXY_AUTO_UPGRADE` | Auto-upgrade app on startup (`true`/`1`); set `0` to disable |
 | `GHC_PROXY_RATE_LIMIT_SECONDS` | Minimum seconds between requests |
 | `GHC_PROXY_RATE_LIMIT_WAIT` | Wait instead of rejecting when limited (`true`/`1`) |
 | `GHC_PROXY_MANUAL_APPROVE` | Require manual approval per request (`true`/`1`) |
@@ -215,3 +222,26 @@ stale clients:
 
 Enable `dynamic_vscode_version` (or `--fetch-version`) to refresh the VS Code
 version automatically at startup.
+
+## Self-update
+
+`auto_upgrade` is **enabled by default**, including for config files written
+before the setting existed. On startup the proxy checks GitHub releases and, if
+a newer version is published, downloads and replaces its own binary. The
+replacement takes effect on the **next** start — the running process keeps
+serving the old code until it restarts.
+
+Disable it with any of:
+
+```yaml
+auto_upgrade: false
+```
+
+```bash
+ghc-proxy --no-auto-upgrade
+GHC_PROXY_AUTO_UPGRADE=0 ghc-proxy
+```
+
+Turn it off if the binary is managed by a package manager, or if it lives
+somewhere the process should not rewrite — for example a build output directory
+that `cargo build` or `cargo clean` also writes to.

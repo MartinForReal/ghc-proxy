@@ -6,13 +6,13 @@ use crate::auth;
 use crate::config::{self, Config, ModelMappings};
 use crate::store::RequestStore;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::RwLock as StdRwLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, RwLock};
 
-/// Mutable token state guarded by a mutex.
-#[derive(Default)]
+/// Mutable token state guarded by a mutex.#[derive(Default)]
 pub struct TokenState {
     pub github_token: String,
     pub copilot_token: Option<String>,
@@ -37,9 +37,107 @@ pub struct AppState {
     pub session_id: String,
     /// Instant the process started serving, used to report uptime on `/health`.
     pub started_at: Instant,
+    /// Latest per-SKU quota reported by the upstream, keyed by SKU name.
+    pub quotas: StdRwLock<BTreeMap<String, QuotaSnapshot>>,
 }
 
 pub type SharedState = Arc<AppState>;
+
+/// Prefix of the per-SKU quota headers Copilot attaches to every response.
+const QUOTA_HEADER_PREFIX: &str = "x-quota-snapshot-";
+
+/// A quota snapshot for one billing SKU, as reported by the upstream on every
+/// response.
+///
+/// Copilot returns these on each request (`x-quota-snapshot-chat`,
+/// `-completions`, `-premium_interactions`), so live quota costs nothing —
+/// unlike `/copilot_internal/user`, which is a separate API call.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct QuotaSnapshot {
+    /// Allowance for the period. Negative means unlimited.
+    pub entitlement: f64,
+    /// Amount consumed beyond the entitlement.
+    pub overage: f64,
+    /// Whether going past the entitlement is allowed at all.
+    pub overage_permitted: bool,
+    /// Percentage of the entitlement still available.
+    pub percent_remaining: f64,
+    /// True when the SKU has no cap.
+    pub unlimited: bool,
+    /// When the allowance resets, if the upstream reported it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reset_date: Option<String>,
+}
+
+/// Decodes the `%XX` escapes used in the header's date field.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok();
+            if let Some(byte) = hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                out.push(byte);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Parses a quota header value such as
+/// `ent=-1&ov=0.0&ovPerm=true&rem=100.0&rst=2026-08-01T00%3A00%3A00Z`.
+///
+/// Returns `None` when nothing recognizable is present, so an upstream that
+/// stops sending these (they are undocumented) simply leaves the cache empty
+/// rather than reporting zeroed quota.
+pub fn parse_quota_snapshot(value: &str) -> Option<QuotaSnapshot> {
+    let mut snapshot = QuotaSnapshot::default();
+    let mut saw_field = false;
+    for pair in value.split('&') {
+        let Some((key, raw)) = pair.split_once('=') else {
+            continue;
+        };
+        match key.trim() {
+            "ent" => {
+                if let Ok(v) = raw.parse::<f64>() {
+                    snapshot.entitlement = v;
+                    snapshot.unlimited = v < 0.0;
+                    saw_field = true;
+                }
+            }
+            "ov" => {
+                if let Ok(v) = raw.parse::<f64>() {
+                    snapshot.overage = v;
+                    saw_field = true;
+                }
+            }
+            "ovPerm" => {
+                snapshot.overage_permitted = raw.eq_ignore_ascii_case("true");
+                saw_field = true;
+            }
+            "rem" => {
+                if let Ok(v) = raw.parse::<f64>() {
+                    snapshot.percent_remaining = v;
+                    saw_field = true;
+                }
+            }
+            "rst" => {
+                let decoded = percent_decode(raw);
+                if !decoded.is_empty() {
+                    snapshot.reset_date = Some(decoded);
+                    saw_field = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    saw_field.then_some(snapshot)
+}
 
 fn now_secs() -> u64 {
     SystemTime::now()
@@ -58,14 +156,20 @@ fn now_millis() -> u128 {
 
 impl AppState {
     pub fn new(config: Config, github_token: String) -> Self {
-        // No global request timeout: SSE responses are long-lived streams. Only
-        // the connect phase and idle pooled connections are bounded so a dead
-        // upstream cannot wedge a request forever.
-        let http = reqwest::Client::builder()
+        // No global request timeout: SSE responses are long-lived streams, and
+        // capping their total duration would cut off legitimate long answers.
+        // Instead the connect phase, idle pooled connections, and the gap
+        // *between* reads are bounded. The read timeout is what turns a
+        // half-open upstream into an error the streaming paths can report,
+        // rather than a request that hangs forever.
+        let mut builder = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(30))
-            .pool_idle_timeout(Duration::from_secs(90))
-            .build()
-            .expect("failed to build HTTP client");
+            .pool_idle_timeout(Duration::from_secs(90));
+        if config.upstream_read_timeout_seconds > 0 {
+            builder =
+                builder.read_timeout(Duration::from_secs(config.upstream_read_timeout_seconds));
+        }
+        let http = builder.build().expect("failed to build HTTP client");
         AppState {
             http,
             config: StdRwLock::new(config),
@@ -81,7 +185,39 @@ impl AppState {
             machine_id: auth::load_or_create_machine_id(),
             session_id: format!("{}{}", uuid::Uuid::new_v4(), now_millis()),
             started_at: Instant::now(),
+            quotas: StdRwLock::new(BTreeMap::new()),
         }
+    }
+
+    /// Records the per-SKU quota headers attached to an upstream response.
+    ///
+    /// Called for every Copilot response, so quota stays current without the
+    /// extra `/copilot_internal/user` round trip. Headers that do not parse are
+    /// ignored, leaving the previous value in place.
+    pub fn record_quota_headers(&self, headers: &HeaderMap) {
+        let mut parsed: Vec<(String, QuotaSnapshot)> = Vec::new();
+        for (name, value) in headers {
+            let Some(sku) = name.as_str().strip_prefix(QUOTA_HEADER_PREFIX) else {
+                continue;
+            };
+            let Ok(value) = value.to_str() else { continue };
+            if let Some(snapshot) = parse_quota_snapshot(value) {
+                parsed.push((sku.to_string(), snapshot));
+            }
+        }
+        if parsed.is_empty() {
+            return;
+        }
+        if let Ok(mut quotas) = self.quotas.write() {
+            for (sku, snapshot) in parsed {
+                quotas.insert(sku, snapshot);
+            }
+        }
+    }
+
+    /// The most recent per-SKU quota reported by the upstream.
+    pub fn quota_snapshot(&self) -> BTreeMap<String, QuotaSnapshot> {
+        self.quotas.read().map(|q| q.clone()).unwrap_or_default()
     }
 
     /// Seconds this process has been running.
@@ -700,7 +836,183 @@ fn premium_multiplier_from_catalog(catalog: &serde_json::Value, model: &str) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::StreamExt;
     use serde_json::json;
+    use tokio::io::AsyncWriteExt;
+
+    #[test]
+    fn parses_a_real_quota_header() {
+        // Captured verbatim from a live Copilot response.
+        let q = parse_quota_snapshot(
+            "ent=-1&ov=0.0&ovPerm=true&rem=100.0&rst=2026-08-01T00%3A00%3A00Z",
+        )
+        .expect("header should parse");
+        assert_eq!(q.entitlement, -1.0);
+        assert!(q.unlimited, "a negative entitlement means unlimited");
+        assert_eq!(q.overage, 0.0);
+        assert!(q.overage_permitted);
+        assert_eq!(q.percent_remaining, 100.0);
+        // The date arrives percent-encoded and must be decoded.
+        assert_eq!(q.reset_date.as_deref(), Some("2026-08-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn parses_a_capped_sku() {
+        let q = parse_quota_snapshot("ent=300&ov=12.5&ovPerm=false&rem=42.5").unwrap();
+        assert_eq!(q.entitlement, 300.0);
+        assert!(!q.unlimited);
+        assert_eq!(q.overage, 12.5);
+        assert!(!q.overage_permitted);
+        assert_eq!(q.percent_remaining, 42.5);
+        assert!(q.reset_date.is_none());
+    }
+
+    #[test]
+    fn unrecognized_quota_headers_are_ignored() {
+        // These headers are undocumented; if the shape changes we must report
+        // nothing rather than a confident zero.
+        assert!(parse_quota_snapshot("").is_none());
+        assert!(parse_quota_snapshot("garbage").is_none());
+        assert!(parse_quota_snapshot("unknown=1&other=2").is_none());
+        // A partially recognizable value still yields what it does contain.
+        assert_eq!(
+            parse_quota_snapshot("rem=7.5&junk=x")
+                .unwrap()
+                .percent_remaining,
+            7.5
+        );
+    }
+
+    #[test]
+    fn quota_headers_are_recorded_per_sku() {
+        let state = AppState::new(Config::default(), "t".into());
+        assert!(state.quota_snapshot().is_empty());
+
+        let mut h = HeaderMap::new();
+        h.insert(
+            "x-quota-snapshot-chat",
+            HeaderValue::from_static("ent=-1&ov=0.0&ovPerm=false&rem=100.0"),
+        );
+        h.insert(
+            "x-quota-snapshot-premium_interactions",
+            HeaderValue::from_static("ent=300&ov=0.0&ovPerm=true&rem=88.0"),
+        );
+        h.insert(
+            "content-type",
+            HeaderValue::from_static("text/event-stream"),
+        );
+        state.record_quota_headers(&h);
+
+        let q = state.quota_snapshot();
+        assert_eq!(q.len(), 2, "only the quota headers are captured: {q:?}");
+        assert_eq!(q["chat"].percent_remaining, 100.0);
+        assert_eq!(q["premium_interactions"].percent_remaining, 88.0);
+        assert_eq!(q["premium_interactions"].entitlement, 300.0);
+
+        // A later response updates in place.
+        let mut h2 = HeaderMap::new();
+        h2.insert(
+            "x-quota-snapshot-premium_interactions",
+            HeaderValue::from_static("ent=300&ov=0.0&ovPerm=true&rem=87.0"),
+        );
+        state.record_quota_headers(&h2);
+        let q = state.quota_snapshot();
+        assert_eq!(q["premium_interactions"].percent_remaining, 87.0);
+        // Untouched SKUs keep their previous value.
+        assert_eq!(q["chat"].percent_remaining, 100.0);
+    }
+
+    #[test]
+    fn responses_without_quota_headers_leave_the_cache_alone() {
+        let state = AppState::new(Config::default(), "t".into());
+        let mut h = HeaderMap::new();
+        h.insert(
+            "x-quota-snapshot-chat",
+            HeaderValue::from_static("ent=-1&rem=55.0"),
+        );
+        state.record_quota_headers(&h);
+
+        // An upstream that stops sending them must not wipe what we know.
+        state.record_quota_headers(&HeaderMap::new());
+        assert_eq!(state.quota_snapshot()["chat"].percent_remaining, 55.0);
+    }
+
+    /// Serves one request: SSE headers plus half an event, then stalls forever
+    /// without ever closing the socket. Returns the bound address.
+    async fn stalling_upstream() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = tokio::io::AsyncReadExt::read(&mut sock, &mut buf).await;
+                let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\n\
+                          Content-Type: text/event-stream\r\n\
+                          Transfer-Encoding: chunked\r\n\r\n",
+                    )
+                    .await;
+                // A chunk that stops in the middle of a `data:` line.
+                let partial: &[u8] = b"data: {\"partial\":";
+                let _ = sock
+                    .write_all(format!("{:X}\r\n", partial.len()).as_bytes())
+                    .await;
+                let _ = sock.write_all(partial).await;
+                let _ = sock.write_all(b"\r\n").await;
+                let _ = sock.flush().await;
+                std::future::pending::<()>().await;
+            }
+        });
+        format!("http://{addr}/")
+    }
+
+    /// The streaming paths only notice a dead upstream when the body stream
+    /// yields an error. Without a read timeout a half-open connection yields
+    /// neither data nor error nor end-of-stream, so the request hangs forever
+    /// and none of the stream-interrupted handling ever runs.
+    #[tokio::test]
+    async fn read_timeout_surfaces_a_stalled_upstream_as_an_error() {
+        let url = stalling_upstream().await;
+        let cfg = Config {
+            upstream_read_timeout_seconds: 1,
+            ..Default::default()
+        };
+        let state = AppState::new(cfg, "token".into());
+
+        let resp = state.http.get(&url).send().await.expect("headers arrive");
+        assert!(resp.status().is_success());
+
+        let mut stream = resp.bytes_stream();
+        let first = stream.next().await.expect("first chunk").expect("is data");
+        assert_eq!(&first[..], b"data: {\"partial\":");
+
+        let outcome = tokio::time::timeout(Duration::from_secs(15), stream.next()).await;
+        let item = outcome.expect("must not hang past the read timeout");
+        let err = item.expect("stream must yield an item").unwrap_err();
+        assert!(
+            err.is_timeout(),
+            "expected a timeout error, got: {err:?} ({err})"
+        );
+    }
+
+    /// Setting the timeout to zero disables it, for operators who would rather
+    /// let a stream run indefinitely.
+    #[tokio::test]
+    async fn read_timeout_can_be_disabled() {
+        let url = stalling_upstream().await;
+        let cfg = Config {
+            upstream_read_timeout_seconds: 0,
+            ..Default::default()
+        };
+        let state = AppState::new(cfg, "token".into());
+        let resp = state.http.get(&url).send().await.expect("headers arrive");
+        let mut stream = resp.bytes_stream();
+        let _ = stream.next().await;
+        let outcome = tokio::time::timeout(Duration::from_secs(3), stream.next()).await;
+        assert!(outcome.is_err(), "expected the stream to still be hanging");
+    }
+
     #[test]
     fn premium_multiplier_reads_billing_from_the_catalog() {
         // Shape taken from a real `GET /models` response.

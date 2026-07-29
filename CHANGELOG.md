@@ -4,7 +4,49 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **Live quota with no extra API call.** Copilot attaches per-SKU quota to every
+  response (`x-quota-snapshot-chat`, `-completions`, `-premium_interactions`),
+  carrying entitlement, overage, overage-permitted, percent remaining and reset
+  date. Those are now parsed on every proxied response and surfaced on:
+  - `GET /health` under `quota`
+  - `GET /metrics` as `ghc_proxy_quota_percent_remaining`,
+    `ghc_proxy_quota_entitlement` and `ghc_proxy_quota_overage`, labelled by `sku`
+  - `GET /usage` under `live`, alongside the existing authoritative response
+
+  Previously quota was only available from `/usage`, which costs a separate
+  `/copilot_internal/user` request. The headers are undocumented, so a value
+  that stops parsing is ignored rather than reported as zero, and the previous
+  reading is left in place.
+- **Observability for streams and failures.** Records now carry
+  `upstream_idle_max_ms` (longest silence between upstream chunks, which is what
+  assigns blame for a stall), `keepalive_probes`, `failure_kind`, `session_id`
+  parsed from `metadata.user_id`, and `output_tokens_final` so a count that is
+  still the `message_start` placeholder renders as `—` instead of being
+  presented as fact. The dashboard gained the matching columns, a failures-only
+  filter, and premium-request/cache-hit stats.
+- `scripts/replay.py` replays a captured request at the upstream or back through
+  the proxy and times the SSE stream event by event, with no stall watchdog.
+- `upstream_read_timeout_seconds` (default `900`, `0` disables, env
+  `GHC_PROXY_UPSTREAM_READ_TIMEOUT`). Bounds the silence *between* reads from an
+  upstream response rather than the total duration, so long streaming answers
+  are unaffected. Without it a half-open connection yields no data, no error and
+  no end-of-stream: the request hangs forever and the stream-interrupted
+  handling never runs. The default clears the longest silence measured against
+  the real upstream (329.5s, while a tool call's argument JSON was buffered) with
+  room to spare.
+
 ### Changed
+- **`auto_upgrade` now defaults to `true`**, including for config files written
+  before the setting existed. The proxy checks GitHub releases on startup and
+  replaces its own binary when a newer version is published; the replacement
+  takes effect on the next start. Disable with `auto_upgrade: false`,
+  `--no-auto-upgrade`, or `GHC_PROXY_AUTO_UPGRADE=0` — worth doing when the
+  binary is managed by a package manager, or lives in a build output directory
+  that `cargo build`/`cargo clean` also writes to.
+- `config_version` bumped to `3`, so existing `config.yaml` files gain
+  `upstream_read_timeout_seconds` and the new `auto_upgrade` default on the next
+  start.
 - **Config schema upgrades apply automatically.** When a release introduces new
   `config.yaml` properties (signalled by a `config_version` bump), the missing
   keys are now filled with their defaults and written back to `config.yaml` on
@@ -12,6 +54,47 @@ All notable changes to this project will be documented in this file.
   Existing values are preserved, and up-to-date files are never rewritten. The
   Opus 4.8 alias backfill is now scoped to pre-v2 files so it cannot overwrite
   customized mappings in current ones
+
+### Fixed
+- **Non-2xx upstreams on `/v1/messages` reached the client as an empty `200`
+  stream.** `messages_direct` only intercepted `400`; a `401`, `403`, `429` or
+  `5xx` fell through and was wrapped in a `200 text/event-stream` whose body was
+  a JSON error object, so the client waited on a stream that never produced an
+  event and reported a stall instead of the auth or rate-limit failure that
+  actually happened. This was the one path Claude Code takes. All five streaming
+  paths now gate on a single `is_streamable_status()` predicate
+- **A client that disconnected mid-stream left no record.** axum drops the
+  response body on disconnect, which drops the generator, so the `store.add`
+  after the loop never ran. Recording now happens from `Drop`
+- Pre-flight failures (token refresh, rate gate, connect errors) returned early
+  without recording; they are captured with a `failure_kind`
+- **Keepalive probes could be silenced exactly during a stall.** The boundary
+  flag was set from the last chunk, so a TCP split mid-event left it stuck until
+  a new chunk arrived — and an upstream that went quiet right then produced no
+  probes at all. Partial events are now held back so the downstream always sits
+  on an event boundary, and the Anthropic path sends `event: ping` rather than
+  an SSE comment, since comments are discarded by the parser and never reset a
+  client's idle watchdog
+- **Token counts were read from one bucket.** Anthropic's `input_tokens`,
+  `cache_read_input_tokens` and `cache_creation_input_tokens` are disjoint, so a
+  fully-cached Claude Code turn reported single digits for a 348,483-token
+  prompt. The three protocols slice the total differently and now have separate
+  extractors; cost reprices the cached buckets instead of charging every input
+  token at the full rate
+- **Reassembling one large SSE event was quadratic.** The line buffer rescanned
+  the whole retained buffer on every chunk, so a single event that arrived in
+  many pieces was re-read from the start each time. A 4 MB event delivered in
+  4 KB chunks took **7.9 seconds** of pure CPU; the search now resumes where the
+  previous one stopped, bringing it to milliseconds. Correctness was never
+  affected — only the cost of getting there.
+- The line buffer could grow without bound if an upstream never emitted a
+  newline. A single line is now capped at 64 MB.
+- Stopped scraping the Arch User Repository for the latest VS Code version. The
+  AUR maintainers asked projects to stop; `dynamic_vscode_version` now uses
+  Microsoft's own `update.code.visualstudio.com` release API and ignores
+  non-`major.minor.patch` builds.
+- Removed `scripts/__pycache__` from version control and added the matching
+  `.gitignore` entries.
 
 ## [1.3.0] - 2026-07-27
 

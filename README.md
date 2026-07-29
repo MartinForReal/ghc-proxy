@@ -91,6 +91,7 @@ ghc-proxy [options]
       --fetch-version     Fetch the latest VS Code version at startup
       --no-fetch-version  Disable dynamic VS Code version fetching
       --auto-upgrade      Auto-upgrade app when a newer release is available
+                          (default: on)
       --no-auto-upgrade   Disable app auto-upgrade
       --update-config     Persist non-schema config write-backs (schema upgrades apply automatically)
   -v, --version           Show version
@@ -162,10 +163,10 @@ address: 127.0.0.1
 port: 8314
 debug: false
 account_type: individual            # individual | business | enterprise
-vscode_version: "1.123.0"
+vscode_version: "1.130.0"
 api_version: "2025-05-01"
 copilot_version: "0.48.1"
-auto_upgrade: false
+auto_upgrade: true                  # self-update on startup; false to disable
 model_mappings:
   exact:
     opus: claude-opus-4.8
@@ -181,6 +182,7 @@ system_prompt_remove: []
 system_prompt_add: []
 tool_result_suffix_remove: []
 max_connection_retries: 3
+upstream_read_timeout_seconds: 900   # max silence from upstream; 0 disables
 
 # Optional: require this key on all LLM endpoints (Bearer / x-api-key /
 # x-goog-api-key). Omit or leave empty to disable authentication.

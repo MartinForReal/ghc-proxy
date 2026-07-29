@@ -75,6 +75,12 @@ has loaded. A degraded proxy still answers `200` with `ready: false` so probes
 can distinguish "process alive" from "able to serve traffic". Add `?strict=true`
 to get `503 Service Unavailable` instead when the proxy is not ready.
 
+The `quota` object holds the most recent per-SKU allowance reported by the
+upstream. Copilot attaches it to every response, so it is current without any
+extra API call — but it stays empty until the first request has been proxied.
+The same figures are exported on `/metrics` as `ghc_proxy_quota_*` gauges
+labelled by `sku`.
+
 ## Retrieve a model
 
 `GET /v1/models/{model}` returns a single catalog entry in the OpenAI shape,
@@ -239,7 +245,14 @@ counts, estimated cost, and prompt-cache hit rate.
 - **SSE keepalive** — a `: keepalive` comment is emitted after 15 seconds of
   silence so extended thinking does not trip the ~60 second idle timeout
   enforced by the upstream load balancer. Comments are ignored by every
-  spec-compliant SSE client.
+  spec-compliant SSE client. The comment is only injected at an event boundary:
+  if the upstream goes quiet *part way through* writing an event, splicing one
+  in would corrupt it, so that case is left to the read timeout below.
+- **Read timeout** — `upstream_read_timeout_seconds` (default 120) bounds how
+  long an upstream response may stay silent between reads. It does not cap the
+  total duration, so long answers stream normally, but a half-open connection
+  is turned into a reported stream error instead of hanging the request
+  forever. Set it to `0` to disable.
 - **`anthropic-beta` passthrough** — the client's beta flags are forwarded and
   merged with the ones the proxy derives (`context-1m-2025-08-07` for extended
   context models, `context-management-2025-06-27` when the request uses

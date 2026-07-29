@@ -38,3 +38,6 @@ self_update = { version = "0.44", default-features = false, features = ["reqwest
 toml = "1.1"
 
 [dev-dependencies]
+# `test-util` (not part of tokio's `full`) enables the paused clock used to
+# exercise the SSE keepalive timing deterministically.
+tokio = { version = "1", features = ["full", "test-util"] }

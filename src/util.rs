@@ -19,9 +19,23 @@ use std::time::Duration;
 /// partial character simply waits for the rest of its bytes. Anything left over
 /// when the stream ends is returned by [`SseLineBuffer::flush`], so a final
 /// event that arrives without a trailing newline is not lost either.
+/// Largest single SSE line the buffer will accumulate before giving up.
+///
+/// Real events are kilobytes; this is far above anything legitimate. It exists
+/// so a broken or hostile upstream that never emits a newline cannot grow the
+/// buffer until the process runs out of memory.
+pub const MAX_SSE_LINE_BYTES: usize = 64 * 1024 * 1024;
+
 #[derive(Default)]
 pub struct SseLineBuffer {
+    /// Bytes of the line currently being assembled. Never contains a newline:
+    /// `push` always drains past the last one it finds, which is what makes
+    /// "only the newly arrived bytes can complete a line" true.
     buf: Vec<u8>,
+    /// Set when a single line exceeded [`MAX_SSE_LINE_BYTES`]. The stream can
+    /// no longer be parsed correctly from this point, so callers treat it the
+    /// same as a dropped connection rather than emitting a truncated event.
+    poisoned: bool,
 }
 
 impl SseLineBuffer {
@@ -29,19 +43,50 @@ impl SseLineBuffer {
         Self::default()
     }
 
+    /// Whether an oversized line forced the buffer to give up. Once true the
+    /// remaining stream is unparseable and the caller should report the
+    /// response as incomplete.
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
     /// Appends a chunk and returns every complete line it completed, with the
     /// trailing `\r` (CRLF streams) already stripped.
     pub fn push(&mut self, chunk: &[u8]) -> Vec<String> {
+        if self.poisoned {
+            return Vec::new();
+        }
+        // Whatever is already buffered was searched on an earlier call and, by
+        // the invariant above, holds no newline. So only the bytes that just
+        // arrived can terminate a line, and the search starts where they do —
+        // every byte is examined exactly once across the whole stream.
+        let search_from = self.buf.len();
         self.buf.extend_from_slice(chunk);
+
         let mut lines = Vec::new();
         let mut start = 0usize;
-        while let Some(pos) = self.buf[start..].iter().position(|&b| b == b'\n') {
-            let end = start + pos;
+        let mut cursor = search_from;
+        while let Some(pos) = self.buf[cursor..].iter().position(|&b| b == b'\n') {
+            let end = cursor + pos;
+            // A line spans from the end of the previous one, which may reach
+            // back into bytes buffered by earlier calls.
             lines.push(decode_line(&self.buf[start..end]));
             start = end + 1;
+            cursor = start;
         }
         if start > 0 {
             self.buf.drain(..start);
+        }
+        if self.buf.len() > MAX_SSE_LINE_BYTES {
+            tracing::error!(
+                "[sse] discarding a {} byte line with no newline (limit {} bytes); \
+                 treating the stream as broken",
+                self.buf.len(),
+                MAX_SSE_LINE_BYTES
+            );
+            self.buf.clear();
+            self.buf.shrink_to_fit();
+            self.poisoned = true;
         }
         lines
     }
@@ -245,6 +290,9 @@ pub async fn post_with_retry(
             .await;
         match result {
             Ok(resp) => {
+                // Every Copilot response carries the current quota, so recording
+                // it here keeps it fresh for free on every request.
+                state.record_quota_headers(resp.headers());
                 let status = resp.status().as_u16();
                 // If response is successful or a non-retryable error, return it
                 if status < 400 || !is_retryable_error(status) {
@@ -509,6 +557,57 @@ mod tests {
         assert_eq!(b.flush().as_deref(), Some("data: last-event-no-newline"));
         // Flushing twice is a no-op.
         assert!(b.flush().is_none());
+    }
+
+    #[test]
+    fn sse_buffer_handles_a_huge_single_event_split_into_many_chunks() {
+        // One 4 MB `data:` line delivered in 4 KB pieces, the shape a very
+        // large tool-call payload or final Responses event takes.
+        let payload = "x".repeat(4 * 1024 * 1024);
+        let line = format!("data: {{\"t\":\"{payload}\"}}\n");
+        let bytes = line.as_bytes();
+
+        let start = std::time::Instant::now();
+        let mut b = SseLineBuffer::new();
+        let mut lines = Vec::new();
+        for chunk in bytes.chunks(4096) {
+            lines.extend(b.push(chunk));
+        }
+        let elapsed = start.elapsed();
+
+        assert_eq!(lines.len(), 1);
+        let v: Value = serde_json::from_str(sse_data(&lines[0]).unwrap()).unwrap();
+        assert_eq!(v["t"].as_str().unwrap().len(), payload.len());
+        assert!(b.flush().is_none());
+
+        // Each byte must be examined a bounded number of times. Rescanning the
+        // whole retained buffer on every chunk makes this quadratic and takes
+        // orders of magnitude longer.
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "reassembling one large event took {elapsed:?}; the buffer is rescanning"
+        );
+    }
+
+    #[test]
+    fn sse_buffer_gives_up_on_an_unbounded_line_instead_of_growing_forever() {
+        // An upstream that never emits a newline must not be able to grow the
+        // buffer until the process dies.
+        let mut b = SseLineBuffer::new();
+        let mib = vec![b'x'; 1024 * 1024];
+        let mut pushed = 0usize;
+        while !b.is_poisoned() {
+            b.push(&mib);
+            pushed += mib.len();
+            assert!(
+                pushed <= MAX_SSE_LINE_BYTES + 2 * mib.len(),
+                "buffer grew past the cap without giving up"
+            );
+        }
+        assert!(b.is_poisoned());
+        // Once poisoned it stops accumulating entirely.
+        assert!(b.push(b"data: anything\n").is_empty());
+        assert!(b.is_poisoned());
     }
 
     #[test]

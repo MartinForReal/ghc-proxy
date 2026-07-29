@@ -1943,6 +1943,7 @@ async fn stream_gemini(
         Ok(r) => r,
         Err(e) => return gemini_error(StatusCode::GATEWAY_TIMEOUT, e.to_string()),
     };
+    state.record_quota_headers(upstream.headers());
     let status = upstream.status().as_u16();
     // Surface a non-2xx upstream (JSON error, not SSE) as a normal error.
     if !is_streamable_status(status) {
@@ -2146,8 +2147,18 @@ async fn usage(State(state): State<SharedState>) -> Response {
     if let Err(e) = state.ensure_copilot_token().await {
         return error_response(StatusCode::INTERNAL_SERVER_ERROR, e);
     }
+    // The live per-SKU snapshot rides along on every proxied response, so it is
+    // already current; the upstream call below adds the plan name and the
+    // detailed per-category breakdown it does not carry.
+    let live = state.quota_snapshot();
     match state.fetch_usage().await {
-        Ok(v) => Json(crate::state::summarize_usage(&v)).into_response(),
+        Ok(v) => {
+            let mut summary = crate::state::summarize_usage(&v);
+            if !live.is_empty() {
+                summary["live"] = serde_json::to_value(&live).unwrap_or(Value::Null);
+            }
+            Json(summary).into_response()
+        }
         Err(e) => error_response(StatusCode::BAD_GATEWAY, e),
     }
 }
@@ -2183,6 +2194,9 @@ async fn health(
         "models_loaded": model_count,
         "requests_served": stats.request_count,
         "auth_required": state.api_key().is_some(),
+        // Reported by the upstream on every response, so this costs no extra
+        // API call. Empty until the first request has been proxied.
+        "quota": state.quota_snapshot(),
     });
     let strict = params
         .get("strict")
@@ -2243,6 +2257,7 @@ async fn stream_openai(
             Ok(r) => r,
             Err(e) => return error_response(StatusCode::GATEWAY_TIMEOUT, e.to_string()),
         };
+        state.record_quota_headers(upstream.headers());
         let status = upstream.status().as_u16();
         // A non-2xx upstream (e.g. GitHub Models returning 401/403 as JSON when
         // the token lacks the `models: read` permission) is not an SSE stream —
@@ -2269,6 +2284,7 @@ async fn stream_openai(
         }
         break upstream;
     };
+    state.record_quota_headers(upstream.headers());
     let status = upstream.status().as_u16();
     let model = translated.clone();
     // Shared with the keepalive wrapper so the record can report how
@@ -2419,6 +2435,7 @@ async fn stream_responses(
         Ok(r) => r,
         Err(e) => return error_response(StatusCode::GATEWAY_TIMEOUT, e.to_string()),
     };
+    state.record_quota_headers(upstream.headers());
     let status = upstream.status().as_u16();
     // A non-2xx upstream returns a JSON error body, not an SSE stream. Forward
     // it as a normal error response instead of wrapping it in a 200 "stream",
@@ -2550,6 +2567,7 @@ async fn stream_anthropic_direct(
         session_id,
         start,
     } = meta;
+    state.record_quota_headers(upstream.headers());
     let status = upstream.status().as_u16();
     // Without this the error body is wrapped in a 200 `text/event-stream`, so
     // the client waits on a stream that never produces an event and reports a
@@ -2692,6 +2710,7 @@ async fn stream_anthropic_translated(
         Ok(r) => r,
         Err(e) => return anthropic_error(StatusCode::GATEWAY_TIMEOUT, e.to_string()),
     };
+    state.record_quota_headers(upstream.headers());
     let status = upstream.status().as_u16();
     // Surface a non-2xx upstream (JSON error, not SSE) as a normal error.
     if !is_streamable_status(status) {
@@ -3254,6 +3273,45 @@ async fn metrics_openmetrics(State(state): State<SharedState>) -> Response {
         "ghc_proxy_uptime_seconds {}\n",
         state.uptime_secs()
     ));
+
+    // Quota comes from headers the upstream attaches to every response, so
+    // scraping this endpoint never costs an extra API call.
+    let quotas = state.quota_snapshot();
+    if !quotas.is_empty() {
+        out.push_str(
+            "# HELP ghc_proxy_quota_percent_remaining Percent of the entitlement still available.\n",
+        );
+        out.push_str("# TYPE ghc_proxy_quota_percent_remaining gauge\n");
+        for (sku, q) in &quotas {
+            out.push_str(&format!(
+                "ghc_proxy_quota_percent_remaining{{sku=\"{}\"}} {}\n",
+                metrics_label_escape(sku),
+                q.percent_remaining
+            ));
+        }
+
+        out.push_str(
+            "# HELP ghc_proxy_quota_entitlement Allowance for the period; negative means unlimited.\n",
+        );
+        out.push_str("# TYPE ghc_proxy_quota_entitlement gauge\n");
+        for (sku, q) in &quotas {
+            out.push_str(&format!(
+                "ghc_proxy_quota_entitlement{{sku=\"{}\"}} {}\n",
+                metrics_label_escape(sku),
+                q.entitlement
+            ));
+        }
+
+        out.push_str("# HELP ghc_proxy_quota_overage Amount consumed beyond the entitlement.\n");
+        out.push_str("# TYPE ghc_proxy_quota_overage gauge\n");
+        for (sku, q) in &quotas {
+            out.push_str(&format!(
+                "ghc_proxy_quota_overage{{sku=\"{}\"}} {}\n",
+                metrics_label_escape(sku),
+                q.overage
+            ));
+        }
+    }
 
     out.push_str(
         "# HELP ghc_proxy_estimated_cost_usd_total Total estimated request cost in USD.\n",
