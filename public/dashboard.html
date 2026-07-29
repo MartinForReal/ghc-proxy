@@ -39,9 +39,18 @@
       try {
         const res = await fetch('/api/stats');
         const s = await res.json();
+        // Share of all prompt volume served from cache. Copilot bills per
+        // premium request rather than per token, so that count — not a dollar
+        // estimate — is what actually tracks consumption.
+        const cacheRate = s.total_input_tokens > 0
+          ? Math.round(s.total_cache_read_tokens / s.total_input_tokens * 100) + '%'
+          : '—';
         const cards = [
           ['Requests', s.request_count],
+          ['Premium requests', (s.premium_requests ?? 0).toFixed(2)],
           ['Input tokens', s.total_input_tokens],
+          ['Cache hit rate', cacheRate],
+          ['Cache writes', s.total_cache_creation_tokens],
           ['Output tokens', s.total_output_tokens],
           ['Bytes sent', s.bytes_sent],
           ['Bytes received', s.bytes_received],

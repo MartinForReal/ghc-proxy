@@ -477,6 +477,16 @@ impl AppState {
         self.model_supports_endpoint(model, "/v1/messages").await
     }
 
+    /// Copilot premium-request cost for a model, from the catalog's
+    /// `billing.multiplier`. `None` when the catalog does not price the model.
+    pub async fn model_premium_multiplier(&self, model: &str) -> Option<f64> {
+        self.models
+            .read()
+            .await
+            .as_ref()
+            .and_then(|catalog| premium_multiplier_from_catalog(catalog, model))
+    }
+
     /// Maximum output tokens advertised for a model
     /// (`capabilities.limits.max_output_tokens`). Used to fill in a missing
     /// `max_tokens`, which some Copilot models reject the request without.
@@ -668,4 +678,71 @@ pub fn summarize_usage(raw: &serde_json::Value) -> serde_json::Value {
         "quotas": quotas,
         "raw": raw,
     })
+}
+
+/// Extracts a model's Copilot premium-request cost from a `/models` catalog
+/// payload.
+///
+/// Returns `None` when the model is absent from the catalog or carries no
+/// `billing.multiplier`, so a model the catalog never priced is not silently
+/// counted as a full premium request.
+fn premium_multiplier_from_catalog(catalog: &serde_json::Value, model: &str) -> Option<f64> {
+    catalog
+        .get("data")?
+        .as_array()?
+        .iter()
+        .find(|m| m.get("id").and_then(|i| i.as_str()) == Some(model))?
+        .get("billing")?
+        .get("multiplier")?
+        .as_f64()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn premium_multiplier_reads_billing_from_the_catalog() {
+        // Shape taken from a real `GET /models` response.
+        let catalog = json!({"data": [
+            {"id": "claude-opus-5", "billing": {"is_premium": true, "multiplier": 1.0}},
+            {"id": "gpt-4.1", "billing": {"is_premium": false, "multiplier": 0.0}},
+            {"id": "discounted", "billing": {"is_premium": true, "multiplier": 0.33}},
+            {"id": "no-billing-block"}
+        ]});
+        assert_eq!(
+            premium_multiplier_from_catalog(&catalog, "claude-opus-5"),
+            Some(1.0)
+        );
+        assert_eq!(
+            premium_multiplier_from_catalog(&catalog, "gpt-4.1"),
+            Some(0.0)
+        );
+        assert_eq!(
+            premium_multiplier_from_catalog(&catalog, "discounted"),
+            Some(0.33)
+        );
+        // A model without billing metadata, or one that is not in the catalog
+        // at all, must stay unknown rather than defaulting to a full request.
+        assert_eq!(
+            premium_multiplier_from_catalog(&catalog, "no-billing-block"),
+            None
+        );
+        assert_eq!(
+            premium_multiplier_from_catalog(&catalog, "nonexistent"),
+            None
+        );
+    }
+
+    #[test]
+    fn premium_multiplier_survives_a_malformed_catalog() {
+        assert_eq!(
+            premium_multiplier_from_catalog(&json!({}), "claude-opus-5"),
+            None
+        );
+        assert_eq!(
+            premium_multiplier_from_catalog(&json!({"data": "not-an-array"}), "x"),
+            None
+        );
+    }
 }

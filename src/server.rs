@@ -8,6 +8,7 @@ use crate::state::SharedState;
 use crate::store::RequestRecord;
 use crate::translate;
 use crate::util;
+use crate::util::TokenUsage;
 use axum::{
     body::{Body, Bytes},
     extract::{DefaultBodyLimit, Path, Query, Request, State},
@@ -335,12 +336,30 @@ fn model_rates(model: &str) -> (f64, f64) {
     }
 }
 
+/// Cache writes carry a premium over fresh input, and cache reads a steep
+/// discount. These are Anthropic's published multipliers for 5-minute
+/// ephemeral caching, which is the tier Copilot passes through.
+const CACHE_WRITE_RATE_MULTIPLIER: f64 = 1.25;
+const CACHE_READ_RATE_MULTIPLIER: f64 = 0.1;
+
 /// Calculate estimated cost in USD based on token counts and model.
 /// Rates are approximate public list prices per 1K tokens and are only used for
 /// the dashboard/metrics estimate, never for billing.
-fn calculate_cost(model: &str, input_tokens: u64, output_tokens: u64) -> f64 {
+///
+/// `usage.input_tokens` is the true total prompt size, so the cached buckets
+/// are carved back out of it and repriced: billing every cached token at the
+/// full input rate would overstate a Claude Code turn several times over,
+/// while billing only the uncached remainder — as this did before — understates
+/// it by orders of magnitude.
+fn calculate_cost(model: &str, usage: &TokenUsage) -> f64 {
     let (input_rate, output_rate) = model_rates(model);
-    (input_tokens as f64 * input_rate + output_tokens as f64 * output_rate) / 1000.0
+    let cached = usage.cache_read_input_tokens + usage.cache_creation_input_tokens;
+    let uncached = usage.input_tokens.saturating_sub(cached);
+    (uncached as f64 * input_rate
+        + usage.cache_creation_input_tokens as f64 * input_rate * CACHE_WRITE_RATE_MULTIPLIER
+        + usage.cache_read_input_tokens as f64 * input_rate * CACHE_READ_RATE_MULTIPLIER
+        + usage.output_tokens as f64 * output_rate)
+        / 1000.0
 }
 
 /// Checks if a request is eligible for prompt caching (system prompt is large enough).
@@ -368,25 +387,328 @@ fn is_prompt_cache_eligible(req: &Value) -> bool {
     }
 }
 
-/// Detect if a response used prompt caching by checking for cache tokens.
-#[allow(dead_code)]
-fn extract_prompt_cache_hit(response: &Value) -> Option<bool> {
-    let usage = response.get("usage")?;
-    let cache_read = usage
-        .get("cache_read_input_tokens")
-        .and_then(|t| t.as_u64())
-        .unwrap_or(0);
-    let cache_creation = usage
-        .get("cache_creation_input_tokens")
-        .and_then(|t| t.as_u64())
-        .unwrap_or(0);
+/// Ratio of `part` to `whole` as a **0–1 fraction** rounded to two decimals.
+///
+/// Every rate the audit API reports goes through here so they all share one
+/// scale. Mixing a 0–1 fraction with a 0–100 percentage under two
+/// similarly-named JSON keys is the kind of thing that silently corrupts a
+/// dashboard downstream. Returns `0.0` for a zero denominator instead of the
+/// `NaN` that would serialize as `null`.
+fn ratio_2dp(part: f64, whole: f64) -> f64 {
+    if whole <= 0.0 {
+        return 0.0;
+    }
+    (part / whole * 100.0).round() / 100.0
+}
 
-    if cache_read > 0 {
-        Some(true) // Cache hit (reading from cache)
-    } else if cache_creation > 0 {
-        Some(false) // Cache write (creating new cache)
+/// Extracts the client session id from a request's `metadata.user_id`.
+///
+/// Claude Code sends that field as a JSON *string* containing another JSON
+/// object (`{"device_id":…,"session_id":…}`), so it takes two parses. Several
+/// client instances routinely share one proxy, and without this their records
+/// interleave in the dashboard with nothing to tell them apart.
+///
+/// Every unexpected shape degrades to `None` — this is diagnostic metadata and
+/// must never be able to fail a request.
+fn extract_session_id(req: &Value) -> Option<String> {
+    let raw = req.get("metadata")?.get("user_id")?.as_str()?;
+    let parsed: Value = serde_json::from_str(raw).ok()?;
+    let id = parsed.get("session_id")?.as_str()?;
+    (!id.is_empty()).then(|| id.to_string())
+}
+
+/// Records a request that failed before producing a usable response.
+///
+/// Every early `return` on an inference path routes through here. Without it
+/// the request vanishes entirely: records were only ever added on the success
+/// path, so a connection error or a 429 left nothing in the dashboard and
+/// nothing to diagnose from.
+#[allow(clippy::too_many_arguments)]
+fn record_failure(
+    state: &SharedState,
+    endpoint: &str,
+    model: &str,
+    translated: Option<&str>,
+    status: u16,
+    kind: &str,
+    req_size: usize,
+    req_body: Option<String>,
+    resp_body: Option<String>,
+    start: Instant,
+    session_id: Option<String>,
+) {
+    state.store.add(RequestRecord {
+        id: uuid::Uuid::new_v4().to_string(),
+        timestamp: now_iso(),
+        endpoint: endpoint.to_string(),
+        model: model.to_string(),
+        translated_model: translated.filter(|t| *t != model).map(String::from),
+        status_code: status,
+        request_size: req_size,
+        response_size: resp_body.as_ref().map(|s| s.len()).unwrap_or(0),
+        input_tokens: 0,
+        output_tokens: 0,
+        output_tokens_final: None,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+        premium_multiplier: None,
+        upstream_idle_max_ms: None,
+        keepalive_probes: None,
+        duration: elapsed_secs(start),
+        request_body: req_body,
+        // Kept regardless of debug mode: an error body is small and is the
+        // entire reason this record exists.
+        response_body: resp_body,
+        message_count: None,
+        tool_count: None,
+        tool_names: None,
+        stop_reason: None,
+        tools_called: None,
+        is_agent_initiated: None,
+        prompt_cache_hit: None,
+        session_id,
+        failure_kind: Some(kind.to_string()),
+        estimated_cost_usd: None,
+    });
+}
+
+/// Guarantees a streaming request is recorded on every exit path, including
+/// the one that used to lose it entirely.
+///
+/// When a client hangs up, axum drops the response body, which drops the
+/// `async_stream` generator — so a `store.add` written after the loop never
+/// runs. Holding the record in a value with a `Drop` impl moves the write onto
+/// an unconditional path. `RequestStore::add` takes a synchronous
+/// `std::sync::Mutex`, so it is safe to call from `Drop`; anything async (such
+/// as the premium multiplier) must be resolved before the stream starts.
+/// Running state folded out of the upstream Anthropic SSE stream on the
+/// passthrough path (`stream_anthropic_direct`).
+///
+/// Kept as a plain value rather than as generator locals so the whole
+/// event-interpretation rulebook is testable without standing up a stream.
+#[derive(Debug, Default)]
+struct DirectStreamState {
+    usage: TokenUsage,
+    /// Whether `message_delta` — the only event carrying an authoritative
+    /// `output_tokens` — has arrived. Until it does, the count taken from
+    /// `message_start` is an opening placeholder, so a record finalized early
+    /// must not present it as the turn's real output.
+    usage_final: bool,
+    stop_reason: Option<String>,
+    tools_called: Vec<String>,
+    saw_message_stop: bool,
+}
+
+impl DirectStreamState {
+    /// Folds one decoded SSE event into the running state.
+    fn observe(&mut self, v: &Value) {
+        match v.get("type").and_then(|t| t.as_str()) {
+            Some("message_start") => {
+                // The input buckets are only ever stated here, and
+                // `input_tokens` alone is the uncached remainder — for a
+                // cached Claude Code turn that is single digits against a
+                // six-figure prompt.
+                if let Some(u) = v.get("message").and_then(|m| m.get("usage")) {
+                    self.usage = util::anthropic_usage(u);
+                }
+            }
+            Some("message_delta") => {
+                // `message_delta` restates the running output count and
+                // nothing else; adopting it wholesale would zero the input
+                // buckets captured at message_start.
+                if let Some(o) = v
+                    .get("usage")
+                    .and_then(|u| u.get("output_tokens"))
+                    .and_then(|t| t.as_u64())
+                {
+                    self.usage.output_tokens = o;
+                    self.usage_final = true;
+                }
+                if let Some(sr) = v
+                    .get("delta")
+                    .and_then(|d| d.get("stop_reason"))
+                    .and_then(|s| s.as_str())
+                {
+                    self.stop_reason = Some(sr.to_string());
+                }
+            }
+            Some("content_block_start") => {
+                if let Some(block) = v.get("content_block") {
+                    if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
+                        if let Some(name) = block.get("name").and_then(|n| n.as_str()) {
+                            if !self.tools_called.iter().any(|t| t == name) {
+                                self.tools_called.push(name.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            Some("message_stop") => self.saw_message_stop = true,
+            _ => {}
+        }
+    }
+}
+
+struct StreamRecorder {
+    state: SharedState,
+    /// Taken by the first finalize, so `Drop` cannot record a second time.
+    rec: Option<RequestRecord>,
+    model_for_cost: String,
+    start: Instant,
+    /// Running counters, kept here rather than as generator locals so `Drop`
+    /// can still see how far the stream got.
+    usage: TokenUsage,
+    /// Mirrors `DirectStreamState::usage_final`, for the same reason: `Drop`
+    /// must be able to tell a record cut short mid-stream — whose output count
+    /// is still the `message_start` placeholder — from one that saw the real
+    /// total in `message_delta`.
+    usage_final: bool,
+    resp_size: usize,
+    idle: util::IdleTracker,
+    /// Shared with the keepalive layer wrapping this stream, so the record can
+    /// state how many probes actually went out during an upstream silence.
+    probes: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    /// Raw upstream bytes seen so far, for the same reason: a client
+    /// disconnect is exactly when you want to read what did arrive, and a
+    /// generator local would be gone by then. Only filled in debug mode.
+    debug_raw: Vec<u8>,
+}
+
+impl StreamRecorder {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        state: SharedState,
+        endpoint: &str,
+        model: String,
+        translated: String,
+        req_size: usize,
+        req_body: Option<String>,
+        premium_multiplier: Option<f64>,
+        start: Instant,
+        probes: std::sync::Arc<std::sync::atomic::AtomicU32>,
+        session_id: Option<String>,
+    ) -> Self {
+        let rec = RequestRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            timestamp: now_iso(),
+            endpoint: endpoint.to_string(),
+            translated_model: (translated != model).then(|| translated.clone()),
+            model,
+            status_code: 0,
+            request_size: req_size,
+            response_size: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            output_tokens_final: None,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+            premium_multiplier,
+            upstream_idle_max_ms: None,
+            keepalive_probes: None,
+            duration: 0.0,
+            request_body: req_body,
+            response_body: None,
+            message_count: None,
+            tool_count: None,
+            tool_names: None,
+            stop_reason: None,
+            tools_called: None,
+            is_agent_initiated: None,
+            prompt_cache_hit: None,
+            session_id,
+            failure_kind: None,
+            estimated_cost_usd: None,
+        };
+        StreamRecorder {
+            state,
+            rec: Some(rec),
+            model_for_cost: translated,
+            start,
+            usage: TokenUsage::default(),
+            usage_final: false,
+            resp_size: 0,
+            idle: util::IdleTracker::new(Instant::now()),
+            probes,
+            debug_raw: Vec::new(),
+        }
+    }
+
+    /// Mutable access to the pending record for path-specific fields the
+    /// generic finalize does not cover (tool names, message counts, …).
+    fn record_mut(&mut self) -> Option<&mut RequestRecord> {
+        self.rec.as_mut()
+    }
+
+    /// Folds the running counters into the record and hands it to the store.
+    /// Idempotent — the second call (typically from `Drop`) is a no-op.
+    fn finalize(
+        &mut self,
+        status: u16,
+        failure_kind: Option<&str>,
+        stop_reason: Option<String>,
+        response_body: Option<String>,
+    ) {
+        let Some(mut rec) = self.rec.take() else {
+            return;
+        };
+        rec.status_code = status;
+        rec.response_size = self.resp_size;
+        rec.input_tokens = self.usage.input_tokens;
+        rec.output_tokens = self.usage.output_tokens;
+        rec.output_tokens_final = Some(self.usage_final);
+        rec.cache_read_input_tokens = self.usage.cache_read_input_tokens;
+        rec.cache_creation_input_tokens = self.usage.cache_creation_input_tokens;
+        rec.upstream_idle_max_ms = Some(self.idle.max_idle_ms_including_now());
+        rec.keepalive_probes = Some(self.probes.load(std::sync::atomic::Ordering::Relaxed));
+        rec.duration = elapsed_secs(self.start);
+        rec.prompt_cache_hit = cache_disposition(&self.usage);
+        rec.estimated_cost_usd = Some(calculate_cost(&self.model_for_cost, &self.usage));
+        rec.stop_reason = stop_reason;
+        rec.response_body = response_body;
+        rec.failure_kind = failure_kind.map(String::from);
+        self.state.store.add(rec);
+    }
+}
+
+impl Drop for StreamRecorder {
+    fn drop(&mut self) {
+        // Only reachable when the generator was dropped before finalize ran,
+        // i.e. the client went away mid-stream. 499 follows nginx's
+        // "client closed request". Whatever had already arrived from the
+        // upstream is preserved — that partial body is the main evidence for
+        // diagnosing why the client gave up.
+        let partial = (!self.debug_raw.is_empty())
+            .then(|| String::from_utf8_lossy(&self.debug_raw).into_owned());
+        self.finalize(
+            499,
+            Some(crate::store::failure::CLIENT_DISCONNECTED),
+            None,
+            partial,
+        );
+    }
+}
+
+/// Whether an upstream response should be forwarded to the client as an SSE
+/// stream.
+///
+/// A non-2xx upstream returns a JSON error body, not SSE. Wrapping one in a
+/// 200 `text/event-stream` produces a stream that never yields a single event,
+/// which clients report as a stalled or hung response instead of the actual
+/// auth/quota failure underneath. Every streaming path must gate on this.
+fn is_streamable_status(status: u16) -> bool {
+    (200..300).contains(&status)
+}
+
+/// Whether a request touched the prompt cache: `Some(true)` when part of the
+/// prompt was served from cache, `Some(false)` on a write-only turn (a cold
+/// cache being populated), and `None` when caching was not involved at all.
+fn cache_disposition(usage: &TokenUsage) -> Option<bool> {
+    if usage.cache_read_input_tokens > 0 {
+        Some(true)
+    } else if usage.cache_creation_input_tokens > 0 {
+        Some(false)
     } else {
-        None // No caching
+        None
     }
 }
 
@@ -674,17 +996,10 @@ async fn chat_completions(State(state): State<SharedState>, body: Bytes) -> Resp
     log_debug_response(&state, "/v1/chat/completions", &text);
     if status.is_success() {
         let parsed: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
-        let usage = parsed.get("usage").cloned().unwrap_or(json!({}));
-        let input_tokens = usage
-            .get("prompt_tokens")
-            .and_then(|t| t.as_u64())
-            .unwrap_or(0);
-        let output_tokens = usage
-            .get("completion_tokens")
-            .and_then(|t| t.as_u64())
-            .unwrap_or(0);
+        let usage = util::openai_usage(&parsed.get("usage").cloned().unwrap_or(json!({})));
         let (tool_count, tool_names) = extract_tools_from_request(&req);
-        let cost = calculate_cost(&translated, input_tokens, output_tokens);
+        let cost = calculate_cost(&translated, &usage);
+        let premium_multiplier = state.model_premium_multiplier(&translated).await;
         state.store.add(RequestRecord {
             id: uuid::Uuid::new_v4().to_string(),
             timestamp: now_iso(),
@@ -694,8 +1009,14 @@ async fn chat_completions(State(state): State<SharedState>, body: Bytes) -> Resp
             status_code: status.as_u16(),
             request_size: req_size,
             response_size: resp_size,
-            input_tokens,
-            output_tokens,
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            output_tokens_final: None,
+            cache_read_input_tokens: usage.cache_read_input_tokens,
+            cache_creation_input_tokens: usage.cache_creation_input_tokens,
+            premium_multiplier,
+            upstream_idle_max_ms: None,
+            keepalive_probes: None,
             duration: elapsed_secs(start),
             request_body: capture_json(&state, &req),
             response_body: capture_str(&state, &text),
@@ -705,7 +1026,9 @@ async fn chat_completions(State(state): State<SharedState>, body: Bytes) -> Resp
             stop_reason: None, // OpenAI responses don't have stop_reason in JSON
             tools_called: None,
             is_agent_initiated: Some(agent),
-            prompt_cache_hit: None,
+            session_id: None,
+            prompt_cache_hit: cache_disposition(&usage),
+            failure_kind: None,
             estimated_cost_usd: Some(cost),
         });
         Json(parsed).into_response()
@@ -821,17 +1144,10 @@ async fn responses(State(state): State<SharedState>, body: Bytes) -> Response {
     log_debug_response(&state, "/v1/responses", &text);
     if status.is_success() {
         let parsed: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
-        let usage = parsed.get("usage").cloned().unwrap_or(json!({}));
-        let input_tokens = usage
-            .get("input_tokens")
-            .and_then(|t| t.as_u64())
-            .unwrap_or(0);
-        let output_tokens = usage
-            .get("output_tokens")
-            .and_then(|t| t.as_u64())
-            .unwrap_or(0);
+        let usage = util::responses_usage(&parsed.get("usage").cloned().unwrap_or(json!({})));
         let (tool_count, tool_names) = extract_tools_from_request(&req);
-        let cost = calculate_cost(&translated, input_tokens, output_tokens);
+        let cost = calculate_cost(&translated, &usage);
+        let premium_multiplier = state.model_premium_multiplier(&translated).await;
         state.store.add(RequestRecord {
             id: uuid::Uuid::new_v4().to_string(),
             timestamp: now_iso(),
@@ -841,8 +1157,14 @@ async fn responses(State(state): State<SharedState>, body: Bytes) -> Response {
             status_code: status.as_u16(),
             request_size: req_size,
             response_size: resp_size,
-            input_tokens,
-            output_tokens,
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            output_tokens_final: None,
+            cache_read_input_tokens: usage.cache_read_input_tokens,
+            cache_creation_input_tokens: usage.cache_creation_input_tokens,
+            premium_multiplier,
+            upstream_idle_max_ms: None,
+            keepalive_probes: None,
             duration: elapsed_secs(start),
             request_body: capture_json(&state, &req),
             response_body: capture_str(&state, &text),
@@ -852,7 +1174,9 @@ async fn responses(State(state): State<SharedState>, body: Bytes) -> Response {
             stop_reason: None,
             tools_called: None,
             is_agent_initiated: Some(agent),
-            prompt_cache_hit: None,
+            session_id: None,
+            prompt_cache_hit: cache_disposition(&usage),
+            failure_kind: None,
             estimated_cost_usd: Some(cost),
         });
         Json(parsed).into_response()
@@ -994,7 +1318,22 @@ async fn messages_direct(
                 .await;
             let upstream = match upstream {
                 Ok(r) => r,
-                Err(e) => return anthropic_error(StatusCode::GATEWAY_TIMEOUT, e.to_string()),
+                Err(e) => {
+                    record_failure(
+                        &state,
+                        "/v1/messages",
+                        &original_model,
+                        Some(&translated),
+                        504,
+                        crate::store::failure::CONNECT,
+                        req_size,
+                        capture_json(&state, &sanitized),
+                        Some(e.to_string()),
+                        start,
+                        extract_session_id(&sanitized),
+                    );
+                    return anthropic_error(StatusCode::GATEWAY_TIMEOUT, e.to_string());
+                }
             };
             let status = upstream.status();
             // Inspect 400 responses so we can transparently recover from the
@@ -1013,16 +1352,32 @@ async fn messages_direct(
                         continue;
                     }
                 }
+                record_failure(
+                    &state,
+                    "/v1/messages",
+                    &original_model,
+                    Some(&translated),
+                    status.as_u16(),
+                    crate::store::failure::UPSTREAM_STATUS,
+                    req_size,
+                    capture_json(&state, &sanitized),
+                    Some(text.clone()),
+                    start,
+                    extract_session_id(&sanitized),
+                );
                 return passthrough_error(status, text);
             }
             return stream_anthropic_direct(
                 state.clone(),
                 upstream,
-                original_model,
-                translated,
-                req_size,
-                capture_json(&state, &sanitized),
-                start,
+                RequestMeta {
+                    req_body: capture_json(&state, &sanitized),
+                    session_id: extract_session_id(&sanitized),
+                    original_model,
+                    translated,
+                    req_size,
+                    start,
+                },
             )
             .await;
         }
@@ -1030,6 +1385,19 @@ async fn messages_direct(
         let resp =
             util::post_with_retry(&state, &url, headers.clone(), payload, "/v1/messages").await;
         let Some(resp) = resp else {
+            record_failure(
+                &state,
+                "/v1/messages",
+                &original_model,
+                Some(&translated),
+                504,
+                crate::store::failure::CONNECT,
+                req_size,
+                capture_json(&state, &sanitized),
+                None,
+                start,
+                extract_session_id(&sanitized),
+            );
             return anthropic_error(
                 StatusCode::GATEWAY_TIMEOUT,
                 "Upstream connection error".into(),
@@ -1044,14 +1412,7 @@ async fn messages_direct(
                 &serde_json::to_string(&parsed).unwrap_or_default(),
             );
             let usage = parsed.get("usage").cloned().unwrap_or(json!({}));
-            let input_tokens = usage
-                .get("input_tokens")
-                .and_then(|t| t.as_u64())
-                .unwrap_or(0);
-            let output_tokens = usage
-                .get("output_tokens")
-                .and_then(|t| t.as_u64())
-                .unwrap_or(0);
+            let usage = util::anthropic_usage(&usage);
             let (tool_count, tool_names) = extract_tools_from_request(&req);
             let tools_called: Vec<String> = parsed
                 .get("content")
@@ -1080,8 +1441,14 @@ async fn messages_direct(
                 status_code: status.as_u16(),
                 request_size: req_size,
                 response_size: serde_json::to_vec(&parsed).map(|v| v.len()).unwrap_or(0),
-                input_tokens,
-                output_tokens,
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+                output_tokens_final: None,
+                cache_read_input_tokens: usage.cache_read_input_tokens,
+                cache_creation_input_tokens: usage.cache_creation_input_tokens,
+                premium_multiplier: state.model_premium_multiplier(&translated).await,
+                upstream_idle_max_ms: None,
+                keepalive_probes: None,
                 duration: elapsed_secs(start),
                 request_body: capture_json(&state, &sanitized),
                 response_body: capture_json(&state, &parsed),
@@ -1091,8 +1458,10 @@ async fn messages_direct(
                 stop_reason,
                 tools_called: (!tools_called.is_empty()).then_some(tools_called),
                 is_agent_initiated: Some(agent),
-                prompt_cache_hit: None,
-                estimated_cost_usd: Some(calculate_cost(&translated, input_tokens, output_tokens)),
+                session_id: None,
+                prompt_cache_hit: cache_disposition(&usage),
+                failure_kind: None,
+                estimated_cost_usd: Some(calculate_cost(&translated, &usage)),
             });
             return Json(parsed).into_response();
         }
@@ -1119,6 +1488,19 @@ async fn messages_direct(
                 continue;
             }
         }
+        record_failure(
+            &state,
+            "/v1/messages",
+            &original_model,
+            Some(&translated),
+            status.as_u16(),
+            crate::store::failure::UPSTREAM_STATUS,
+            req_size,
+            capture_json(&state, &sanitized),
+            Some(text.clone()),
+            start,
+            extract_session_id(&sanitized),
+        );
         return passthrough_error(status, text);
     }
     anthropic_error(StatusCode::BAD_GATEWAY, "Exhausted retries".into())
@@ -1169,6 +1551,7 @@ async fn messages_translated(
                 translated,
                 req_size,
                 start,
+                extract_session_id(&openai_req),
             )
             .await;
         }
@@ -1177,6 +1560,19 @@ async fn messages_translated(
             util::post_with_retry(&state, &url, headers, payload, "/v1/messages (translated)")
                 .await;
         let Some(resp) = resp else {
+            record_failure(
+                &state,
+                "/v1/messages",
+                &original_model,
+                Some(&translated),
+                504,
+                crate::store::failure::CONNECT,
+                req_size,
+                capture_json(&state, &openai_req),
+                None,
+                start,
+                extract_session_id(&openai_req),
+            );
             return anthropic_error(
                 StatusCode::GATEWAY_TIMEOUT,
                 "Upstream connection error".into(),
@@ -1191,15 +1587,7 @@ async fn messages_translated(
                 "/v1/messages",
                 &serde_json::to_string(&parsed).unwrap_or_default(),
             );
-            let usage = parsed.get("usage").cloned().unwrap_or(json!({}));
-            let input_tokens = usage
-                .get("prompt_tokens")
-                .and_then(|t| t.as_u64())
-                .unwrap_or(0);
-            let output_tokens = usage
-                .get("completion_tokens")
-                .and_then(|t| t.as_u64())
-                .unwrap_or(0);
+            let usage = util::openai_usage(&parsed.get("usage").cloned().unwrap_or(json!({})));
             let (tool_count, tool_names) = extract_tools_from_request(&openai_req);
             state.store.add(RequestRecord {
                 id: uuid::Uuid::new_v4().to_string(),
@@ -1212,8 +1600,14 @@ async fn messages_translated(
                 response_size: serde_json::to_vec(&anthropic_resp)
                     .map(|v| v.len())
                     .unwrap_or(0),
-                input_tokens,
-                output_tokens,
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+                output_tokens_final: None,
+                cache_read_input_tokens: usage.cache_read_input_tokens,
+                cache_creation_input_tokens: usage.cache_creation_input_tokens,
+                premium_multiplier: state.model_premium_multiplier(&translated).await,
+                upstream_idle_max_ms: None,
+                keepalive_probes: None,
                 duration: elapsed_secs(start),
                 request_body: capture_json(&state, &openai_req),
                 response_body: capture_json(&state, &parsed),
@@ -1223,8 +1617,10 @@ async fn messages_translated(
                 stop_reason: None,
                 tools_called: None,
                 is_agent_initiated: Some(agent),
-                prompt_cache_hit: None,
-                estimated_cost_usd: Some(calculate_cost(&translated, input_tokens, output_tokens)),
+                session_id: None,
+                prompt_cache_hit: cache_disposition(&usage),
+                failure_kind: None,
+                estimated_cost_usd: Some(calculate_cost(&translated, &usage)),
             });
             return Json(anthropic_resp).into_response();
         }
@@ -1241,6 +1637,19 @@ async fn messages_translated(
                 }
             }
         }
+        record_failure(
+            &state,
+            "/v1/messages",
+            &original_model,
+            Some(&translated),
+            status.as_u16(),
+            crate::store::failure::UPSTREAM_STATUS,
+            req_size,
+            capture_json(&state, &openai_req),
+            Some(text.clone()),
+            start,
+            extract_session_id(&openai_req),
+        );
         return passthrough_error(status, text);
     }
     anthropic_error(StatusCode::BAD_GATEWAY, "Exhausted retries".into())
@@ -1438,16 +1847,9 @@ async fn gemini_generate(
     if status.is_success() {
         let parsed: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
         let gemini_resp = gemini::openai_to_gemini(&parsed);
-        let usage = parsed.get("usage").cloned().unwrap_or(json!({}));
-        let input_tokens = usage
-            .get("prompt_tokens")
-            .and_then(|t| t.as_u64())
-            .unwrap_or(0);
-        let output_tokens = usage
-            .get("completion_tokens")
-            .and_then(|t| t.as_u64())
-            .unwrap_or(0);
-        let cost = calculate_cost(&translated, input_tokens, output_tokens);
+        let usage = util::openai_usage(&parsed.get("usage").cloned().unwrap_or(json!({})));
+        let cost = calculate_cost(&translated, &usage);
+        let premium_multiplier = state.model_premium_multiplier(&translated).await;
         state.store.add(RequestRecord {
             id: uuid::Uuid::new_v4().to_string(),
             timestamp: now_iso(),
@@ -1457,8 +1859,14 @@ async fn gemini_generate(
             status_code: status.as_u16(),
             request_size: req_size,
             response_size: resp_size,
-            input_tokens,
-            output_tokens,
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            output_tokens_final: None,
+            cache_read_input_tokens: usage.cache_read_input_tokens,
+            cache_creation_input_tokens: usage.cache_creation_input_tokens,
+            premium_multiplier,
+            upstream_idle_max_ms: None,
+            keepalive_probes: None,
             duration: elapsed_secs(start),
             request_body: capture_json(&state, &openai_req),
             response_body: capture_str(&state, &text),
@@ -1468,7 +1876,9 @@ async fn gemini_generate(
             stop_reason: None,
             tools_called: None,
             is_agent_initiated: Some(agent),
-            prompt_cache_hit: None,
+            session_id: None,
+            prompt_cache_hit: cache_disposition(&usage),
+            failure_kind: None,
             estimated_cost_usd: Some(cost),
         });
         Json(gemini_resp).into_response()
@@ -1535,7 +1945,7 @@ async fn stream_gemini(
     };
     let status = upstream.status().as_u16();
     // Surface a non-2xx upstream (JSON error, not SSE) as a normal error.
-    if !(200..300).contains(&status) {
+    if !is_streamable_status(status) {
         let text = upstream.text().await.unwrap_or_default();
         log_debug_response(&state, "/v1beta/models", &text);
         log_error(
@@ -1550,22 +1960,26 @@ async fn stream_gemini(
         );
     }
     let model_json = Value::String(translated.clone());
+    // Shared with the keepalive wrapper so the record can report how
+    // many probes actually went out during an upstream silence.
+    let probe_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let stream = async_stream::stream! {
         use futures_util::StreamExt;
         let mut byte_stream = upstream.bytes_stream();
         let mut lines = util::SseLineBuffer::new();
-        let mut input_tokens = 0u64;
-        let mut output_tokens = 0u64;
+        let mut usage = TokenUsage::default();
         let mut resp_size = 0usize;
         let mut finish: Option<String> = None;
         let mut debug_raw: Vec<u8> = Vec::new();
         let mut interrupted: Option<String> = None;
+        let mut idle = util::IdleTracker::new(std::time::Instant::now());
         loop {
             let chunk = match byte_stream.next().await {
                 Some(Ok(chunk)) => chunk,
                 Some(Err(e)) => { interrupted = Some(e.to_string()); break; }
                 None => break,
             };
+            idle.mark_now();
             if state.is_debug() { debug_raw.extend_from_slice(&chunk); }
             for line in lines.push(&chunk) {
                 let Some(data) = util::sse_data(&line) else { continue };
@@ -1573,8 +1987,7 @@ async fn stream_gemini(
                 if let Ok(v) = serde_json::from_str::<Value>(data) {
                     if let Some(u) = v.get("usage") {
                         if !u.is_null() {
-                            input_tokens = u.get("prompt_tokens").and_then(|t| t.as_u64()).unwrap_or(input_tokens);
-                            output_tokens = u.get("completion_tokens").and_then(|t| t.as_u64()).unwrap_or(output_tokens);
+                            usage.merge_stream_update(util::openai_usage(u));
                         }
                     }
                     if let Some(choice) = v.get("choices").and_then(|c| c.as_array()).and_then(|a| a.first()) {
@@ -1600,8 +2013,8 @@ async fn stream_gemini(
             tracing::warn!("[/v1beta/models] upstream stream interrupted: {reason}");
             finish = Some("OTHER".to_string());
         }
-        let usage = json!({"prompt_tokens": input_tokens, "completion_tokens": output_tokens});
-        let ev = gemini::gemini_stream_final_chunk(finish.as_deref(), &usage, &model_json);
+        let usage_json = json!({"prompt_tokens": usage.input_tokens, "completion_tokens": usage.output_tokens});
+        let ev = gemini::gemini_stream_final_chunk(finish.as_deref(), &usage_json, &model_json);
         let payload = format!("data: {}\n\n", serde_json::to_string(&ev).unwrap_or_default());
         resp_size += payload.len();
         yield Ok(Bytes::from(payload));
@@ -1616,8 +2029,14 @@ async fn stream_gemini(
             status_code: if interrupted.is_some() { 502 } else { status },
             request_size: req_size,
             response_size: resp_size,
-            input_tokens,
-            output_tokens,
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            output_tokens_final: None,
+            cache_read_input_tokens: usage.cache_read_input_tokens,
+            cache_creation_input_tokens: usage.cache_creation_input_tokens,
+            premium_multiplier: state.model_premium_multiplier(&translated).await,
+            upstream_idle_max_ms: Some(idle.max_idle_ms_including_now()),
+            keepalive_probes: None,
             duration: elapsed_secs(start),
             request_body: req_body,
             response_body: if state.is_debug() { Some(debug_resp) } else { None },
@@ -1627,11 +2046,13 @@ async fn stream_gemini(
             stop_reason: interrupted.is_some().then(|| "stream_interrupted".to_string()),
             tools_called: None,
             is_agent_initiated: None,
-            prompt_cache_hit: None,
-            estimated_cost_usd: Some(calculate_cost(&translated, input_tokens, output_tokens)),
+            session_id: None,
+            prompt_cache_hit: cache_disposition(&usage),
+            failure_kind: None,
+            estimated_cost_usd: Some(calculate_cost(&translated, &usage)),
         });
     };
-    build_sse_response(stream)
+    build_sse_response(stream, COMMENT_KEEPALIVE_PROBE, probe_count.clone())
 }
 
 // ---------------------------------------------------------------------------
@@ -1677,11 +2098,7 @@ async fn embeddings(State(state): State<SharedState>, body: Bytes) -> Response {
     log_debug_response(&state, "/v1/embeddings", &text);
     if status.is_success() {
         let parsed: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
-        let usage = parsed.get("usage").cloned().unwrap_or(json!({}));
-        let input_tokens = usage
-            .get("prompt_tokens")
-            .and_then(|t| t.as_u64())
-            .unwrap_or(0);
+        let usage = util::openai_usage(&parsed.get("usage").cloned().unwrap_or(json!({})));
         state.store.add(RequestRecord {
             id: uuid::Uuid::new_v4().to_string(),
             timestamp: now_iso(),
@@ -1691,8 +2108,15 @@ async fn embeddings(State(state): State<SharedState>, body: Bytes) -> Response {
             status_code: status.as_u16(),
             request_size: req_size,
             response_size: resp_size,
-            input_tokens,
+            input_tokens: usage.input_tokens,
             output_tokens: 0,
+            output_tokens_final: None,
+            cache_read_input_tokens: usage.cache_read_input_tokens,
+            cache_creation_input_tokens: usage.cache_creation_input_tokens,
+            // Embeddings are not billed as premium requests.
+            premium_multiplier: None,
+            upstream_idle_max_ms: None,
+            keepalive_probes: None,
             duration: elapsed_secs(start),
             request_body: capture_json(&state, &req),
             response_body: capture_str(&state, &text),
@@ -1702,8 +2126,10 @@ async fn embeddings(State(state): State<SharedState>, body: Bytes) -> Response {
             stop_reason: None,
             tools_called: None,
             is_agent_initiated: Some(false),
-            prompt_cache_hit: None,
-            estimated_cost_usd: Some(calculate_cost(&model, input_tokens, 0)),
+            session_id: None,
+            prompt_cache_hit: cache_disposition(&usage),
+            failure_kind: None,
+            estimated_cost_usd: Some(calculate_cost(&model, &usage)),
         });
         Json(parsed).into_response()
     } else {
@@ -1821,7 +2247,7 @@ async fn stream_openai(
         // A non-2xx upstream (e.g. GitHub Models returning 401/403 as JSON when
         // the token lacks the `models: read` permission) is not an SSE stream —
         // surface it as a normal error instead of forwarding a broken "stream".
-        if !(200..300).contains(&status) {
+        if !is_streamable_status(status) {
             let text = upstream.text().await.unwrap_or_default();
             log_debug_response(&state, endpoint, &text);
             // Newer OpenAI-family models reject `max_tokens` in favour of
@@ -1845,16 +2271,19 @@ async fn stream_openai(
     };
     let status = upstream.status().as_u16();
     let model = translated.clone();
+    // Shared with the keepalive wrapper so the record can report how
+    // many probes actually went out during an upstream silence.
+    let probe_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let stream = async_stream::stream! {
         use futures_util::StreamExt;
         let mut byte_stream = upstream.bytes_stream();
         let mut lines = util::SseLineBuffer::new();
-        let mut input_tokens = 0u64;
-        let mut output_tokens = 0u64;
+        let mut usage = TokenUsage::default();
         let mut resp_size = 0usize;
         let mut debug_raw: Vec<u8> = Vec::new();
         let mut interrupted: Option<String> = None;
         let mut saw_done = false;
+        let mut idle = util::IdleTracker::new(std::time::Instant::now());
         loop {
             let chunk = match byte_stream.next().await {
                 Some(Ok(chunk)) => chunk,
@@ -1865,6 +2294,7 @@ async fn stream_openai(
                 Some(Err(e)) => { interrupted = Some(e.to_string()); break; }
                 None => break,
             };
+            idle.mark_now();
             if state.is_debug() { debug_raw.extend_from_slice(&chunk); }
             for line in lines.push(&chunk) {
                 let Some(data) = util::sse_data(&line) else { continue };
@@ -1877,8 +2307,7 @@ async fn stream_openai(
                 match serde_json::from_str::<Value>(data) {
                     Ok(v) => {
                         if let Some(u) = v.get("usage") {
-                            input_tokens = u.get("prompt_tokens").and_then(|t| t.as_u64()).unwrap_or(input_tokens);
-                            output_tokens = u.get("completion_tokens").and_then(|t| t.as_u64()).unwrap_or(output_tokens);
+                            usage.merge_stream_update(util::openai_usage(u));
                         }
                         resp_size += data.len();
                         yield Ok(Bytes::from(format!("data: {data}\n\n")));
@@ -1904,8 +2333,7 @@ async fn stream_openai(
                 } else if !data.is_empty() {
                     if let Ok(v) = serde_json::from_str::<Value>(data) {
                         if let Some(u) = v.get("usage") {
-                            input_tokens = u.get("prompt_tokens").and_then(|t| t.as_u64()).unwrap_or(input_tokens);
-                            output_tokens = u.get("completion_tokens").and_then(|t| t.as_u64()).unwrap_or(output_tokens);
+                            usage.merge_stream_update(util::openai_usage(u));
                         }
                     }
                     resp_size += data.len();
@@ -1939,8 +2367,14 @@ async fn stream_openai(
             status_code: if interrupted.is_some() { 502 } else { status },
             request_size: req_size,
             response_size: resp_size,
-            input_tokens,
-            output_tokens,
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            output_tokens_final: None,
+            cache_read_input_tokens: usage.cache_read_input_tokens,
+            cache_creation_input_tokens: usage.cache_creation_input_tokens,
+            premium_multiplier: state.model_premium_multiplier(&translated).await,
+            upstream_idle_max_ms: Some(idle.max_idle_ms_including_now()),
+            keepalive_probes: None,
             duration: elapsed_secs(start),
             request_body: req_body,
             response_body: if state.is_debug() { Some(debug_resp) } else { None },
@@ -1950,11 +2384,13 @@ async fn stream_openai(
             stop_reason: interrupted.is_some().then(|| "stream_interrupted".to_string()),
             tools_called: None,
             is_agent_initiated: None,
-            prompt_cache_hit: None,
-            estimated_cost_usd: Some(calculate_cost(&translated, input_tokens, output_tokens)),
+            session_id: None,
+            prompt_cache_hit: cache_disposition(&usage),
+            failure_kind: None,
+            estimated_cost_usd: Some(calculate_cost(&translated, &usage)),
         });
     };
-    build_sse_response(stream)
+    build_sse_response(stream, COMMENT_KEEPALIVE_PROBE, probe_count.clone())
 }
 
 /// Streams an OpenAI Responses SSE stream back to the client verbatim while
@@ -1987,7 +2423,7 @@ async fn stream_responses(
     // A non-2xx upstream returns a JSON error body, not an SSE stream. Forward
     // it as a normal error response instead of wrapping it in a 200 "stream",
     // which would make clients treat an auth/quota failure as a valid answer.
-    if !(200..300).contains(&status) {
+    if !is_streamable_status(status) {
         let text = upstream.text().await.unwrap_or_default();
         log_debug_response(&state, "/v1/responses", &text);
         log_error("/v1/responses", &req, &text, status);
@@ -1996,22 +2432,26 @@ async fn stream_responses(
             text,
         );
     }
+    // Shared with the keepalive wrapper so the record can report how
+    // many probes actually went out during an upstream silence.
+    let probe_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let stream = async_stream::stream! {
         use futures_util::StreamExt;
         let mut byte_stream = upstream.bytes_stream();
         let mut lines = util::SseLineBuffer::new();
-        let mut input_tokens = 0u64;
-        let mut output_tokens = 0u64;
+        let mut usage = TokenUsage::default();
         let mut resp_size = 0usize;
         let mut debug_raw: Vec<u8> = Vec::new();
         let mut interrupted: Option<String> = None;
         let mut completed = false;
+        let mut idle = util::IdleTracker::new(std::time::Instant::now());
         loop {
             let chunk = match byte_stream.next().await {
                 Some(Ok(chunk)) => chunk,
                 Some(Err(e)) => { interrupted = Some(e.to_string()); break; }
                 None => break,
             };
+            idle.mark_now();
             resp_size += chunk.len();
             // Verbatim passthrough of raw bytes. Bytes are never re-decoded on
             // this path, so a multi-byte character split across chunks reaches
@@ -2024,9 +2464,8 @@ async fn stream_responses(
                 if let Ok(v) = serde_json::from_str::<Value>(data) {
                     if v.get("type").and_then(|t| t.as_str()) == Some("response.completed") {
                         completed = true;
-                        let usage = v.get("response").and_then(|r| r.get("usage")).cloned().unwrap_or(json!({}));
-                        input_tokens = usage.get("input_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
-                        output_tokens = usage.get("output_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+                        let raw = v.get("response").and_then(|r| r.get("usage")).cloned().unwrap_or(json!({}));
+                        usage = util::responses_usage(&raw);
                     }
                 }
             }
@@ -2060,8 +2499,14 @@ async fn stream_responses(
             status_code: if interrupted.is_some() { 502 } else { status },
             request_size: req_size,
             response_size: resp_size,
-            input_tokens,
-            output_tokens,
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            output_tokens_final: None,
+            cache_read_input_tokens: usage.cache_read_input_tokens,
+            cache_creation_input_tokens: usage.cache_creation_input_tokens,
+            premium_multiplier: state.model_premium_multiplier(&translated).await,
+            upstream_idle_max_ms: Some(idle.max_idle_ms_including_now()),
+            keepalive_probes: None,
             duration: elapsed_secs(start),
             request_body: req_body,
             response_body: if state.is_debug() { Some(debug_resp) } else { None },
@@ -2072,80 +2517,123 @@ async fn stream_responses(
                 .then(|| "stream_interrupted".to_string()),
             tools_called: None,
             is_agent_initiated: None,
-            prompt_cache_hit: None,
-            estimated_cost_usd: Some(calculate_cost(&translated, input_tokens, output_tokens)),
+            session_id: None,
+            prompt_cache_hit: cache_disposition(&usage),
+            failure_kind: None,
+            estimated_cost_usd: Some(calculate_cost(&translated, &usage)),
         });
     };
-    build_sse_response(stream)
+    build_sse_response(stream, COMMENT_KEEPALIVE_PROBE, probe_count.clone())
 }
 /// Streams a direct Anthropic SSE response back to the client verbatim.
-async fn stream_anthropic_direct(
-    state: SharedState,
-    upstream: reqwest::Response,
+/// Identity and bookkeeping for one request, threaded unchanged into whichever
+/// record it ends up producing.
+struct RequestMeta {
     original_model: String,
     translated: String,
     req_size: usize,
     req_body: Option<String>,
+    session_id: Option<String>,
     start: Instant,
+}
+
+async fn stream_anthropic_direct(
+    state: SharedState,
+    upstream: reqwest::Response,
+    meta: RequestMeta,
 ) -> Response {
+    let RequestMeta {
+        original_model,
+        translated,
+        req_size,
+        req_body,
+        session_id,
+        start,
+    } = meta;
     let status = upstream.status().as_u16();
+    // Without this the error body is wrapped in a 200 `text/event-stream`, so
+    // the client waits on a stream that never produces an event and reports a
+    // stalled response instead of the rate limit or auth failure that actually
+    // happened. The other three streaming paths already gate on this.
+    if !is_streamable_status(status) {
+        let text = upstream.text().await.unwrap_or_default();
+        log_debug_response(&state, "/v1/messages", &text);
+        log_error(
+            "/v1/messages",
+            &json!({"model": &translated}),
+            &text,
+            status,
+        );
+        record_failure(
+            &state,
+            "/v1/messages",
+            &translated,
+            Some(&translated),
+            status,
+            crate::store::failure::UPSTREAM_STATUS,
+            req_size,
+            req_body.clone(),
+            Some(text.clone()),
+            start,
+            session_id.clone(),
+        );
+        return passthrough_error(
+            StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+            text,
+        );
+    }
+    // Resolved before the stream starts: the recorder's Drop path is
+    // synchronous and cannot await.
+    let premium_multiplier = state.model_premium_multiplier(&translated).await;
+    // Shared with the keepalive wrapper so the record can report how
+    // many probes actually went out during an upstream silence.
+    let probe_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let mut recorder = StreamRecorder::new(
+        state.clone(),
+        "/v1/messages",
+        original_model,
+        translated,
+        req_size,
+        req_body,
+        premium_multiplier,
+        start,
+        probe_count.clone(),
+        session_id.clone(),
+    );
     let stream = async_stream::stream! {
         use futures_util::StreamExt;
         let mut byte_stream = upstream.bytes_stream();
-        let mut input_tokens = 0u64;
-        let mut output_tokens = 0u64;
-        let mut resp_size = 0usize;
         let mut lines = util::SseLineBuffer::new();
-        let mut debug_raw: Vec<u8> = Vec::new();
         let mut interrupted: Option<String> = None;
-        let mut saw_message_stop = false;
-        let mut stop_reason: Option<String> = None;
-        let mut tools_called: Vec<String> = Vec::new();
+        let mut st = DirectStreamState::default();
         loop {
             let chunk = match byte_stream.next().await {
                 Some(Ok(chunk)) => chunk,
                 Some(Err(e)) => { interrupted = Some(e.to_string()); break; }
                 None => break,
             };
-            resp_size += chunk.len();
+            recorder.idle.mark_now();
+            recorder.resp_size += chunk.len();
             // Verbatim passthrough: the client receives the exact upstream
             // bytes, so characters split across chunks are never mangled.
             yield Ok::<Bytes, std::convert::Infallible>(Bytes::copy_from_slice(&chunk));
-            if state.is_debug() { debug_raw.extend_from_slice(&chunk); }
+            if state.is_debug() { recorder.debug_raw.extend_from_slice(&chunk); }
             for line in lines.push(&chunk) {
                 let Some(data) = util::sse_data(&line) else { continue };
                 if data.is_empty() { continue; }
                 let Ok(v) = serde_json::from_str::<Value>(data) else { continue };
-                match v.get("type").and_then(|t| t.as_str()) {
-                    Some("message_start") => {
-                        input_tokens = v.get("message").and_then(|m| m.get("usage")).and_then(|u| u.get("input_tokens")).and_then(|t| t.as_u64()).unwrap_or(0);
-                    }
-                    Some("message_delta") => {
-                        output_tokens = v.get("usage").and_then(|u| u.get("output_tokens")).and_then(|t| t.as_u64()).unwrap_or(output_tokens);
-                        if let Some(sr) = v.get("delta").and_then(|d| d.get("stop_reason")).and_then(|s| s.as_str()) {
-                            stop_reason = Some(sr.to_string());
-                        }
-                    }
-                    Some("content_block_start") => {
-                        if let Some(block) = v.get("content_block") {
-                            if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
-                                if let Some(name) = block.get("name").and_then(|n| n.as_str()) {
-                                    if !tools_called.iter().any(|t| t == name) {
-                                        tools_called.push(name.to_string());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Some("message_stop") => saw_message_stop = true,
-                    _ => {}
-                }
+                st.observe(&v);
+                // Mirrored onto the recorder because a client disconnect drops
+                // this generator: `Drop` can only report what the recorder
+                // itself holds.
+                recorder.usage = st.usage;
+                recorder.usage_final = st.usage_final;
             }
         }
         // Anthropic clients wait for `message_stop`. Without it they either
         // hang or record the partial text as a completed assistant turn, which
         // then poisons every following request in the conversation.
-        if interrupted.is_some() || !saw_message_stop {
+        if interrupted.is_some() || !st.saw_message_stop {
             let reason = interrupted
                 .clone()
                 .unwrap_or_else(|| "upstream closed the stream before message_stop".to_string());
@@ -2158,35 +2646,22 @@ async fn stream_anthropic_direct(
                 }
             });
             yield Ok(Bytes::from(format!("event: error\ndata: {err}\n\n")));
-            stop_reason = Some("stream_interrupted".to_string());
+            st.stop_reason = Some("stream_interrupted".to_string());
         }
-        let debug_resp = String::from_utf8_lossy(&debug_raw).into_owned();
+        let debug_resp = String::from_utf8_lossy(&recorder.debug_raw).into_owned();
         log_debug_response(&state, "/v1/messages", &debug_resp);
-        state.store.add(RequestRecord {
-            id: uuid::Uuid::new_v4().to_string(),
-            timestamp: now_iso(),
-            endpoint: "/v1/messages".to_string(),
-            model: original_model.clone(),
-            translated_model: (translated != original_model).then_some(translated.clone()),
-            status_code: if interrupted.is_some() { 502 } else { status },
-            request_size: req_size,
-            response_size: resp_size,
-            input_tokens,
-            output_tokens,
-            duration: elapsed_secs(start),
-            request_body: req_body,
-            response_body: if state.is_debug() { Some(debug_resp) } else { None },
-            message_count: None,
-            tool_count: None,
-            tool_names: None,
-            stop_reason,
-            tools_called: (!tools_called.is_empty()).then_some(tools_called),
-            is_agent_initiated: None,
-            prompt_cache_hit: None,
-            estimated_cost_usd: Some(calculate_cost(&translated, input_tokens, output_tokens)),
-        });
+        if let Some(r) = recorder.record_mut() {
+            r.tools_called = (!st.tools_called.is_empty()).then_some(st.tools_called);
+        }
+        recorder.finalize(
+            if interrupted.is_some() { 502 } else { status },
+            (interrupted.is_some() || !st.saw_message_stop)
+                .then_some(crate::store::failure::STREAM_INTERRUPTED),
+            st.stop_reason,
+            state.is_debug().then_some(debug_resp),
+        );
     };
-    build_sse_response(stream)
+    build_sse_response(stream, ANTHROPIC_KEEPALIVE_PROBE, probe_count.clone())
 }
 
 /// Streams an OpenAI chat-completions SSE stream translated into Anthropic
@@ -2201,6 +2676,7 @@ async fn stream_anthropic_translated(
     translated: String,
     req_size: usize,
     start: Instant,
+    session_id: Option<String>,
 ) -> Response {
     let req_body = state
         .is_debug()
@@ -2218,7 +2694,7 @@ async fn stream_anthropic_translated(
     };
     let status = upstream.status().as_u16();
     // Surface a non-2xx upstream (JSON error, not SSE) as a normal error.
-    if !(200..300).contains(&status) {
+    if !is_streamable_status(status) {
         let text = upstream.text().await.unwrap_or_default();
         log_debug_response(&state, "/v1/messages", &text);
         log_error(
@@ -2227,28 +2703,45 @@ async fn stream_anthropic_translated(
             &text,
             status,
         );
+        record_failure(
+            &state,
+            "/v1/messages",
+            &translated,
+            Some(&translated),
+            status,
+            crate::store::failure::UPSTREAM_STATUS,
+            req_size,
+            req_body.clone(),
+            Some(text.clone()),
+            start,
+            session_id.clone(),
+        );
         return passthrough_error(
             StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
             text,
         );
     }
+    // Shared with the keepalive wrapper so the record can report how
+    // many probes actually went out during an upstream silence.
+    let probe_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let stream = async_stream::stream! {
         use futures_util::StreamExt;
         let mut byte_stream = upstream.bytes_stream();
         let mut lines = util::SseLineBuffer::new();
         let mut conv = AnthropicStreamState::new();
         let mut chunks: Vec<Value> = Vec::new();
-        let mut input_tokens = 0u64;
-        let mut output_tokens = 0u64;
+        let mut usage = TokenUsage::default();
         let mut resp_size = 0usize;
         let mut debug_raw: Vec<u8> = Vec::new();
         let mut interrupted: Option<String> = None;
+        let mut idle = util::IdleTracker::new(std::time::Instant::now());
         loop {
             let chunk = match byte_stream.next().await {
                 Some(Ok(chunk)) => chunk,
                 Some(Err(e)) => { interrupted = Some(e.to_string()); break; }
                 None => break,
             };
+            idle.mark_now();
             if state.is_debug() { debug_raw.extend_from_slice(&chunk); }
             for line in lines.push(&chunk) {
                 let Some(data) = util::sse_data(&line) else { continue };
@@ -2258,8 +2751,7 @@ async fn stream_anthropic_translated(
                     continue;
                 };
                 if let Some(u) = v.get("usage") {
-                    input_tokens = u.get("prompt_tokens").and_then(|t| t.as_u64()).unwrap_or(input_tokens);
-                    output_tokens = u.get("completion_tokens").and_then(|t| t.as_u64()).unwrap_or(output_tokens);
+                    usage.merge_stream_update(util::openai_usage(u));
                 }
                 chunks.push(v.clone());
                 for event in conv.process(&v) {
@@ -2297,11 +2789,10 @@ async fn stream_anthropic_translated(
             yield Ok(Bytes::from(format!("event: error\ndata: {err}\n\n")));
         }
         // Fall back to merged usage if streaming chunks did not carry usage.
-        if input_tokens == 0 && output_tokens == 0 {
+        if usage.input_tokens == 0 && usage.output_tokens == 0 {
             let merged = anthropic::merge_chat_chunks(&chunks);
-            if let Some(usage) = merged.get("usage") {
-                input_tokens = usage.get("prompt_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
-                output_tokens = usage.get("completion_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+            if let Some(raw) = merged.get("usage") {
+                usage = util::openai_usage(raw);
             }
         }
         let debug_resp = String::from_utf8_lossy(&debug_raw).into_owned();
@@ -2315,8 +2806,14 @@ async fn stream_anthropic_translated(
             status_code: if interrupted.is_some() { 502 } else { status },
             request_size: req_size,
             response_size: resp_size,
-            input_tokens,
-            output_tokens,
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            output_tokens_final: None,
+            cache_read_input_tokens: usage.cache_read_input_tokens,
+            cache_creation_input_tokens: usage.cache_creation_input_tokens,
+            premium_multiplier: state.model_premium_multiplier(&translated).await,
+            upstream_idle_max_ms: Some(idle.max_idle_ms_including_now()),
+            keepalive_probes: None,
             duration: elapsed_secs(start),
             request_body: req_body,
             response_body: if state.is_debug() { Some(debug_resp) } else { None },
@@ -2326,11 +2823,13 @@ async fn stream_anthropic_translated(
             stop_reason: synthesized_stop.then(|| stop_reason.to_string()),
             tools_called: None,
             is_agent_initiated: None,
-            prompt_cache_hit: None,
-            estimated_cost_usd: Some(calculate_cost(&translated, input_tokens, output_tokens)),
+            session_id: None,
+            prompt_cache_hit: cache_disposition(&usage),
+            failure_kind: None,
+            estimated_cost_usd: Some(calculate_cost(&translated, &usage)),
         });
     };
-    build_sse_response(stream)
+    build_sse_response(stream, ANTHROPIC_KEEPALIVE_PROBE, probe_count.clone())
 }
 
 /// How long a stream may stay silent before a keepalive comment is emitted.
@@ -2349,8 +2848,64 @@ const SSE_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 /// before anything has been sent — because the verbatim passthrough paths yield
 /// raw upstream chunks and splicing a comment into a half-written event would
 /// corrupt it.
+/// Keepalive probe for the Anthropic Messages protocol.
+///
+/// Anthropic's own streaming API emits `ping` events during long silences, and
+/// clients reset their idle watchdog on *events*. An SSE comment is discarded
+/// by the parser per spec, so it keeps the TCP connection and intermediaries
+/// alive while never reaching the application — which is how a connection that
+/// is provably still flowing bytes gets aborted as `Response stalled
+/// mid-stream`. Measured against the real upstream: GitHub Copilot's Anthropic
+/// endpoint never emits a ping of its own, so this probe is the only keepalive
+/// signal on the link.
+const ANTHROPIC_KEEPALIVE_PROBE: &[u8] = b"event: ping\ndata: {\"type\":\"ping\"}\n\n";
+
+/// Keepalive probe for protocols that have no ping event of their own (OpenAI
+/// chat completions, OpenAI Responses, Gemini). A comment is the only thing
+/// guaranteed not to be mistaken for content by those parsers.
+const COMMENT_KEEPALIVE_PROBE: &[u8] = b": keepalive\n\n";
+
 fn keepalive<S>(
     stream: S,
+    probe: &'static [u8],
+    counter: std::sync::Arc<std::sync::atomic::AtomicU32>,
+) -> impl futures_util::Stream<Item = Result<Bytes, std::convert::Infallible>>
+where
+    S: futures_util::Stream<Item = Result<Bytes, std::convert::Infallible>> + Send + 'static,
+{
+    keepalive_with_interval(stream, SSE_KEEPALIVE_INTERVAL, probe, counter)
+}
+
+/// Byte offset just past the last **complete** SSE event in `buf`, or `None`
+/// when `buf` does not yet contain a whole event.
+fn last_event_boundary(buf: &[u8]) -> Option<usize> {
+    let lf = buf.windows(2).rposition(|w| w == b"\n\n").map(|i| i + 2);
+    let crlf = buf
+        .windows(4)
+        .rposition(|w| w == b"\r\n\r\n")
+        .map(|i| i + 4);
+    lf.max(crlf)
+}
+
+/// Keepalive with an injectable interval so the stall behavior is testable
+/// without waiting out the production interval.
+///
+/// Upstream chunks are re-aligned to event boundaries: bytes that do not yet
+/// complete an event are held back rather than forwarded. That is what makes
+/// the keepalive unconditional — everything already sent downstream ends on a
+/// blank line, so a comment can never land inside a half-written event.
+///
+/// The previous implementation forwarded chunks verbatim and only emitted a
+/// keepalive when the *last chunk* happened to end on a boundary. A TCP split
+/// mid-event left that flag stuck `false` — and since only a new chunk could
+/// clear it, an upstream that went quiet right then silenced the keepalive for
+/// as long as it stayed quiet. The client saw zero bytes and aborted the
+/// stream, which surfaced as `Response stalled mid-stream`.
+fn keepalive_with_interval<S>(
+    stream: S,
+    interval: Duration,
+    probe: &'static [u8],
+    counter: std::sync::Arc<std::sync::atomic::AtomicU32>,
 ) -> impl futures_util::Stream<Item = Result<Bytes, std::convert::Infallible>>
 where
     S: futures_util::Stream<Item = Result<Bytes, std::convert::Infallible>> + Send + 'static,
@@ -2358,42 +2913,50 @@ where
     async_stream::stream! {
         use futures_util::StreamExt;
         let mut inner = Box::pin(stream);
-        // True while the last bytes written ended an SSE event.
-        let mut at_boundary = true;
+        // Upstream bytes not yet forming a complete event.
+        let mut partial: Vec<u8> = Vec::new();
         loop {
             tokio::select! {
                 biased;
                 item = inner.next() => {
                     match item {
-                        Some(chunk) => {
-                            if let Ok(bytes) = &chunk {
-                                at_boundary = ends_at_event_boundary(bytes);
+                        Some(Ok(bytes)) => {
+                            partial.extend_from_slice(&bytes);
+                            if let Some(cut) = last_event_boundary(&partial) {
+                                let whole: Vec<u8> = partial.drain(..cut).collect();
+                                yield Ok(Bytes::from(whole));
                             }
-                            yield chunk;
                         }
+                        Some(Err(e)) => yield Err(e),
                         None => break,
                     }
                 }
-                _ = tokio::time::sleep(SSE_KEEPALIVE_INTERVAL) => {
-                    if at_boundary {
-                        yield Ok(Bytes::from_static(b": keepalive\n\n"));
-                    }
+                _ = tokio::time::sleep(interval) => {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    yield Ok(Bytes::from_static(probe));
                 }
             }
+        }
+        // A final event that never received its blank line is still real data.
+        if !partial.is_empty() {
+            yield Ok(Bytes::from(partial));
         }
     }
 }
 
-/// Whether a chunk ends on an SSE event boundary (a blank line).
-fn ends_at_event_boundary(bytes: &[u8]) -> bool {
-    bytes.ends_with(b"\n\n") || bytes.ends_with(b"\r\n\r\n")
-}
-
-fn build_sse_response<S>(stream: S) -> Response
+/// Wraps an SSE stream in a response, injecting `probe` during upstream
+/// silences. The probe is protocol-specific — see the two `*_KEEPALIVE_PROBE`
+/// constants; sending the wrong one either breaks the client's parser or fails
+/// to reset its idle watchdog.
+fn build_sse_response<S>(
+    stream: S,
+    probe: &'static [u8],
+    counter: std::sync::Arc<std::sync::atomic::AtomicU32>,
+) -> Response
 where
     S: futures_util::Stream<Item = Result<Bytes, std::convert::Infallible>> + Send + 'static,
 {
-    let body = Body::from_stream(keepalive(stream));
+    let body = Body::from_stream(keepalive(stream, probe, counter));
     let mut resp = Response::new(body);
     *resp.headers_mut() = sse_headers();
     resp
@@ -2543,6 +3106,9 @@ async fn metrics_openmetrics(State(state): State<SharedState>) -> Response {
     let mut req_total_by_labels: HashMap<(String, u16, String), u64> = HashMap::new();
     let mut in_tokens_by_model: HashMap<String, u64> = HashMap::new();
     let mut out_tokens_by_model: HashMap<String, u64> = HashMap::new();
+    let mut cache_read_by_model: HashMap<String, u64> = HashMap::new();
+    let mut cache_creation_by_model: HashMap<String, u64> = HashMap::new();
+    let mut premium_by_model: HashMap<String, f64> = HashMap::new();
     let mut duration_sum_by_endpoint: HashMap<String, f64> = HashMap::new();
     let mut duration_count_by_endpoint: HashMap<String, u64> = HashMap::new();
     let mut cost_total = 0.0_f64;
@@ -2560,6 +3126,12 @@ async fn metrics_openmetrics(State(state): State<SharedState>) -> Response {
                 .entry((rec.endpoint.clone(), rec.status_code, model.clone()))
                 .or_insert(0) += 1;
             *in_tokens_by_model.entry(model.clone()).or_insert(0) += rec.input_tokens;
+            *cache_read_by_model.entry(model.clone()).or_insert(0) += rec.cache_read_input_tokens;
+            *cache_creation_by_model.entry(model.clone()).or_insert(0) +=
+                rec.cache_creation_input_tokens;
+            if let Some(multiplier) = rec.premium_multiplier {
+                *premium_by_model.entry(model.clone()).or_insert(0.0) += multiplier;
+            }
             *out_tokens_by_model.entry(model).or_insert(0) += rec.output_tokens;
             *duration_sum_by_endpoint
                 .entry(rec.endpoint.clone())
@@ -2605,6 +3177,42 @@ async fn metrics_openmetrics(State(state): State<SharedState>) -> Response {
     for (model, total) in out_tokens_by_model {
         out.push_str(&format!(
             "ghc_proxy_output_tokens_total{{model=\"{}\"}} {}\n",
+            metrics_label_escape(&model),
+            total
+        ));
+    }
+
+    out.push_str(
+        "# HELP ghc_proxy_cache_read_tokens_total Input tokens served from the prompt cache.\n",
+    );
+    out.push_str("# TYPE ghc_proxy_cache_read_tokens_total counter\n");
+    for (model, total) in cache_read_by_model {
+        out.push_str(&format!(
+            "ghc_proxy_cache_read_tokens_total{{model=\"{}\"}} {}\n",
+            metrics_label_escape(&model),
+            total
+        ));
+    }
+
+    out.push_str(
+        "# HELP ghc_proxy_cache_creation_tokens_total Input tokens written into the prompt cache.\n",
+    );
+    out.push_str("# TYPE ghc_proxy_cache_creation_tokens_total counter\n");
+    for (model, total) in cache_creation_by_model {
+        out.push_str(&format!(
+            "ghc_proxy_cache_creation_tokens_total{{model=\"{}\"}} {}\n",
+            metrics_label_escape(&model),
+            total
+        ));
+    }
+
+    out.push_str(
+        "# HELP ghc_proxy_premium_requests_total Copilot premium requests consumed, per the catalog's billing multiplier.\n",
+    );
+    out.push_str("# TYPE ghc_proxy_premium_requests_total counter\n");
+    for (model, total) in premium_by_model {
+        out.push_str(&format!(
+            "ghc_proxy_premium_requests_total{{model=\"{}\"}} {:.4}\n",
             metrics_label_escape(&model),
             total
         ));
@@ -2726,7 +3334,28 @@ async fn api_requests(
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
     let (page, per_page, offset) = parse_pagination(&params);
-    let (items, total) = state.store.recent(per_page, offset);
+    // `failed=true` narrows to requests that never produced a usable answer —
+    // the ones worth looking at when something went wrong.
+    let failed_only = params.get("failed").map(|v| v == "true").unwrap_or(false);
+    // Several clients share one proxy, so isolating a single session is the
+    // difference between reading a log and guessing at one.
+    let session = params.get("session").map(|s| s.as_str());
+    let (items, total) = if failed_only || session.is_some() {
+        state.store.filtered_page(per_page, offset, |r| {
+            if failed_only && r.status_code < 400 && r.failure_kind.is_none() {
+                return false;
+            }
+            match session {
+                Some(want) => r
+                    .session_id
+                    .as_deref()
+                    .is_some_and(|id| id.starts_with(want)),
+                None => true,
+            }
+        })
+    } else {
+        state.store.recent(per_page, offset)
+    };
     let total_pages = total.div_ceil(per_page);
     Json(json!({
         "items": items,
@@ -2804,6 +3433,10 @@ async fn api_audit_summary(State(state): State<SharedState>) -> Response {
     let mut cache_hit_count = 0usize;
     let mut cache_write_count = 0usize;
     let mut record_count = 0usize;
+    let mut total_input_tokens = 0u64;
+    let mut total_cache_read_tokens = 0u64;
+    let mut total_cache_creation_tokens = 0u64;
+    let mut premium_requests = 0.0_f64;
 
     state.store.with_records(|records| {
         for rec in records {
@@ -2836,6 +3469,16 @@ async fn api_audit_summary(State(state): State<SharedState>) -> Response {
             } else if rec.prompt_cache_hit == Some(false) {
                 cache_write_count += 1;
             }
+
+            // Token-level cache accounting. The per-request counters above
+            // only say how many turns touched the cache; these say how much of
+            // the prompt volume it actually absorbed.
+            total_input_tokens += rec.input_tokens;
+            total_cache_read_tokens += rec.cache_read_input_tokens;
+            total_cache_creation_tokens += rec.cache_creation_input_tokens;
+            if let Some(multiplier) = rec.premium_multiplier {
+                premium_requests += multiplier;
+            }
         }
     });
 
@@ -2857,17 +3500,80 @@ async fn api_audit_summary(State(state): State<SharedState>) -> Response {
         "stop_reasons": stop_reasons_sorted,
         "cache_hits": cache_hit_count,
         "cache_writes": cache_write_count,
-        "cache_hit_rate": if cache_hit_count + cache_write_count > 0 {
-            (cache_hit_count as f64 / (cache_hit_count + cache_write_count) as f64 * 100.0).round() / 100.0
-        } else {
-            0.0
-        },
+        // Share of requests that read from cache — a per-request count, not a
+        // token volume. Both rates below are 0–1 fractions.
+        "cache_hit_rate": ratio_2dp(
+            cache_hit_count as f64,
+            (cache_hit_count + cache_write_count) as f64,
+        ),
+        "total_input_tokens": total_input_tokens,
+        "total_cache_read_tokens": total_cache_read_tokens,
+        "total_cache_creation_tokens": total_cache_creation_tokens,
+        // Share of total prompt volume served from cache, which is what
+        // actually drives cost and latency — unlike the per-request rate above.
+        "token_cache_hit_rate": ratio_2dp(
+            total_cache_read_tokens as f64,
+            total_input_tokens as f64,
+        ),
+        "premium_requests": (premium_requests * 100.0).round() / 100.0,
     }))
     .into_response()
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn output_tokens_stay_provisional_until_message_delta() {
+        let mut st = super::DirectStreamState::default();
+        // `message_start` opens with a placeholder output count. A stream cut
+        // short here (client stall abort) would otherwise publish "3" as the
+        // output of a turn that went on to emit 35899 — the exact numbers from
+        // the stalled Write call this guard exists for.
+        st.observe(&serde_json::json!({
+            "type": "message_start",
+            "message": {"usage": {
+                "input_tokens": 2,
+                "cache_read_input_tokens": 342437,
+                "cache_creation_input_tokens": 6044,
+                "output_tokens": 3
+            }}
+        }));
+        assert!(!st.usage_final);
+        assert_eq!(st.usage.output_tokens, 3);
+        assert_eq!(st.usage.input_tokens, 2 + 342437 + 6044);
+
+        st.observe(&serde_json::json!({
+            "type": "message_delta",
+            "usage": {"output_tokens": 35899},
+            "delta": {"stop_reason": "tool_use"}
+        }));
+        assert!(st.usage_final);
+        assert_eq!(st.usage.output_tokens, 35899);
+        // `message_delta` restates output only; the input buckets captured at
+        // `message_start` must survive it.
+        assert_eq!(st.usage.input_tokens, 2 + 342437 + 6044);
+        assert_eq!(st.stop_reason.as_deref(), Some("tool_use"));
+    }
+
+    #[test]
+    fn tool_names_are_collected_once_each() {
+        let mut st = super::DirectStreamState::default();
+        for _ in 0..2 {
+            st.observe(&serde_json::json!({
+                "type": "content_block_start",
+                "content_block": {"type": "tool_use", "name": "Write"}
+            }));
+        }
+        st.observe(&serde_json::json!({
+            "type": "content_block_start",
+            "content_block": {"type": "text"}
+        }));
+        assert_eq!(st.tools_called, vec!["Write"]);
+        assert!(!st.saw_message_stop);
+        st.observe(&serde_json::json!({"type": "message_stop"}));
+        assert!(st.saw_message_stop);
+    }
+
     use super::*;
     use axum::http::HeaderMap;
 
@@ -2945,11 +3651,355 @@ mod tests {
         assert_eq!(model_rates("something-new"), (0.0005, 0.0015));
     }
 
+    /// Minimal state for exercising the recording helpers.
+    fn test_state() -> SharedState {
+        std::sync::Arc::new(crate::state::AppState::new(
+            crate::config::Config::default(),
+            "test-token".into(),
+        ))
+    }
+
+    #[test]
+    fn record_failure_captures_a_request_that_never_produced_a_response() {
+        let state = test_state();
+        record_failure(
+            &state,
+            "/v1/messages",
+            "claude-opus-5",
+            Some("claude-opus-5"),
+            429,
+            crate::store::failure::UPSTREAM_STATUS,
+            1234,
+            None,
+            Some(r#"{"error":{"message":"rate limit"}}"#.into()),
+            Instant::now(),
+            Some("test-session".into()),
+        );
+        let (items, total) = state.store.recent(10, 0);
+        assert_eq!(total, 1, "a failed request must still be recorded");
+        let rec = &items[0];
+        assert_eq!(rec.status_code, 429);
+        assert_eq!(rec.failure_kind.as_deref(), Some("upstream_status"));
+        assert_eq!(rec.request_size, 1234);
+        // The error body is the whole point of the record, so it is kept even
+        // with debug off.
+        assert!(rec.response_body.as_deref().unwrap().contains("rate limit"));
+    }
+
+    #[test]
+    fn stream_recorder_records_a_client_disconnect_when_dropped_early() {
+        let state = test_state();
+        {
+            let mut rec = StreamRecorder::new(
+                state.clone(),
+                "/v1/messages",
+                "claude-opus-5".into(),
+                "claude-opus-5".into(),
+                500,
+                None,
+                None,
+                Instant::now(),
+                std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                Some("test-session".into()),
+            );
+            rec.resp_size = 4096;
+            rec.usage.output_tokens = 77;
+            rec.debug_raw
+                .extend_from_slice(b"event: message_start\ndata: {}\n\n");
+            // Deliberately no finalize() — this models axum dropping the
+            // response body when the client hangs up mid-stream.
+        }
+        let (items, total) = state.store.recent(10, 0);
+        assert_eq!(total, 1, "a client disconnect must leave a record behind");
+        let rec = &items[0];
+        assert_eq!(rec.status_code, 499);
+        assert_eq!(rec.failure_kind.as_deref(), Some("client_disconnected"));
+        // Whatever had streamed so far is preserved, not zeroed.
+        assert_eq!(rec.response_size, 4096);
+        assert_eq!(rec.output_tokens, 77);
+        // The partial upstream body is the main evidence for why the client
+        // gave up, so it must survive the disconnect too.
+        assert!(
+            rec.response_body
+                .as_deref()
+                .unwrap_or_default()
+                .contains("message_start"),
+            "partial response body lost on client disconnect"
+        );
+    }
+
+    #[test]
+    fn stream_recorder_does_not_double_record_after_finalize() {
+        let state = test_state();
+        {
+            let mut rec = StreamRecorder::new(
+                state.clone(),
+                "/v1/messages",
+                "claude-opus-5".into(),
+                "claude-opus-5".into(),
+                500,
+                None,
+                None,
+                Instant::now(),
+                std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                Some("test-session".into()),
+            );
+            rec.finalize(200, None, None, None);
+        } // Drop runs here and must be a no-op.
+        let (_, total) = state.store.recent(10, 0);
+        assert_eq!(
+            total, 1,
+            "finalize followed by drop must record exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn keepalive_probes_are_counted_for_diagnosis() {
+        use futures_util::StreamExt;
+        // A stalled stream is ambiguous after the fact: did the proxy stop
+        // signalling, or did the client ignore the signal? The counter is what
+        // separates the two, so it must track what actually went out.
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let upstream = futures_util::stream::pending::<Result<Bytes, std::convert::Infallible>>();
+        let mut out = Box::pin(keepalive_with_interval(
+            upstream,
+            Duration::from_millis(25),
+            ANTHROPIC_KEEPALIVE_PROBE,
+            counter.clone(),
+        ));
+        for _ in 0..3 {
+            let _ = tokio::time::timeout(Duration::from_millis(300), out.next()).await;
+        }
+        assert!(
+            counter.load(std::sync::atomic::Ordering::Relaxed) >= 3,
+            "expected at least 3 probes, counted {}",
+            counter.load(std::sync::atomic::Ordering::Relaxed)
+        );
+    }
+
+    #[test]
+    fn session_id_is_read_from_the_nested_metadata_string() {
+        // `metadata.user_id` is a JSON *string* holding another JSON object,
+        // so it takes two parses.
+        let req = json!({"metadata": {"user_id":
+            "{\"device_id\":\"d3427\",\"account_uuid\":\"\",\"session_id\":\"7dea551a-c9f5-4ba1\"}"}});
+        assert_eq!(
+            extract_session_id(&req).as_deref(),
+            Some("7dea551a-c9f5-4ba1")
+        );
+    }
+
+    #[test]
+    fn session_id_degrades_to_none_on_any_unexpected_shape() {
+        // This is diagnostic metadata — a malformed value must never take the
+        // request down with it.
+        for req in [
+            json!({}),
+            json!({"metadata": {}}),
+            json!({"metadata": {"user_id": "not json at all"}}),
+            json!({"metadata": {"user_id": 12345}}),
+            json!({"metadata": {"user_id": "{\"device_id\":\"x\"}"}}),
+            json!({"metadata": {"user_id": "{\"session_id\":null}"}}),
+            json!({"metadata": {"user_id": "{\"session_id\":\"\"}"}}),
+        ] {
+            assert_eq!(extract_session_id(&req), None, "req was {req}");
+        }
+    }
+
+    #[test]
+    fn keepalive_probes_are_wellformed_for_their_protocol() {
+        // Both must terminate an SSE block, or they fuse with the next event.
+        assert!(ANTHROPIC_KEEPALIVE_PROBE.ends_with(b"\n\n"));
+        assert!(COMMENT_KEEPALIVE_PROBE.ends_with(b"\n\n"));
+        // Anthropic clients reset their idle watchdog on *events*. A comment
+        // is discarded by the SSE parser and never reaches them, which is how
+        // a live connection still gets aborted as "stalled".
+        assert!(ANTHROPIC_KEEPALIVE_PROBE.starts_with(b"event: ping"));
+        assert!(!ANTHROPIC_KEEPALIVE_PROBE.starts_with(b":"));
+        // OpenAI and Gemini have no ping event; sending one would surface as
+        // an unknown event to their parsers, so those paths keep the comment.
+        assert!(COMMENT_KEEPALIVE_PROBE.starts_with(b":"));
+        // The ping payload must be valid JSON — clients parse `data:`.
+        let payload = std::str::from_utf8(ANTHROPIC_KEEPALIVE_PROBE)
+            .unwrap()
+            .lines()
+            .find_map(|l| l.strip_prefix("data: "))
+            .expect("ping carries a data line");
+        let v: Value = serde_json::from_str(payload).expect("ping data is valid JSON");
+        assert_eq!(v["type"], "ping");
+    }
+
+    #[tokio::test]
+    async fn anthropic_stall_emits_a_ping_event_rather_than_a_comment() {
+        use futures_util::StreamExt;
+        let upstream = futures_util::stream::pending::<Result<Bytes, std::convert::Infallible>>();
+        let mut out = Box::pin(keepalive_with_interval(
+            upstream,
+            Duration::from_millis(30),
+            ANTHROPIC_KEEPALIVE_PROBE,
+            std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        ));
+        let probe = tokio::time::timeout(Duration::from_millis(500), out.next())
+            .await
+            .expect("a probe must be emitted while the upstream is silent")
+            .unwrap()
+            .unwrap();
+        assert_eq!(&probe[..], ANTHROPIC_KEEPALIVE_PROBE);
+    }
+
+    #[tokio::test]
+    async fn non_anthropic_stall_keeps_using_a_comment() {
+        use futures_util::StreamExt;
+        let upstream = futures_util::stream::pending::<Result<Bytes, std::convert::Infallible>>();
+        let mut out = Box::pin(keepalive_with_interval(
+            upstream,
+            Duration::from_millis(30),
+            COMMENT_KEEPALIVE_PROBE,
+            std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        ));
+        let probe = tokio::time::timeout(Duration::from_millis(500), out.next())
+            .await
+            .expect("a probe must be emitted while the upstream is silent")
+            .unwrap()
+            .unwrap();
+        assert_eq!(&probe[..], b": keepalive\n\n");
+    }
+
+    #[test]
+    fn last_event_boundary_finds_the_end_of_the_final_complete_event() {
+        assert_eq!(last_event_boundary(b"data: a\n\n"), Some(9));
+        assert_eq!(last_event_boundary(b"data: a\r\n\r\n"), Some(11));
+        // Two events: the cut is after the second one.
+        assert_eq!(last_event_boundary(b"data: a\n\ndata: b\n\n"), Some(18));
+        // A trailing partial event is excluded from the cut.
+        assert_eq!(last_event_boundary(b"data: a\n\nevent: par"), Some(9));
+        // Nothing complete yet.
+        assert_eq!(last_event_boundary(b"event: par"), None);
+        assert_eq!(last_event_boundary(b""), None);
+    }
+
+    #[tokio::test]
+    async fn keepalive_still_fires_when_upstream_stalls_mid_event() {
+        use futures_util::StreamExt;
+        // One complete event followed by the first bytes of a second, then
+        // silence — exactly what a TCP split mid-event looks like when the
+        // model then goes quiet to think.
+        let upstream = futures_util::stream::iter(vec![Ok::<_, std::convert::Infallible>(
+            Bytes::from("event: content_block_delta\ndata: {}\n\nevent: content_bl"),
+        )])
+        .chain(futures_util::stream::pending());
+
+        let mut out = Box::pin(keepalive_with_interval(
+            upstream,
+            Duration::from_millis(30),
+            ANTHROPIC_KEEPALIVE_PROBE,
+            std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        ));
+
+        // Only the complete event is forwarded; the partial one is held back
+        // so the downstream byte stream stays on an event boundary.
+        let first = out.next().await.unwrap().unwrap();
+        assert_eq!(&first[..], b"event: content_block_delta\ndata: {}\n\n");
+
+        // The upstream is now parked mid-event. A keepalive MUST still be
+        // emitted — otherwise the connection goes fully silent and the client
+        // aborts with "Response stalled mid-stream".
+        let next = tokio::time::timeout(Duration::from_millis(500), out.next()).await;
+        assert!(
+            next.is_ok(),
+            "no keepalive emitted while upstream was stalled mid-event"
+        );
+        assert_eq!(
+            &next.unwrap().unwrap().unwrap()[..],
+            ANTHROPIC_KEEPALIVE_PROBE
+        );
+    }
+
+    #[test]
+    fn only_2xx_upstreams_are_streamed_as_sse() {
+        assert!(is_streamable_status(200));
+        assert!(is_streamable_status(299));
+        // These carry a JSON error body, not SSE. Streaming one yields a 200
+        // with no events, which surfaces to the user as a stalled stream
+        // rather than the actual auth/quota failure.
+        for status in [401, 403, 429, 500, 502, 503] {
+            assert!(!is_streamable_status(status), "status {status}");
+        }
+    }
+
+    #[test]
+    fn ratios_are_two_decimal_fractions_never_percentages() {
+        // Half the prompt volume served from cache.
+        assert_eq!(ratio_2dp(7203.0, 14434.0), 0.5);
+        // A realistic Claude Code session: 98% cached, expressed as 0.98 —
+        // the same scale as the per-request `cache_hit_rate` beside it, so
+        // the two are not silently on different units.
+        assert_eq!(ratio_2dp(101_940.0, 103_673.0), 0.98);
+        assert_eq!(ratio_2dp(1.0, 1.0), 1.0);
+        // A zero denominator must yield 0.0 rather than NaN, which would
+        // serialize as `null` and break consumers.
+        assert_eq!(ratio_2dp(0.0, 0.0), 0.0);
+        assert!(ratio_2dp(5.0, 0.0).is_finite());
+    }
+
     #[test]
     fn cost_scales_with_tokens() {
-        let cost = calculate_cost("claude-opus-4.8", 1000, 1000);
+        // With no caching involved the whole prompt bills at the base rate,
+        // exactly as before cache-aware pricing was introduced.
+        let usage = TokenUsage {
+            input_tokens: 1000,
+            output_tokens: 1000,
+            ..TokenUsage::default()
+        };
+        let cost = calculate_cost("claude-opus-4.8", &usage);
         assert!((cost - (0.015 + 0.075)).abs() < 1e-9);
-        assert_eq!(calculate_cost("gpt-4o", 0, 0), 0.0);
+        assert_eq!(calculate_cost("gpt-4o", &TokenUsage::default()), 0.0);
+    }
+
+    #[test]
+    fn cost_prices_cache_reads_and_writes_at_their_own_rates() {
+        // 3k prompt: 1k uncached, 1k read from cache, 1k written to cache.
+        let usage = TokenUsage {
+            input_tokens: 3000,
+            cache_read_input_tokens: 1000,
+            cache_creation_input_tokens: 1000,
+            output_tokens: 1000,
+        };
+        let (base_in, base_out) = model_rates("claude-opus-4.8");
+        let expected = base_in                      // uncached remainder
+            + base_in * CACHE_WRITE_RATE_MULTIPLIER // cache write premium
+            + base_in * CACHE_READ_RATE_MULTIPLIER  // cache read discount
+            + base_out;
+        let cost = calculate_cost("claude-opus-4.8", &usage);
+        assert!((cost - expected).abs() < 1e-9, "cost was {cost}");
+    }
+
+    #[test]
+    fn cached_prompts_cost_far_less_than_billing_them_at_full_rate() {
+        // The real shape of a Claude Code turn: ~98% of the prompt is a cache
+        // read. Charging the full input rate for all of it overstates the
+        // cost several times over.
+        let usage = TokenUsage {
+            input_tokens: 103_673,
+            cache_read_input_tokens: 101_940,
+            cache_creation_input_tokens: 1_731,
+            output_tokens: 561,
+        };
+        let cache_aware = calculate_cost("claude-opus-5", &usage);
+        let (base_in, base_out) = model_rates("claude-opus-5");
+        let naive =
+            (usage.input_tokens as f64 * base_in + usage.output_tokens as f64 * base_out) / 1000.0;
+        assert!(
+            cache_aware < naive,
+            "cache-aware {cache_aware} should be below naive {naive}"
+        );
+        // ...but still far above counting only the 2 uncached tokens, which is
+        // what the dashboard used to report.
+        let broken = (2.0 * base_in + usage.output_tokens as f64 * base_out) / 1000.0;
+        assert!(
+            cache_aware > broken * 2.0,
+            "cache-aware {cache_aware} should dwarf the uncached-only {broken}"
+        );
     }
 
     #[test]
@@ -3009,13 +4059,14 @@ mod tests {
     }
 
     #[test]
-    fn keepalive_only_injects_at_event_boundaries() {
-        assert!(ends_at_event_boundary(b"data: {}\n\n"));
-        assert!(ends_at_event_boundary(b"data: {}\r\n\r\n"));
-        // Mid-event: injecting here would corrupt the passthrough stream.
-        assert!(!ends_at_event_boundary(b"data: {\"partial\":"));
-        assert!(!ends_at_event_boundary(b"data: {}\n"));
-        assert!(!ends_at_event_boundary(b""));
+    fn keepalive_holds_back_a_partial_event_until_it_completes() {
+        // The old boundary check treated these as "unsafe to inject after".
+        // Now they are simply held back until the rest of the event arrives,
+        // so the downstream stream never sits mid-event.
+        assert_eq!(last_event_boundary(b"data: {\"partial\":"), None);
+        assert_eq!(last_event_boundary(b"data: {}\n"), None);
+        // Once the blank line lands, the whole event is released.
+        assert_eq!(last_event_boundary(b"data: {}\n\n"), Some(10));
     }
 
     #[test]

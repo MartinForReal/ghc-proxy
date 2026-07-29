@@ -22,18 +22,44 @@
     .caret { color: #8b949e; width: 1em; text-align: center; }
     .detail-row td { background: #010409; padding: 0; }
     .detail { padding: 0.75rem 1rem; display: grid; gap: 0.75rem; }
-    .detail h3 { margin: 0 0 0.25rem; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.05em; color: #8b949e; }
+    .detail h3 { margin: 0; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.05em; color: #8b949e; }
+    .body-head { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; margin-bottom: 0.25rem; }
+    .copy-btn { background: transparent; border: 1px solid #30363d; border-radius: 5px; padding: 0.25rem 0.4rem; color: #8b949e; line-height: 0; cursor: pointer; }
+    .copy-btn:hover { color: #e6edf3; border-color: #8b949e; background: #21262d; }
+    .copy-btn.copied { color: #3fb950; border-color: #3fb950; }
     pre { margin: 0; max-height: 360px; overflow: auto; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; padding: 0.75rem; font-size: 0.8rem; white-space: pre-wrap; word-break: break-word; }
     .muted { color: #8b949e; font-style: italic; padding: 0.75rem 1rem; }
+    .cache-rate { color: #8b949e; font-size: 0.9em; }
+    .unknown { color: #8b949e; }
+    .idle-hot { color: #d29922; font-weight: 600; }
+    .sess { color: #58a6ff; cursor: pointer; font-family: ui-monospace, monospace; }
+    .sess:hover { text-decoration: underline; }
+    .fail-kind { color: #f85149; font-size: 0.75em; opacity: 0.85; margin-top: 2px; }
+    tr.row-failed td { background: #2d1214; }
+    tr.row-failed:hover td { background: #3d181b; }
+    .toolbar { display: flex; gap: 0.75rem; align-items: center; margin-bottom: 0.75rem; font-size: 0.85rem; color: #8b949e; }
+    .toolbar label { display: flex; gap: 0.35rem; align-items: center; cursor: pointer; }
   </style>
 </head>
 <body>
   <h1>Requests <a href="/" style="font-size:0.8rem">← Dashboard</a></h1>
+  <div class="toolbar">
+    <label><input type="checkbox" id="failedOnly" /> Failures only</label>
+    <span id="sessFilter"></span>
+    <span id="filterHint"></span>
+  </div>
   <table>
     <thead>
       <tr>
-        <th></th><th>Time</th><th>Endpoint</th><th>Model</th><th>Status</th>
-        <th>In</th><th>Out</th><th>Duration</th>
+        <th></th><th>Time</th>
+        <th title="Client session (from metadata.user_id). Click to filter to just this session.">Session</th>
+        <th>Endpoint</th><th>Model</th><th>Status</th>
+        <th title="Total prompt tokens, with the share served from cache">In</th>
+        <th title="Prompt tokens written into the cache by this request — the new content of this turn">New</th>
+        <th>Out</th>
+        <th title="Longest silence between two upstream chunks. Large = the upstream went quiet; small = it kept sending and any stall was downstream.">Idle</th>
+        <th title="Keepalive probes the proxy wrote to the client. Pair with Idle: long idle + probes sent means the proxy kept signalling and the client ignored it; long idle + 0 probes means the keepalive itself failed.">Probes</th>
+        <th>Duration</th>
       </tr>
     </thead>
     <tbody id="rows"></tbody>
@@ -56,7 +82,84 @@
       if (s == null) return null;
       try { return JSON.stringify(JSON.parse(s), null, 2); } catch (e) { return s; }
     }
+    // Compact token counts: 103673 -> "103.7k". Raw six-digit numbers in a
+    // dense table are hard to compare at a glance.
+    function compactTokens(n) {
+      if (n == null) return '0';
+      if (n < 1000) return String(n);
+      if (n < 1000000) return (n / 1000).toFixed(1) + 'k';
+      return (n / 1000000).toFixed(2) + 'M';
+    }
+    // "103.7k (98%)" — total prompt size plus how much of it came from cache.
+    // The hit rate is the early warning for a broken cache prefix: it should
+    // sit high and stable, and a sudden drop means the prompt stopped
+    // matching and every turn is paying full price again.
+    function formatInput(r) {
+      const total = r.input_tokens ?? 0;
+      const read = r.cache_read_input_tokens ?? 0;
+      if (total === 0) return '0';
+      if (read === 0) return compactTokens(total);
+      const pct = Math.round(read / total * 100);
+      return `${compactTokens(total)} <span class="cache-rate">(${pct}%)</span>`;
+    }
+    // `output_tokens` only becomes authoritative when the upstream's closing
+    // `message_delta` arrives. A stream cut short before that leaves the
+    // opening placeholder from `message_start` — 3, for a turn that went on to
+    // emit 35899 — so show a dash rather than a number that reads as fact.
+    function formatOutput(r) {
+      if (r.output_tokens_final === false) {
+        return '<span class="unknown" title="Upstream never sent the closing message_delta, so the real output count is unknown">—</span>';
+      }
+      return r.output_tokens;
+    }
+    // Inline SVGs rather than emoji: clipboard/check glyphs render wildly
+    // differently across platforms, and these inherit the button's color.
+    const ICON_COPY = '<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="5.75" y="5.75" width="8.5" height="9.5" rx="1.5"/><path d="M3.25 10.25h-.5a1.5 1.5 0 01-1.5-1.5v-6a1.5 1.5 0 011.5-1.5h6a1.5 1.5 0 011.5 1.5v.5"/></svg>';
+    const ICON_DONE = '<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 8.5l3.5 3.5 7.5-8"/></svg>';
+
+    function bodyBlock(title, content) {
+      return `<div class="body-block">
+                <div class="body-head">
+                  <h3>${title}</h3>
+                  <button class="copy-btn" title="Copy ${title.toLowerCase()}">${ICON_COPY}</button>
+                </div>
+                <pre>${escapeHtml(content ?? '(none)')}</pre>
+              </div>`;
+    }
+
+    let lastSignature = '';
+
+    // Longest upstream silence. This is the number that assigns blame when a
+    // stream stalls: a large value means the upstream went quiet, a small one
+    // means it kept sending and the stall was downstream of the proxy.
+    // Highlighted past 60s, which is where intermediaries start dropping
+    // idle connections.
+    function formatIdle(r) {
+      const ms = r.upstream_idle_max_ms;
+      if (ms == null) return '—';
+      const s = ms / 1000;
+      const txt = s < 10 ? s.toFixed(1) + 's' : Math.round(s) + 's';
+      return s >= 60 ? `<span class="idle-hot">${txt}</span>` : txt;
+    }
     function render(data) {
+      // Records are immutable once stored, so an identical id list means
+      // nothing on screen would change. Skipping the rebuild entirely keeps
+      // text selection and scroll position untouched while the user reads.
+      const signature = `${data.page}|${data.total}|${(data.items || []).map(r => r.id).join(',')}`;
+      if (signature === lastSignature) return;
+      lastSignature = signature;
+
+      // The 5s auto-refresh rebuilds this table wholesale, which resets the
+      // scroll offset of any expanded body the user is in the middle of
+      // reading. Snapshot those offsets and put them back afterwards.
+      const scrollTops = new Map();
+      document.querySelectorAll('tr.detail-row').forEach(tr => {
+        const id = tr.getAttribute('data-detail');
+        tr.querySelectorAll('pre').forEach((pre, i) => {
+          if (pre.scrollTop > 0) scrollTops.set(`${id}:${i}`, pre.scrollTop);
+        });
+      });
+
       const rows = (data.items || []).map(r => {
         const ok = r.status_code >= 200 && r.status_code < 400;
         const model = r.translated_model ? `${r.model} → ${r.translated_model}` : r.model;
@@ -65,23 +168,63 @@
         const hasBody = r.request_body != null || r.response_body != null;
         const detail = hasBody
           ? `<div class="detail">
-               <div><h3>Request body</h3><pre>${escapeHtml(pretty(r.request_body) ?? '(none)')}</pre></div>
-               <div><h3>Response body</h3><pre>${escapeHtml(pretty(r.response_body) ?? '(none)')}</pre></div>
+               ${bodyBlock('Request body', pretty(r.request_body))}
+               ${bodyBlock('Response body', pretty(r.response_body))}
              </div>`
           : `<div class="muted">No body captured. Run the proxy with debug enabled (--debug) to record request/response bodies.</div>`;
-        return `<tr class="req-row" data-id="${escapeHtml(id)}">
+        return `<tr class="req-row${ok ? '' : ' row-failed'}" data-id="${escapeHtml(id)}">
           <td class="caret">${open ? '▾' : '▸'}</td>
           <td>${escapeHtml(r.timestamp)}</td>
+          <td>${r.session_id ? `<span class="sess" data-sess="${escapeHtml(r.session_id)}" title="${escapeHtml(r.session_id)}">${escapeHtml(r.session_id.slice(0,8))}</span>` : '—'}</td>
           <td>${escapeHtml(r.endpoint)}</td>
           <td>${escapeHtml(model)}</td>
-          <td class="${ok ? 'status-ok' : 'status-err'}">${r.status_code}</td>
-          <td>${r.input_tokens}</td>
-          <td>${r.output_tokens}</td>
+          <td class="${ok ? 'status-ok' : 'status-err'}">${r.status_code}${r.failure_kind ? `<div class="fail-kind">${escapeHtml(r.failure_kind)}</div>` : ''}</td>
+          <td>${formatInput(r)}</td>
+          <td>${compactTokens(r.cache_creation_input_tokens ?? 0)}</td>
+          <td>${formatOutput(r)}</td>
+          <td>${formatIdle(r)}</td>
+          <td>${r.keepalive_probes ?? '—'}</td>
           <td>${r.duration}s</td>
         </tr>
-        <tr class="detail-row" data-detail="${escapeHtml(id)}" style="display:${open ? 'table-row' : 'none'}"><td colspan="8">${detail}</td></tr>`;
+        <tr class="detail-row" data-detail="${escapeHtml(id)}" style="display:${open ? 'table-row' : 'none'}"><td colspan="12">${detail}</td></tr>`;
       }).join('');
       document.getElementById('rows').innerHTML = rows;
+
+      // Restore the offsets captured above. A finished request's body never
+      // changes, so the position stays meaningful across refreshes.
+      document.querySelectorAll('tr.detail-row').forEach(tr => {
+        const id = tr.getAttribute('data-detail');
+        tr.querySelectorAll('pre').forEach((pre, i) => {
+          const top = scrollTops.get(`${id}:${i}`);
+          if (top != null) pre.scrollTop = top;
+        });
+      });
+
+      document.querySelectorAll('.sess').forEach(el => {
+        el.onclick = (e) => {
+          e.stopPropagation();
+          sessionFilter = el.getAttribute('data-sess').slice(0, 8);
+          page = 1; lastSignature = ''; load();
+        };
+      });
+      document.querySelectorAll('.copy-btn').forEach(btn => {
+        btn.onclick = async (e) => {
+          // The detail row is a sibling of the clickable request row, but stop
+          // propagation anyway so a future layout change cannot make copying
+          // collapse the row.
+          e.stopPropagation();
+          const pre = btn.closest('.body-block').querySelector('pre');
+          try {
+            await navigator.clipboard.writeText(pre.textContent);
+            btn.innerHTML = ICON_DONE;
+            btn.classList.add('copied');
+            setTimeout(() => { btn.innerHTML = ICON_COPY; btn.classList.remove('copied'); }, 1200);
+          } catch (err) {
+            btn.title = 'Copy failed: ' + err;
+          }
+        };
+      });
+
       document.querySelectorAll('tr.req-row').forEach(tr => {
         tr.onclick = () => {
           const id = tr.getAttribute('data-id');
@@ -96,11 +239,30 @@
       document.getElementById('prev').disabled = page <= 1;
       document.getElementById('next').disabled = page >= (data.total_pages || 1);
     }
+    let sessionFilter = null;
     async function load() {
-      const res = await fetch(`/api/requests?page=${page}&per_page=${perPage}`);
+      const failed = document.getElementById('failedOnly').checked;
+      const sq = sessionFilter ? `&session=${encodeURIComponent(sessionFilter)}` : '';
+      document.getElementById('sessFilter').innerHTML = sessionFilter
+        ? `session <b>${escapeHtml(sessionFilter)}</b> <a href="#" id="clearSess">clear</a>`
+        : '';
+      const res = await fetch(`/api/requests?page=${page}&per_page=${perPage}${failed ? '&failed=true' : ''}${sq}`);
       const data = await res.json();
+      document.getElementById('filterHint').textContent =
+        failed ? `${data.total} failed request(s) — non-2xx, interrupted streams, and client disconnects` : '';
       render(data);
     }
+    document.addEventListener('click', (e) => {
+      if (e.target && e.target.id === 'clearSess') {
+        e.preventDefault();
+        sessionFilter = null; page = 1; lastSignature = ''; load();
+      }
+    });
+    document.getElementById('failedOnly').onchange = () => {
+      page = 1;
+      lastSignature = '';   // force a rebuild; the filter changed, not the data
+      load();
+    };
     document.getElementById('prev').onclick = () => { if (page > 1) { page--; load(); } };
     document.getElementById('next').onclick = () => { page++; load(); };
     load();

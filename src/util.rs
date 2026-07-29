@@ -291,6 +291,150 @@ pub async fn post_with_retry(
     }
 }
 
+/// Token counts for one request, split by how the input was served.
+///
+/// `input_tokens` is always the **true total** prompt size. Providers disagree
+/// on how they slice that total, so the extractors below normalize it:
+/// Anthropic reports three disjoint buckets that must be summed, while
+/// OpenAI's `prompt_tokens` already contains its cached subset.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct TokenUsage {
+    /// Total prompt tokens, cached and uncached alike.
+    pub input_tokens: u64,
+    /// Portion of `input_tokens` served from a warm cache.
+    pub cache_read_input_tokens: u64,
+    /// Portion of `input_tokens` written into the cache by this request.
+    pub cache_creation_input_tokens: u64,
+    pub output_tokens: u64,
+}
+
+impl TokenUsage {
+    /// Fraction of the prompt served from cache, or `None` when the request
+    /// had no input at all (which would make the ratio meaningless rather
+    /// than zero).
+    pub fn cache_hit_ratio(&self) -> Option<f64> {
+        (self.input_tokens > 0)
+            .then(|| self.cache_read_input_tokens as f64 / self.input_tokens as f64)
+    }
+
+    /// Adopts a usage object parsed from a streaming chunk, keeping the
+    /// previous totals when the new one is empty.
+    ///
+    /// Streams repeat `usage` across chunks — frequently as `null` or an empty
+    /// object until the final event — so overwriting unconditionally would
+    /// zero out counts a later chunk simply did not restate.
+    pub fn merge_stream_update(&mut self, next: TokenUsage) {
+        if next.input_tokens > 0 || next.output_tokens > 0 {
+            *self = next;
+        }
+    }
+}
+
+/// Reads a `u64` field, treating absent/malformed values as zero.
+fn usage_field(usage: &Value, key: &str) -> u64 {
+    usage.get(key).and_then(|t| t.as_u64()).unwrap_or(0)
+}
+
+/// Normalizes an Anthropic `usage` object.
+///
+/// `input_tokens`, `cache_read_input_tokens` and `cache_creation_input_tokens`
+/// are **disjoint**, so the real prompt size is their sum. Reading
+/// `input_tokens` on its own reports single digits for a fully-cached
+/// hundred-thousand-token conversation, because Claude Code covers almost the
+/// entire prompt — including the newest message — with `cache_control`.
+pub fn anthropic_usage(usage: &Value) -> TokenUsage {
+    let cache_read = usage_field(usage, "cache_read_input_tokens");
+    let cache_creation = usage_field(usage, "cache_creation_input_tokens");
+    TokenUsage {
+        input_tokens: usage_field(usage, "input_tokens") + cache_read + cache_creation,
+        cache_read_input_tokens: cache_read,
+        cache_creation_input_tokens: cache_creation,
+        output_tokens: usage_field(usage, "output_tokens"),
+    }
+}
+
+/// Normalizes an OpenAI `usage` object.
+///
+/// Unlike Anthropic's disjoint buckets, `prompt_tokens` is already the total
+/// and `prompt_tokens_details.cached_tokens` is a subset of it — adding them
+/// would double-count. OpenAI has no cache-write concept, so that bucket stays
+/// zero.
+pub fn openai_usage(usage: &Value) -> TokenUsage {
+    TokenUsage {
+        input_tokens: usage_field(usage, "prompt_tokens"),
+        cache_read_input_tokens: usage
+            .get("prompt_tokens_details")
+            .map(|d| usage_field(d, "cached_tokens"))
+            .unwrap_or(0),
+        cache_creation_input_tokens: 0,
+        output_tokens: usage_field(usage, "completion_tokens"),
+    }
+}
+
+/// Normalizes an OpenAI **Responses API** `usage` object.
+///
+/// A trap worth naming: this API spells its totals `input_tokens` /
+/// `output_tokens` — the same keys Anthropic uses — but with OpenAI's
+/// semantics, where `input_tokens` is already the grand total and
+/// `input_tokens_details.cached_tokens` is a subset of it. Feeding one of
+/// these payloads to [`anthropic_usage`] would double-count the cached half.
+pub fn responses_usage(usage: &Value) -> TokenUsage {
+    TokenUsage {
+        input_tokens: usage_field(usage, "input_tokens"),
+        cache_read_input_tokens: usage
+            .get("input_tokens_details")
+            .map(|d| usage_field(d, "cached_tokens"))
+            .unwrap_or(0),
+        cache_creation_input_tokens: 0,
+        output_tokens: usage_field(usage, "output_tokens"),
+    }
+}
+
+/// Tracks the longest silence between upstream chunks on a streaming response.
+///
+/// When a stream stalls, this is the number that assigns blame: a large value
+/// means the upstream itself went quiet, while a small one means the upstream
+/// kept sending and the stall happened on the proxy or client side. Without it
+/// the two are indistinguishable after the fact.
+///
+/// The wait before the first chunk counts as idle time too — a stream that
+/// never produces anything is the worst stall of all.
+pub struct IdleTracker {
+    last: std::time::Instant,
+    max_idle_ms: u64,
+}
+
+impl IdleTracker {
+    pub fn new(start: std::time::Instant) -> Self {
+        IdleTracker {
+            last: start,
+            max_idle_ms: 0,
+        }
+    }
+
+    /// Records that a chunk arrived at `now`.
+    pub fn mark(&mut self, now: std::time::Instant) {
+        let gap = now.saturating_duration_since(self.last).as_millis() as u64;
+        self.max_idle_ms = self.max_idle_ms.max(gap);
+        self.last = now;
+    }
+
+    /// Records a chunk arriving right now.
+    pub fn mark_now(&mut self) {
+        self.mark(std::time::Instant::now());
+    }
+
+    /// Longest observed gap, including any trailing silence up to `now`.
+    pub fn max_idle_ms_including_now(&self) -> u64 {
+        let trailing = self.last.elapsed().as_millis() as u64;
+        self.max_idle_ms.max(trailing)
+    }
+
+    pub fn max_idle_ms(&self) -> u64 {
+        self.max_idle_ms
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -396,5 +540,140 @@ mod tests {
         assert!(is_max_tokens_unsupported_error(400, body));
         assert!(!is_max_tokens_unsupported_error(200, body));
         assert!(!is_max_tokens_unsupported_error(400, "some other error"));
+    }
+
+    #[test]
+    fn anthropic_usage_sums_all_three_input_buckets() {
+        // Verbatim from a real Copilot `/v1/messages` message_start event.
+        // Reading only `input_tokens` reports 2 for a 100k-token prompt.
+        let usage = serde_json::json!({
+            "input_tokens": 2,
+            "cache_read_input_tokens": 101940,
+            "cache_creation_input_tokens": 1731,
+            "cache_creation": {
+                "ephemeral_5m_input_tokens": 1731,
+                "ephemeral_1h_input_tokens": 0
+            },
+            "output_tokens": 2
+        });
+        let u = anthropic_usage(&usage);
+        assert_eq!(u.input_tokens, 103_673);
+        assert_eq!(u.cache_read_input_tokens, 101_940);
+        assert_eq!(u.cache_creation_input_tokens, 1_731);
+        assert_eq!(u.output_tokens, 2);
+    }
+
+    #[test]
+    fn anthropic_usage_tolerates_absent_cache_fields() {
+        // A cache-less turn: the total is just the uncached input.
+        let usage = serde_json::json!({"input_tokens": 4_096, "output_tokens": 128});
+        let u = anthropic_usage(&usage);
+        assert_eq!(u.input_tokens, 4_096);
+        assert_eq!(u.cache_read_input_tokens, 0);
+        assert_eq!(u.cache_creation_input_tokens, 0);
+        assert_eq!(u.output_tokens, 128);
+    }
+
+    #[test]
+    fn openai_usage_does_not_double_count_cached_tokens() {
+        // OpenAI's `prompt_tokens` ALREADY includes `cached_tokens`, unlike
+        // Anthropic's disjoint buckets. Summing them would inflate the total.
+        let usage = serde_json::json!({
+            "prompt_tokens": 5_000,
+            "completion_tokens": 300,
+            "prompt_tokens_details": {"cached_tokens": 4_500}
+        });
+        let u = openai_usage(&usage);
+        assert_eq!(u.input_tokens, 5_000);
+        assert_eq!(u.cache_read_input_tokens, 4_500);
+        // OpenAI has no cache-write concept.
+        assert_eq!(u.cache_creation_input_tokens, 0);
+        assert_eq!(u.output_tokens, 300);
+    }
+
+    #[test]
+    fn idle_tracker_reports_the_longest_upstream_gap() {
+        let t0 = std::time::Instant::now();
+        let mut t = IdleTracker::new(t0);
+        // Chunks arriving steadily.
+        t.mark(t0 + Duration::from_millis(100));
+        t.mark(t0 + Duration::from_millis(150));
+        assert_eq!(t.max_idle_ms(), 100);
+        // A long think between chunks — this is the number that distinguishes
+        // "upstream went quiet" from "proxy failed to forward".
+        t.mark(t0 + Duration::from_millis(2_150));
+        assert_eq!(t.max_idle_ms(), 2_000);
+        // A later short gap must not lower the recorded maximum.
+        t.mark(t0 + Duration::from_millis(2_200));
+        assert_eq!(t.max_idle_ms(), 2_000);
+    }
+
+    #[test]
+    fn idle_tracker_counts_the_wait_before_the_first_chunk() {
+        // Time-to-first-byte is itself an upstream stall; a stream that never
+        // produces a chunk at all must not report zero idle time.
+        let t0 = std::time::Instant::now();
+        let mut t = IdleTracker::new(t0);
+        t.mark(t0 + Duration::from_millis(4_000));
+        assert_eq!(t.max_idle_ms(), 4_000);
+    }
+
+    #[test]
+    fn responses_usage_reads_the_responses_api_field_names() {
+        // The Responses API reuses Anthropic's key names for a DIFFERENT
+        // meaning: its `input_tokens` is already the grand total and
+        // `input_tokens_details.cached_tokens` is a subset, so these must not
+        // be summed the way anthropic_usage sums its disjoint buckets.
+        let usage = serde_json::json!({
+            "input_tokens": 8_000,
+            "output_tokens": 250,
+            "input_tokens_details": {"cached_tokens": 6_000}
+        });
+        let u = responses_usage(&usage);
+        assert_eq!(u.input_tokens, 8_000);
+        assert_eq!(u.cache_read_input_tokens, 6_000);
+        assert_eq!(u.cache_creation_input_tokens, 0);
+        assert_eq!(u.output_tokens, 250);
+    }
+
+    #[test]
+    fn stream_usage_updates_ignore_empty_repeats() {
+        let mut running = TokenUsage::default();
+        running.merge_stream_update(TokenUsage {
+            input_tokens: 5_000,
+            cache_read_input_tokens: 4_000,
+            output_tokens: 10,
+            ..TokenUsage::default()
+        });
+        assert_eq!(running.input_tokens, 5_000);
+
+        // Streams repeat `usage` across chunks, often empty until the last
+        // one. Adopting an empty repeat would wipe totals already collected.
+        running.merge_stream_update(TokenUsage::default());
+        assert_eq!(running.input_tokens, 5_000);
+        assert_eq!(running.cache_read_input_tokens, 4_000);
+        assert_eq!(running.output_tokens, 10);
+
+        // A later chunk carrying real numbers does win.
+        running.merge_stream_update(TokenUsage {
+            input_tokens: 5_000,
+            cache_read_input_tokens: 4_000,
+            output_tokens: 250,
+            ..TokenUsage::default()
+        });
+        assert_eq!(running.output_tokens, 250);
+    }
+
+    #[test]
+    fn cache_hit_ratio_is_none_without_input() {
+        let none = TokenUsage::default();
+        assert_eq!(none.cache_hit_ratio(), None);
+        let hit = TokenUsage {
+            input_tokens: 103_673,
+            cache_read_input_tokens: 101_940,
+            ..TokenUsage::default()
+        };
+        let ratio = hit.cache_hit_ratio().unwrap();
+        assert!((ratio - 0.983).abs() < 0.001, "ratio was {ratio}");
     }
 }
