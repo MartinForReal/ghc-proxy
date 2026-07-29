@@ -354,6 +354,10 @@ pub struct TokenUsage {
     /// Portion of `input_tokens` written into the cache by this request.
     pub cache_creation_input_tokens: u64,
     pub output_tokens: u64,
+    /// Output tokens spent on reasoning the upstream never sends. Billed like
+    /// any other output token, which is what makes a turn that produced no
+    /// visible text still cost something.
+    pub reasoning_tokens: u64,
 }
 
 impl TokenUsage {
@@ -378,6 +382,69 @@ impl TokenUsage {
     }
 }
 
+/// Copilot's own billing figure for a request, in nano-AI-units, read from the
+/// `copilot_usage` object the upstream attaches to terminal stream events and
+/// non-streaming responses.
+///
+/// This is what GitHub actually charges — since the move to usage-based billing
+/// the meter is token consumption, not premium requests — and it is worth more
+/// than the list-price estimate beside it: the estimate has no way to know that
+/// a model is included at no cost, and prices `gpt-4o-mini` at a few
+/// microdollars where Copilot bills exactly zero.
+///
+/// `total_nano_aiu` is the sum of `token_count * cost_per_batch / batch_size`
+/// over `token_details`, verified against every surface. The total is used
+/// directly rather than recomputed, so a change in how Copilot slices the
+/// details cannot silently skew the number.
+pub fn copilot_billed_nano_aiu(root: &Value) -> Option<u64> {
+    root.get("copilot_usage")?.get("total_nano_aiu")?.as_u64()
+}
+
+/// What the prompt cache was worth on this turn, in nano-AI-units.
+///
+/// Copilot states its own per-token rate for every token type it charges, in
+/// `copilot_usage.token_details`, so this is computed from what the model
+/// actually costs rather than from a price list and an assumed discount.
+///
+/// That distinction matters because cache pricing is per model, and the entries
+/// are not the same on every one. Observed on the wire: `claude-haiku-4.5`
+/// reports a `cache_write` rate above its input rate, `gemini-3.5-flash`
+/// reports one of zero, `gpt-5.5` reports no `cache_write` entry at all, and
+/// `gpt-4o-mini` reports zero for everything because Copilot includes it at no
+/// charge. A single hard-coded multiplier would claim savings on a model that
+/// is free.
+///
+/// Positive means the cache paid for itself this turn. Negative is the normal
+/// shape of a first turn, which pays a premium to populate a cache that later
+/// turns read back.
+pub fn cache_saving_nano_aiu(root: &Value, usage: &TokenUsage) -> Option<i64> {
+    let details = root
+        .get("copilot_usage")?
+        .get("token_details")?
+        .as_array()?;
+    let rate = |kind: &str| -> Option<f64> {
+        details
+            .iter()
+            .find(|d| d.get("token_type").and_then(Value::as_str) == Some(kind))
+            .and_then(|d| {
+                let per_batch = d.get("cost_per_batch")?.as_f64()?;
+                let batch = d.get("batch_size")?.as_f64()?;
+                (batch > 0.0).then_some(per_batch / batch)
+            })
+    };
+    // Without an input rate there is nothing for the cache rates to be cheaper
+    // than, so there is no saving to state.
+    let input = rate("input")?;
+    let mut net = 0.0;
+    if let Some(read) = rate("cache_read") {
+        net += usage.cache_read_input_tokens as f64 * (input - read);
+    }
+    if let Some(write) = rate("cache_write") {
+        net -= usage.cache_creation_input_tokens as f64 * (write - input);
+    }
+    Some(net.round() as i64)
+}
+
 /// Reads a `u64` field, treating absent/malformed values as zero.
 fn usage_field(usage: &Value, key: &str) -> u64 {
     usage.get(key).and_then(|t| t.as_u64()).unwrap_or(0)
@@ -398,6 +465,7 @@ pub fn anthropic_usage(usage: &Value) -> TokenUsage {
         cache_read_input_tokens: cache_read,
         cache_creation_input_tokens: cache_creation,
         output_tokens: usage_field(usage, "output_tokens"),
+        reasoning_tokens: 0,
     }
 }
 
@@ -408,6 +476,21 @@ pub fn anthropic_usage(usage: &Value) -> TokenUsage {
 /// would double-count. OpenAI has no cache-write concept, so that bucket stays
 /// zero.
 pub fn openai_usage(usage: &Value) -> TokenUsage {
+    // Where the surface puts `reasoning_tokens` tells you whether it is already
+    // inside `completion_tokens`. o-series report it under
+    // `completion_tokens_details`, as a breakdown of a total that includes it.
+    // The translated Gemini surface reports it at the top level and *excludes*
+    // it — `prompt + completion + reasoning == total_tokens` there.
+    //
+    // `output_tokens` is normalized to the true total either way, for the same
+    // reason `input_tokens` is: a caller comparing two models should not have
+    // to know which convention each one follows.
+    let nested = usage
+        .get("completion_tokens_details")
+        .map(|d| usage_field(d, "reasoning_tokens"))
+        .unwrap_or(0);
+    let flat = usage_field(usage, "reasoning_tokens");
+    let completion = usage_field(usage, "completion_tokens");
     TokenUsage {
         input_tokens: usage_field(usage, "prompt_tokens"),
         cache_read_input_tokens: usage
@@ -415,7 +498,12 @@ pub fn openai_usage(usage: &Value) -> TokenUsage {
             .map(|d| usage_field(d, "cached_tokens"))
             .unwrap_or(0),
         cache_creation_input_tokens: 0,
-        output_tokens: usage_field(usage, "completion_tokens"),
+        output_tokens: if nested > 0 {
+            completion
+        } else {
+            completion + flat
+        },
+        reasoning_tokens: if nested > 0 { nested } else { flat },
     }
 }
 
@@ -435,6 +523,10 @@ pub fn responses_usage(usage: &Value) -> TokenUsage {
             .unwrap_or(0),
         cache_creation_input_tokens: 0,
         output_tokens: usage_field(usage, "output_tokens"),
+        reasoning_tokens: usage
+            .get("output_tokens_details")
+            .map(|d| usage_field(d, "reasoning_tokens"))
+            .unwrap_or(0),
     }
 }
 
@@ -688,6 +780,139 @@ mod tests {
         // OpenAI has no cache-write concept.
         assert_eq!(u.cache_creation_input_tokens, 0);
         assert_eq!(u.output_tokens, 300);
+    }
+
+    /// The two surfaces disagree about whether reasoning is inside the
+    /// completion count, so `output_tokens` has to be normalized the way
+    /// `input_tokens` already is. Observed on the wire: a Responses turn
+    /// reported `input 11 + output 17 == total 28` with 10 of that output being
+    /// reasoning, while the translated Gemini surface reported
+    /// `prompt 5 + completion 1 + reasoning 97 == total 103`.
+    #[test]
+    fn reasoning_tokens_normalize_into_the_output_total() {
+        // Nested: already part of `completion_tokens`.
+        let nested = openai_usage(&serde_json::json!({
+            "prompt_tokens": 11,
+            "completion_tokens": 17,
+            "completion_tokens_details": {"reasoning_tokens": 10}
+        }));
+        assert_eq!(nested.output_tokens, 17);
+        assert_eq!(nested.reasoning_tokens, 10);
+
+        // Flat: disjoint from `completion_tokens`, so it has to be added.
+        let flat = openai_usage(&serde_json::json!({
+            "prompt_tokens": 5,
+            "completion_tokens": 1,
+            "total_tokens": 103,
+            "reasoning_tokens": 97
+        }));
+        assert_eq!(flat.output_tokens, 98);
+        assert_eq!(flat.reasoning_tokens, 97);
+        assert_eq!(flat.input_tokens + flat.output_tokens, 103);
+
+        // A turn with no reasoning is unaffected.
+        let none = openai_usage(&serde_json::json!({
+            "prompt_tokens": 10, "completion_tokens": 20
+        }));
+        assert_eq!(none.output_tokens, 20);
+        assert_eq!(none.reasoning_tokens, 0);
+    }
+
+    /// The Responses API states reasoning as a breakdown of `output_tokens`,
+    /// never as an addition to it.
+    #[test]
+    fn responses_usage_keeps_reasoning_inside_the_output_total() {
+        let u = responses_usage(&serde_json::json!({
+            "input_tokens": 11,
+            "output_tokens": 17,
+            "output_tokens_details": {"reasoning_tokens": 10}
+        }));
+        assert_eq!(u.output_tokens, 17);
+        assert_eq!(u.reasoning_tokens, 10);
+    }
+
+    #[test]
+    fn copilot_billing_is_read_from_the_response() {
+        let v = serde_json::json!({
+            "copilot_usage": {"total_nano_aiu": 56_500_000, "token_details": []}
+        });
+        assert_eq!(copilot_billed_nano_aiu(&v), Some(56_500_000));
+        // A model Copilot includes at no charge reports zero, which is a real
+        // figure and must not be confused with "not reported".
+        let free = serde_json::json!({"copilot_usage": {"total_nano_aiu": 0}});
+        assert_eq!(copilot_billed_nano_aiu(&free), Some(0));
+        assert_eq!(copilot_billed_nano_aiu(&serde_json::json!({})), None);
+    }
+
+    /// Builds a `copilot_usage.token_details` block from per-token rates,
+    /// expressed the way Copilot does: a cost per batch plus a batch size.
+    fn details(rates: &[(&str, f64)]) -> Value {
+        let entries: Vec<Value> = rates
+            .iter()
+            .map(|(kind, per_token)| {
+                serde_json::json!({
+                    "token_type": kind,
+                    "batch_size": 1_000.0,
+                    "cost_per_batch": per_token * 1_000.0,
+                })
+            })
+            .collect();
+        serde_json::json!({"copilot_usage": {"token_details": entries}})
+    }
+
+    #[test]
+    fn cache_saving_uses_the_rates_the_model_itself_reported() {
+        let usage = TokenUsage {
+            cache_read_input_tokens: 10_000,
+            cache_creation_input_tokens: 2_000,
+            ..Default::default()
+        };
+        // Anthropic-style: reads are a tenth of input, writes carry a premium.
+        let v = details(&[
+            ("input", 100_000.0),
+            ("cache_read", 10_000.0),
+            ("cache_write", 125_000.0),
+        ]);
+        // 10_000 × (100_000 − 10_000) − 2_000 × (125_000 − 100_000)
+        assert_eq!(cache_saving_nano_aiu(&v, &usage), Some(850_000_000));
+    }
+
+    #[test]
+    fn a_model_that_prices_no_cache_writes_is_not_charged_for_them() {
+        let usage = TokenUsage {
+            cache_read_input_tokens: 10_000,
+            // Reported by the surface, but this model publishes no write rate,
+            // so there is nothing to subtract for them.
+            cache_creation_input_tokens: 2_000,
+            ..Default::default()
+        };
+        let v = details(&[("input", 500_000.0), ("cache_read", 50_000.0)]);
+        assert_eq!(cache_saving_nano_aiu(&v, &usage), Some(4_500_000_000));
+    }
+
+    #[test]
+    fn a_model_copilot_includes_at_no_charge_saves_nothing() {
+        let usage = TokenUsage {
+            cache_read_input_tokens: 10_000,
+            ..Default::default()
+        };
+        // Every rate is zero, so caching cannot have saved anything. Reporting
+        // a saving here would invent one from a published price list.
+        let v = details(&[("input", 0.0), ("cache_read", 0.0)]);
+        assert_eq!(cache_saving_nano_aiu(&v, &usage), Some(0));
+    }
+
+    #[test]
+    fn no_reported_rates_means_no_figure_rather_than_zero() {
+        let usage = TokenUsage {
+            cache_read_input_tokens: 10_000,
+            ..Default::default()
+        };
+        // No `token_details` at all, and details that omit the input rate the
+        // others are measured against. Neither can be priced.
+        assert_eq!(cache_saving_nano_aiu(&serde_json::json!({}), &usage), None);
+        let no_input = details(&[("cache_read", 50_000.0)]);
+        assert_eq!(cache_saving_nano_aiu(&no_input, &usage), None);
     }
 
     #[test]

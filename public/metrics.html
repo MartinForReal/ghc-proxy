@@ -4,40 +4,57 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>ghc-proxy · Metrics</title>
+  <link rel="stylesheet" href="/app.css" />
   <style>
-    :root { color-scheme: light dark; }
-    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; padding: 2rem; background: #0d1117; color: #e6edf3; }
-    h1 { font-size: 1.4rem; margin: 0 0 1rem; }
-    a { color: #58a6ff; }
-    .toolbar { display: grid; grid-template-columns: 1fr auto auto auto; gap: 0.6rem; margin-bottom: 1rem; }
-    input, button { background: #161b22; color: #e6edf3; border: 1px solid #30363d; border-radius: 6px; padding: 0.5rem 0.75rem; }
-    button { cursor: pointer; }
-    .note { color: #8b949e; margin: 0.5rem 0 1rem; font-size: 0.9rem; }
-    table { width: 100%; border-collapse: collapse; background: #161b22; border: 1px solid #30363d; border-radius: 8px; overflow: hidden; }
-    th, td { text-align: left; padding: 0.45rem 0.6rem; border-bottom: 1px solid #30363d; font-size: 0.85rem; }
-    th { color: #8b949e; font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.05em; }
-    tr:last-child td { border-bottom: none; }
-    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    /* Page-specific only; everything shared lives in /app.css. */
+    .metrics-toolbar { display: grid; grid-template-columns: 1fr auto auto auto; gap: 0.5rem; }
     .right { text-align: right; }
-    .small { font-size: 0.8rem; color: #8b949e; }
+    #rows td { font-size: 0.82rem; padding: 0.4rem 0.75rem; vertical-align: top; }
+    /* Label sets are long enough to push the value off-screen. Wrap them so
+     * the number — the reason you opened the page — always stays visible. */
+    #rows td:nth-child(2) { white-space: normal; word-break: break-word; }
+    th:last-child, #rows td:last-child { width: 1%; }
   </style>
 </head>
-<body>
-  <h1>OpenMetrics Explorer <a href="/" style="font-size:0.8rem">← Dashboard</a></h1>
-  <div class="toolbar">
-    <input id="filter" placeholder="Filter by metric name / label (e.g. requests_total or endpoint=\"/v1/messages\")" />
-    <button id="refresh">Refresh</button>
-    <button id="reloadCfg">Reload config</button>
-    <button id="copyRaw">Copy raw</button>
+<body data-page="metrics">
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="/">ghc-proxy</a>
+      <div class="nav-links">
+        <a href="/">Overview</a>
+        <a href="/requests">Requests</a>
+        <a href="/metrics/dashboard">Metrics</a>
+      </div>
+      <div class="nav-status" id="navStatus"><span class="dot"></span> connecting…</div>
+    </div>
+  </nav>
+
+  <div class="wrap">
+    <div class="panel">
+      <div class="panel-head">
+        <h2>OpenMetrics explorer</h2>
+        <span class="aside" id="meta">Loading metrics…</span>
+      </div>
+      <div class="panel-body">
+        <div class="metrics-toolbar">
+          <input id="filter" placeholder="Filter by metric name, label or value — e.g. requests_total or endpoint=&quot;/v1/messages&quot;" />
+          <button id="refresh">Refresh</button>
+          <button id="reloadCfg">Reload config</button>
+          <button id="copyRaw">Copy raw</button>
+        </div>
+      </div>
+      <div class="panel-body flush scroll-y">
+        <table>
+          <thead>
+            <tr><th>Metric</th><th>Labels</th><th class="right">Value</th></tr>
+          </thead>
+          <tbody id="rows"></tbody>
+        </table>
+        <div class="empty" id="metricsEmpty" style="display:none">No metric matches that filter.</div>
+      </div>
+      <div class="pager">Raw exporter: <a href="/metrics" target="_blank">/metrics</a></div>
+    </div>
   </div>
-  <div class="note" id="meta">Loading metrics...</div>
-  <table>
-    <thead>
-      <tr><th>Metric</th><th>Labels</th><th class="right">Value</th></tr>
-    </thead>
-    <tbody id="rows"></tbody>
-  </table>
-  <p class="small">Raw exporter: <a href="/metrics" target="_blank">/metrics</a></p>
 
   <script>
     let allRows = [];
@@ -78,8 +95,9 @@
         </tr>
       `).join('');
 
+      document.getElementById('metricsEmpty').style.display = filtered.length ? 'none' : '';
       document.getElementById('meta').textContent =
-        `Showing ${filtered.length} / ${allRows.length} metrics`;
+        `${filtered.length} of ${allRows.length} metrics`;
     }
 
     function escapeHtml(s) {
@@ -103,7 +121,22 @@
     }
 
     async function copyRaw() {
+      const btn = document.getElementById('copyRaw');
       await navigator.clipboard.writeText(rawText || '');
+      btn.textContent = 'Copied';
+      setTimeout(() => { btn.textContent = 'Copy raw'; }, 1200);
+    }
+
+    // Same status pill as the other pages, so "is the proxy healthy" never
+    // requires navigating away from what you are reading.
+    async function navStatus() {
+      try {
+        const h = await (await fetch('/health')).json();
+        document.getElementById('navStatus').innerHTML =
+          `<span class="dot ${h.ready ? 'ok' : 'warn'}"></span>${h.ready ? 'ready' : 'degraded'} · v${escapeHtml(h.version)}`;
+      } catch (e) {
+        document.getElementById('navStatus').innerHTML = '<span class="dot err"></span>unreachable';
+      }
     }
 
     document.getElementById('refresh').onclick = refresh;
@@ -111,8 +144,10 @@
     document.getElementById('copyRaw').onclick = copyRaw;
     document.getElementById('filter').oninput = render;
 
+    navStatus();
     refresh();
     setInterval(refresh, 5000);
+    setInterval(navStatus, 15000);
   </script>
 </body>
 </html>

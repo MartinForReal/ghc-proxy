@@ -3,83 +3,436 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>ghc-proxy · Dashboard</title>
-  <style>
-    :root { color-scheme: light dark; }
-    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; padding: 2rem; background: #0d1117; color: #e6edf3; }
-    h1 { font-size: 1.4rem; margin: 0 0 1rem; }
-    .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 1rem; margin-bottom: 2rem; }
-    .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 1rem; }
-    .card .label { color: #8b949e; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; }
-    .card .value { font-size: 1.6rem; font-weight: 600; margin-top: 0.25rem; }
-    a { color: #58a6ff; }
-    .links { margin-top: 1rem; }
-    h2 { font-size: 1.1rem; margin: 1.5rem 0 0.75rem; }
-    table { width: 100%; border-collapse: collapse; background: #161b22; border: 1px solid #30363d; border-radius: 8px; overflow: hidden; }
-    th, td { text-align: left; padding: 0.5rem 0.75rem; border-bottom: 1px solid #30363d; font-size: 0.9rem; }
-    th { color: #8b949e; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; }
-    tr:last-child td { border-bottom: none; }
-  </style>
+  <title>ghc-proxy · Overview</title>
+  <link rel="stylesheet" href="/app.css" />
 </head>
-<body>
-  <h1>GitHub Copilot API Proxy</h1>
-  <div class="cards" id="cards"></div>
-  <h2 id="models-title">Supported models</h2>
-  <table id="models">
-    <thead><tr><th>ID</th><th>Display name</th><th>Owned by</th></tr></thead>
-    <tbody id="models-body"></tbody>
-  </table>
-  <div class="links">
-    <a href="/requests">Browse requests →</a>
-    &nbsp;|&nbsp;
-    <a href="/metrics/dashboard">Metrics dashboard →</a>
+<body data-page="overview">
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="/">ghc-proxy</a>
+      <div class="nav-links">
+        <a href="/">Overview</a>
+        <a href="/requests">Requests</a>
+        <a href="/metrics/dashboard">Metrics</a>
+      </div>
+      <div class="nav-status" id="navStatus"><span class="dot"></span> connecting…</div>
+    </div>
+  </nav>
+
+  <div class="wrap">
+    <!-- Consumption first: Copilot bills per premium request, so that number is
+         the one that actually tracks spend. Tokens qualify it. -->
+    <div class="panel">
+      <div class="panel-head">
+        <h2>Consumption</h2>
+        <span class="aside" id="consumptionNote"></span>
+      </div>
+      <div class="hero" id="hero"></div>
+    </div>
+
+    <!-- Quota sits directly under consumption because it is the same quantity
+         from the other end: what is left rather than what was spent. It rides
+         along on every upstream response, so showing it costs no extra call. -->
+    <div class="panel" id="quotaPanel" hidden>
+      <div class="panel-head">
+        <h2>Quota remaining</h2>
+        <span class="aside" id="quotaReset"></span>
+      </div>
+      <div class="panel-body" id="quotaBody"></div>
+    </div>
+
+    <div class="cols-2">
+      <div class="panel">
+        <div class="panel-head"><h2>Traffic</h2></div>
+        <div class="panel-body"><div class="stat-grid" id="traffic"></div></div>
+      </div>
+      <div class="panel">
+        <div class="panel-head"><h2>Proxy</h2></div>
+        <div class="panel-body"><div class="stat-grid" id="proxy"></div></div>
+      </div>
+    </div>
+
+    <!-- The cache is the difference between an affordable agent session and an
+         expensive one, and a hit rate that collapses is the first sign the
+         prompt prefix stopped matching. Per model, because a single global
+         number cannot tell you which conversation broke. -->
+    <div class="panel">
+      <div class="panel-head">
+        <h2>Prompt cache</h2>
+        <span class="aside" id="cacheNote"></span>
+      </div>
+      <div class="panel-body" id="cacheSummary"></div>
+      <div class="panel-body flush">
+        <table>
+          <thead>
+            <tr>
+              <th>Model</th>
+              <th title="How this model's input tokens split between cache reads, cache writes and fresh tokens. A single global bar cannot tell you which model stopped matching.">Distribution</th>
+              <th class="num">Requests</th><th class="num">Input</th>
+              <th class="num" title="Share of the prompt served from cache. A dash means caching was never attempted on this model.">Hit rate</th>
+              <th class="num">Cached</th>
+              <th class="num cache-write-col" title="Prompt tokens billed as cache writes. Only the Anthropic surface with an explicit cache_control marker reports these; every other surface caches implicitly and never bills a write.">Written</th>
+              <th class="num" title="Net effect on the bill, in AI units, computed from the per-token rates this model itself reported. A dash means it reported no cache rates to compute from.">Saved</th>
+            </tr>
+          </thead>
+          <tbody id="cacheModels"></tbody>
+        </table>
+        <div class="empty" id="cacheEmpty">No cache activity recorded yet.</div>
+      </div>
+      <div class="panel-body" id="cacheFootnote"></div>
+    </div>
+
+    <!-- Reference material, not monitoring data: available but folded away so
+         it cannot dominate the page you open to check spend. -->
+    <details class="panel fold">
+      <summary id="modelsSummary">Supported models</summary>
+      <div class="panel-body flush scroll-y">
+        <table>
+          <thead><tr><th>ID</th><th>Display name</th><th>Owned by</th></tr></thead>
+          <tbody id="modelsBody"></tbody>
+        </table>
+      </div>
+    </details>
   </div>
+
   <script>
-    async function refresh() {
-      try {
-        const res = await fetch('/api/stats');
-        const s = await res.json();
-        // Share of all prompt volume served from cache. Copilot bills per
-        // premium request rather than per token, so that count — not a dollar
-        // estimate — is what actually tracks consumption.
-        const cacheRate = s.total_input_tokens > 0
-          ? Math.round(s.total_cache_read_tokens / s.total_input_tokens * 100) + '%'
-          : '—';
-        const cards = [
-          ['Requests', s.request_count],
-          ['Premium requests', (s.premium_requests ?? 0).toFixed(2)],
-          ['Input tokens', s.total_input_tokens],
-          ['Cache hit rate', cacheRate],
-          ['Cache writes', s.total_cache_creation_tokens],
-          ['Output tokens', s.total_output_tokens],
-          ['Bytes sent', s.bytes_sent],
-          ['Bytes received', s.bytes_received],
-        ];
-        document.getElementById('cards').innerHTML = cards.map(
-          ([label, value]) => `<div class="card"><div class="label">${label}</div><div class="value">${value ?? 0}</div></div>`
-        ).join('');
-      } catch (e) {
-        console.error(e);
-      }
-    }
-    function escapeHtml(s) {
+    function esc(s) {
       return String(s ?? '').replace(/[&<>"']/g, c => ({
         '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
       })[c]);
     }
-    async function loadModels() {
-      try {
-        const res = await fetch('/api/models');
-        const data = await res.json();
-        const models = (data && data.data) || [];
-        document.getElementById('models-title').textContent =
-          `Supported models (${models.length})`;
-        document.getElementById('models-body').innerHTML = models.map(m =>
-          `<tr><td>${escapeHtml(m.id)}</td><td>${escapeHtml(m.display_name)}</td><td>${escapeHtml(m.owned_by)}</td></tr>`
-        ).join('');
-      } catch (e) {
-        console.error(e);
+    // Six-digit token counts are unreadable at a glance and impossible to
+    // compare down a column.
+    function compact(n) {
+      n = Number(n ?? 0);
+      if (n < 1000) return String(n);
+      if (n < 1e6) return (n / 1000).toFixed(1) + 'k';
+      return (n / 1e6).toFixed(2) + 'M';
+    }
+    function bytes(n) {
+      n = Number(n ?? 0);
+      const u = ['B', 'KB', 'MB', 'GB'];
+      let i = 0;
+      while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+      return (i === 0 ? n : n.toFixed(1)) + ' ' + u[i];
+    }
+    function duration(sec) {
+      sec = Math.max(0, Math.floor(Number(sec ?? 0)));
+      const d = Math.floor(sec / 86400), h = Math.floor(sec % 86400 / 3600);
+      const m = Math.floor(sec % 3600 / 60), s = sec % 60;
+      if (d) return `${d}d ${h}h`;
+      if (h) return `${h}h ${m}m`;
+      if (m) return `${m}m ${s}s`;
+      return `${s}s`;
+    }
+    function metric(label, value, sub) {
+      return `<div class="metric"><div class="label">${label}</div>` +
+             `<div class="value">${value}</div>` +
+             (sub ? `<div class="sub">${sub}</div>` : '') + `</div>`;
+    }
+    function stat(label, value, cls) {
+      return `<div class="stat"><div class="label">${label}</div>` +
+             `<div class="value${cls ? ' ' + cls : ''}">${value}</div></div>`;
+    }
+
+    // Copilot bills in AI units and reports the figure on every response. A
+    // nano-AIU is 1e-9 of one, so the raw counter is unreadable; scale it and
+    // keep enough precision that a single cheap turn is not rounded to nothing.
+    // Precision follows magnitude, not sign, so a negative saving reads the
+    // same way a positive one does.
+    function aiu(nano) {
+      const n = Number(nano ?? 0) / 1e9;
+      if (n === 0) return '0';
+      const mag = Math.abs(n);
+      if (mag < 0.001) return n.toFixed(6);
+      if (mag < 1) return n.toFixed(4);
+      return n.toFixed(3);
+    }
+
+    async function loadStats() {
+      const s = await (await fetch('/api/stats')).json();
+
+      const inTok = s.total_input_tokens ?? 0;
+      const cacheRead = s.total_cache_read_tokens ?? 0;
+      const cacheWrite = s.total_cache_creation_tokens ?? 0;
+      // The cache hit rate is the early warning for a broken prompt prefix: it
+      // should sit high and stable, and a sudden drop means every turn started
+      // paying full price again.
+      //
+      // But a rate is only a measurement once caching was possible at all. Both
+      // surfaces need a sizeable prompt before anything is eligible, so on short
+      // traffic 0% is the only value there is — and showing it looks exactly
+      // like a cache that broke.
+      const cacheSeen = cacheRead + cacheWrite > 0;
+      const hit = inTok > 0 ? Math.round(cacheRead / inTok * 100) : null;
+      const cacheSub = cacheSeen
+        ? `<b>${hit}%</b> served from cache`
+        : '<span title="Both surfaces require a sizeable prompt before anything is cacheable, and the Anthropic one also needs an explicit cache_control marker.">nothing cacheable yet</span>';
+      const outTok = s.total_output_tokens ?? 0;
+      const reasoning = s.total_reasoning_tokens ?? 0;
+      const reasoningShare = outTok > 0 ? Math.round(reasoning / outTok * 100) : 0;
+
+      document.getElementById('hero').innerHTML =
+        // What Copilot actually charged, reported by the upstream on every
+        // response. Leads because billing moved to token consumption — the
+        // premium-request count no longer describes the bill.
+        metric('Billed', aiu(s.total_nano_aiu),
+               `AI units · ${(s.premium_requests ?? 0).toFixed(2)} premium requests`) +
+        metric('Input tokens', compact(inTok),
+               inTok === 0 ? '' : cacheSub) +
+        metric('Output tokens', compact(outTok),
+               // Reasoning is billed as output but never appears in the answer,
+               // so a large share here is spend with nothing to show for it.
+               reasoning > 0
+                 ? `<b>${compact(reasoning)}</b> spent reasoning (${reasoningShare}%)`
+                 : `${compact(s.total_cache_creation_tokens ?? 0)} written to cache`);
+
+      document.getElementById('traffic').innerHTML =
+        stat('Requests', s.request_count ?? 0) +
+        stat('Sent', bytes(s.bytes_sent)) +
+        stat('Received', bytes(s.bytes_received));
+
+      // Attempts that produced nothing are kept out of the counters above, so
+      // this is where they get said. It links, because the next question is
+      // always which ones.
+      const failed = s.failed_requests ?? 0;
+      document.getElementById('consumptionNote').innerHTML = failed > 0
+        ? `<a href="/requests">${failed} failed request${failed === 1 ? '' : 's'} →</a>`
+        : '';
+    }
+
+    // The panel is rebuilt on every refresh, so the handler is rebound with it.
+    // Guarded against a refresh landing mid-request, which would otherwise
+    // snap the switch back to a state the server is about to leave.
+    let debugPending = false;
+    function wireDebugToggle() {
+      const btn = document.getElementById('debugToggle');
+      if (!btn) return;
+      btn.onclick = async () => {
+        const want = !btn.classList.contains('on');
+        debugPending = true;
+        btn.disabled = true;
+        try {
+          const res = await fetch('/api/config/debug', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ debug: want })
+          });
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          const d = await res.json();
+          btn.classList.toggle('on', !!d.debug);
+          btn.lastChild.textContent = d.debug ? 'on' : 'off';
+        } catch (err) {
+          btn.title = `Could not change body capture: ${err.message}. ` +
+                      'An API key is required when one is configured.';
+        } finally {
+          btn.disabled = false;
+          debugPending = false;
+        }
+      };
+    }
+
+    async function loadHealth() {
+      const h = await (await fetch('/health')).json();
+
+      // Wayfinding, not decoration: the nav answers "is it working" on every
+      // page without a trip to the health endpoint.
+      const cls = h.ready ? 'ok' : 'warn';
+      document.getElementById('navStatus').innerHTML =
+        `<span class="dot ${cls}"></span>${h.ready ? 'ready' : 'degraded'} · v${esc(h.version)}`;
+
+      const tok = h.copilot_token || {};
+      const exp = tok.present ? duration(tok.expires_in_seconds) : '—';
+      // A refresh landing while the toggle is in flight would rebuild the
+      // button from a reading the server is about to supersede, snapping it
+      // back for a moment. The rest of the page still updates.
+      if (!debugPending) {
+        document.getElementById('proxy').innerHTML =
+          stat('Uptime', duration(h.uptime_seconds)) +
+          stat('Token expires in', exp,
+               tok.present && tok.expires_in_seconds < 300 ? 'warn' : '') +
+          stat('Models loaded', h.models_loaded ?? 0) +
+          stat('Auth', h.auth_required ? 'API key' : 'open', h.auth_required ? 'ok' : '') +
+          // Capture writes prompts and tool output into memory and the log, so
+          // leaving it on is worth noticing — and worth being able to act on
+          // without hunting for the control on another page.
+          `<div class="stat"><div class="label">Body capture</div>` +
+          `<button class="toggle${h.debug ? ' on' : ''}" id="debugToggle" ` +
+          `title="Record request and response bodies. Applies from the next request; not saved to config, so it lapses on restart.">` +
+          `<span class="knob"></span>${h.debug ? 'on' : 'off'}</button></div>`;
+        wireDebugToggle();
       }
+
+      renderQuota(h.quota || {});
+    }
+
+    // Quota arrives on every upstream response, so it is empty only until the
+    // first request has been proxied. Hide the panel rather than render zeros,
+    // which would read as "exhausted".
+    function renderQuota(quota) {
+      const skus = Object.keys(quota);
+      const panel = document.getElementById('quotaPanel');
+      if (skus.length === 0) { panel.hidden = true; return; }
+      panel.hidden = false;
+
+      let reset = null;
+      const rows = skus.map(name => {
+        const q = quota[name];
+        const pct = Math.max(0, Math.min(100, Number(q.percent_remaining ?? 0)));
+        if (q.reset_date && !reset) reset = q.reset_date;
+        const cls = pct <= 10 ? 'err' : pct <= 25 ? 'warn' : '';
+        const right = q.unlimited
+          ? '<b>unlimited</b>'
+          : `<b>${pct.toFixed(0)}%</b> of ${q.entitlement}` +
+            (q.overage > 0 ? ` · ${q.overage} over` : '');
+        return `<div class="quota-row">
+                  <div class="quota-top">
+                    <span class="quota-name">${esc(name)}</span>
+                    <span class="quota-val">${right}</span>
+                  </div>
+                  <div class="bar"><span class="${cls}" style="width:${pct}%"></span></div>
+                </div>`;
+      }).join('');
+
+      document.getElementById('quotaBody').innerHTML = rows;
+      const resetEl = document.getElementById('quotaReset');
+      const d = reset ? new Date(reset) : null;
+      resetEl.textContent = d && !isNaN(d) ? 'resets ' + d.toLocaleDateString() : '';
+    }
+
+    function pct(x) { return (Number(x ?? 0) * 100).toFixed(0) + '%'; }
+
+    async function loadCache() {
+      const c = await (await fetch('/api/cache')).json();
+      const t = c.totals || {};
+      const total = t.input_tokens ?? 0;
+      const read = t.cache_read_tokens ?? 0;
+      const write = t.cache_creation_tokens ?? 0;
+
+      // Each row carries its own bar now, so an aggregate one would say less
+      // than the rows below it while taking the space at the top of the panel.
+      // What is left is the key those bars need to be readable.
+      const summary = document.getElementById('cacheSummary');
+      if (total === 0) {
+        summary.innerHTML = '<div class="dim-note">No input tokens recorded yet.</div>';
+      } else if (read + write === 0) {
+        summary.innerHTML =
+          '<div class="dim-note">No cache activity. Both surfaces need a sizeable prompt before ' +
+          'anything is eligible, and the Anthropic one also needs an explicit <code>cache_control</code> ' +
+          `marker \u2014 nothing in these ${compact(total)} input tokens qualified.</div>`;
+      } else {
+        // The write swatch only appears when something was written: on every
+        // surface but Anthropic's the cache fills implicitly, so a colour for
+        // an event that never happens is a colour to decode for nothing.
+        const writeKey = write > 0
+          ? '<span><i style="background:var(--warn)"></i>Written to cache</span>'
+          : '';
+        summary.innerHTML =
+          `<div class="legend">
+             <span><i style="background:var(--ok)"></i>Served from cache</span>
+             ${writeKey}
+             <span><i style="background:#6e7681"></i>Fresh</span>
+           </div>`;
+      }
+
+      const d = c.dispositions || {};
+      const sampled = c.sampled_requests ?? 0;
+      document.getElementById('cacheNote').textContent = sampled
+        ? `${d.served_from_cache ?? 0} hit · ${d.wrote_to_cache ?? 0} wrote · ${d.no_cache ?? 0} uncached, of the last ${sampled} answered requests`
+        : '';
+
+      const models = c.by_model || [];
+      document.getElementById('cacheEmpty').style.display = models.length ? 'none' : '';
+
+      document.getElementById('cacheModels').innerHTML = models.map(m => {
+        // Only flag a low rate where caching was actually attempted: a model
+        // that never writes to the cache is not a broken prefix.
+        const attempted = (m.cache_read_tokens + m.cache_creation_tokens) > 0;
+        const cls = !attempted ? 'muted' : m.hit_rate >= 0.5 ? 'status-ok' : 'status-err';
+        // Where this model's input tokens went. The aggregate bar above cannot
+        // say which model stopped matching, which is the question a collapsing
+        // hit rate raises.
+        const mTotal = m.input_tokens || 0;
+        const mShare = n => (mTotal > 0 ? (n / mTotal * 100) : 0);
+        const bar = mTotal === 0 ? '' : `<div class="split mini" title="${compact(m.cache_read_tokens)} cached · ${compact(m.cache_creation_tokens)} written · ${compact(m.fresh_tokens)} fresh">
+             <span class="s-read" style="width:${mShare(m.cache_read_tokens)}%"></span>
+             <span class="s-write" style="width:${mShare(m.cache_creation_tokens)}%"></span>
+             <span class="s-fresh" style="width:${mShare(m.fresh_tokens)}%"></span>
+           </div>`;
+        // An empty cell has to say which kind of empty it is, or a reader
+        // cannot tell an unsupported metric from a broken one. Measured on
+        // this proxy: claude-haiku-4.5 cached a 6902-token prefix but not a
+        // 4082-token one, so short prompts land here legitimately.
+        const rate = attempted
+          ? `<span class="${cls}">${pct(m.hit_rate)}</span>`
+          : `<span class="muted" title="Nothing was cached on this model${m.requests > 0 && m.input_tokens / m.requests < 4096 ? `: ${compact(m.input_tokens)} input tokens across ${m.requests} request(s) stayed under Copilot's minimum cacheable prefix, around 4k tokens.` : ' — the prompt was long enough, so the prefix had not been sent before or stopped matching.'}">—</span>`;
+        // A zero here is not a measurement, it is a surface with no such event.
+        const written = m.cache_creation_tokens > 0
+          ? compact(m.cache_creation_tokens)
+          : attempted
+            ? '<span class="muted" title="This model cached implicitly — it read the prefix back without billing a separate write.">—</span>'
+            : '<span class="muted" title="Nothing was cached, so nothing was written.">—</span>';
+        const saved = m.saved_nano_aiu == null
+          ? '<span class="muted" title="No response from this model reported the per-token rates a saving is computed from.">—</span>'
+          : `<span class="${m.saved_nano_aiu > 0 ? 'status-ok' : m.saved_nano_aiu < 0 ? 'status-err' : 'muted'}" title="${m.saved_nano_aiu === 0 ? 'Computed from this model\u2019s own rates: nothing was cached, so nothing was saved.' : 'Computed from the per-token rates this model reported.'}">${aiu(m.saved_nano_aiu)}</span>`;
+        return `<tr>
+          <td class="mono">${esc(m.model)}</td>
+          <td>${bar}</td>
+          <td class="num">${m.requests}</td>
+          <td class="num">${compact(m.input_tokens)}</td>
+          <td class="num">${rate}</td>
+          <td class="num">${compact(m.cache_read_tokens)}</td>
+          <td class="num cache-write-col">${written}</td>
+          <td class="num">${saved}</td>
+        </tr>`;
+      }).join('');
+
+      // Only the Anthropic surface with an explicit `cache_control` marker ever
+      // bills a cache write; everything else caches implicitly, reading the
+      // prefix back without a write event. Measured across 12 calls with a
+      // 27k-token prefix: one write, on `/v1/messages`. On a workload that
+      // never touches that surface the column is a wall of dashes, and a column
+      // that can never say anything is better hidden than explained. Toggled
+      // after the rows are built, since it applies to cells that did not exist
+      // a moment ago.
+      const anyWrites = models.some(m => m.cache_creation_tokens > 0);
+      document.querySelectorAll('.cache-write-col')
+        .forEach(el => { el.style.display = anyWrites ? '' : 'none'; });
+
+      // Naming the reason once, under the table, beats repeating it in every
+      // dimmed cell. Two reasons produce an empty row and they need telling
+      // apart: a prompt too short to be eligible at all, and one long enough
+      // but never sent before, since nothing can be read back on first sight.
+      const idle = models.filter(m => (m.cache_read_tokens + m.cache_creation_tokens) === 0);
+      const tooShort = idle.filter(m => m.requests > 0 && m.input_tokens / m.requests < 4096);
+      const unseen = idle.filter(m => !tooShort.includes(m));
+      const implicit = models.filter(m => m.cache_read_tokens > 0 && m.cache_creation_tokens === 0);
+      const notes = [];
+      if (tooShort.length) {
+        notes.push(`${tooShort.length} of ${models.length} models cached nothing — their prompts stayed under Copilot's minimum cacheable prefix, around 4k tokens.`);
+      }
+      if (unseen.length) {
+        notes.push(`${unseen.map(m => esc(m.model)).join(', ')} cached nothing despite a long enough prompt — the prefix had not been sent before, or stopped matching.`);
+      }
+      if (anyWrites && implicit.length) {
+        notes.push(`${implicit.length} cached implicitly, reading the prefix back without a billed write; only the Anthropic surface with an explicit cache_control marker reports one.`);
+      }
+      document.getElementById('cacheFootnote').innerHTML =
+        notes.length ? `<div class="dim-note">${notes.join(' ')}</div>` : '';
+    }
+
+    async function loadModels() {
+      const data = await (await fetch('/api/models')).json();
+      const models = (data && data.data) || [];
+      document.getElementById('modelsSummary').textContent = `Supported models (${models.length})`;
+      document.getElementById('modelsBody').innerHTML = models.map(m =>
+        `<tr><td class="mono">${esc(m.id)}</td><td>${esc(m.display_name)}</td><td class="muted">${esc(m.owned_by)}</td></tr>`
+      ).join('');
+    }
+
+    async function refresh() {
+      // One failing endpoint must not blank the whole page.
+      await Promise.allSettled([loadStats(), loadHealth(), loadCache()]);
     }
     refresh();
     loadModels();

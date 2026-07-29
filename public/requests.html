@@ -4,70 +4,156 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>ghc-proxy · Requests</title>
+  <link rel="stylesheet" href="/app.css" />
   <style>
-    :root { color-scheme: light dark; }
-    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; padding: 2rem; background: #0d1117; color: #e6edf3; }
-    h1 { font-size: 1.4rem; margin: 0 0 1rem; }
-    a { color: #58a6ff; }
-    table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
-    th, td { text-align: left; padding: 0.5rem 0.75rem; border-bottom: 1px solid #30363d; white-space: nowrap; }
-    th { color: #8b949e; text-transform: uppercase; font-size: 0.7rem; letter-spacing: 0.05em; }
-    .status-ok { color: #3fb950; }
-    .status-err { color: #f85149; }
-    .pager { margin-top: 1rem; display: flex; gap: 0.5rem; align-items: center; }
-    button { background: #21262d; color: #e6edf3; border: 1px solid #30363d; border-radius: 6px; padding: 0.35rem 0.75rem; cursor: pointer; }
-    button:disabled { opacity: 0.5; cursor: default; }
+    /* Page-specific only; everything shared lives in /app.css. */
     tr.req-row { cursor: pointer; }
-    tr.req-row:hover td { background: #161b22; }
-    .caret { color: #8b949e; width: 1em; text-align: center; }
-    .detail-row td { background: #010409; padding: 0; }
+    tr.req-row:hover td { background: var(--surface-2); }
+    .caret { color: var(--muted); width: 1em; text-align: center; }
+    .detail-row td { background: #010409; padding: 0; white-space: normal; }
+    /* The detail sits inside the horizontally scrolling table, so without this
+     * it slides out of view the moment you scroll right to reach Duration.
+     * Pin it to the left edge and size it to the visible area, which JS
+     * measures because the cell itself is as wide as the whole table. */
+    .detail-row td > div { position: sticky; left: 0; width: var(--visible-width, 100%); }
     .detail { padding: 0.75rem 1rem; display: grid; gap: 0.75rem; }
-    .detail h3 { margin: 0; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.05em; color: #8b949e; }
+    .detail h3 { margin: 0; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
     .body-head { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; margin-bottom: 0.25rem; }
-    .copy-btn { background: transparent; border: 1px solid #30363d; border-radius: 5px; padding: 0.25rem 0.4rem; color: #8b949e; line-height: 0; cursor: pointer; }
-    .copy-btn:hover { color: #e6edf3; border-color: #8b949e; background: #21262d; }
-    .copy-btn.copied { color: #3fb950; border-color: #3fb950; }
-    pre { margin: 0; max-height: 360px; overflow: auto; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; padding: 0.75rem; font-size: 0.8rem; white-space: pre-wrap; word-break: break-word; }
-    .muted { color: #8b949e; font-style: italic; padding: 0.75rem 1rem; }
-    .cache-rate { color: #8b949e; font-size: 0.9em; }
-    .unknown { color: #8b949e; }
-    .idle-hot { color: #d29922; font-weight: 600; }
-    .sess { color: #58a6ff; cursor: pointer; font-family: ui-monospace, monospace; }
+    .copy-btn { background: transparent; border: 1px solid var(--border); border-radius: 5px; padding: 0.25rem 0.4rem; color: var(--muted); line-height: 0; cursor: pointer; }
+    .copy-btn:hover { color: var(--text); border-color: var(--muted); background: var(--surface-2); }
+    .copy-btn.copied { color: var(--ok); border-color: var(--ok); }
+    pre { margin: 0; max-height: 360px; overflow: auto; background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 0.75rem; font-size: 0.8rem; white-space: pre-wrap; word-break: break-word; }
+    .detail-row .muted { font-style: italic; padding: 0.75rem 1rem; }
+    .cache-rate { color: var(--muted); font-size: 0.9em; }
+    .unknown { color: var(--muted); }
+    .idle-hot { color: var(--warn); font-weight: 600; }
+    .sess { color: var(--accent); cursor: pointer; font-family: var(--mono); }
     .sess:hover { text-decoration: underline; }
-    .fail-kind { color: #f85149; font-size: 0.75em; opacity: 0.85; margin-top: 2px; }
+    .fail-kind { color: var(--danger); font-size: 0.75em; opacity: 0.85; margin-top: 2px; }
     tr.row-failed td { background: #2d1214; }
     tr.row-failed:hover td { background: #3d181b; }
-    .toolbar { display: flex; gap: 0.75rem; align-items: center; margin-bottom: 0.75rem; font-size: 0.85rem; color: #8b949e; }
-    .toolbar label { display: flex; gap: 0.35rem; align-items: center; cursor: pointer; }
+
+    /* --- conversation view (debug bodies) --------------------------------
+     * Raw JSON answers "what was on the wire". This answers "what was said",
+     * which is the question you actually have when a turn goes wrong. */
+    .detail-tabs { display: flex; gap: 0.25rem; }
+    .tab { font-size: 0.75rem; padding: 0.2rem 0.6rem; background: transparent; border: 1px solid transparent; color: var(--muted); }
+    .tab:hover { color: var(--text); }
+    .tab.active { background: var(--surface-2); border-color: var(--border); color: var(--text); }
+    .conv-sec > h3 { margin-bottom: 0.35rem; }
+    .chips { display: flex; flex-wrap: wrap; gap: 0.3rem; margin-bottom: 0.5rem; }
+    .chip { font-size: 0.72rem; padding: 0.1rem 0.45rem; border: 1px solid var(--border); border-radius: 999px; color: var(--muted); background: var(--bg); white-space: nowrap; }
+    .chip b { color: var(--text); font-weight: 600; }
+    .dim { color: var(--muted); }
+
+    /* Protocol-specific parameters. Kept out of the table, which can only carry
+     * what all three APIs share. */
+    .spec { border: 1px solid var(--border); border-radius: 6px; background: var(--bg); margin-bottom: 0.5rem; overflow: hidden; }
+    .spec-head { padding: 0.25rem 0.6rem; border-bottom: 1px solid var(--border); font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); font-weight: 600; }
+    .spec-tag { margin-left: 0.5rem; color: var(--warn); border: 1px solid var(--warn); border-radius: 999px; padding: 0 0.35rem; font-size: 0.9em; }
+    .spec-row { display: grid; grid-template-columns: 12rem minmax(0, 1fr); gap: 0.6rem; padding: 0.2rem 0.6rem; font-size: 0.78rem; }
+    .spec-k { color: var(--muted); font-family: var(--mono); }
+    .spec-v { color: var(--text); word-break: break-word; }
+    .spec-row.dim { color: var(--muted); display: block; }
+
+    .msg { display: grid; grid-template-columns: 76px minmax(0, 1fr); gap: 0.75rem; padding: 0.45rem 0; border-top: 1px solid var(--border); }
+    .msg:first-child { border-top: none; }
+    .role { font-size: 0.66rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); padding-top: 0.15rem; }
+    .role.user { color: var(--accent); }
+    .role.assistant { color: var(--ok); }
+    .role.system { color: var(--warn); }
+    .msg-body { display: grid; gap: 0.35rem; min-width: 0; }
+    /* Prose stops being readable long before it stops fitting, so the message
+     * text keeps a sane measure even when the page is 2000px wide. Tool
+     * payloads below are code and stay full width. */
+    .text { white-space: pre-wrap; word-break: break-word; font-size: 0.84rem; max-height: 320px; overflow: auto; max-width: 100ch; }
+
+    details.tool { border: 1px solid var(--border); border-radius: 6px; background: var(--bg); overflow: hidden; }
+    details.tool > summary { cursor: pointer; padding: 0.3rem 0.6rem; font-size: 0.78rem; list-style: none; }
+    details.tool > summary::-webkit-details-marker { display: none; }
+    details.tool > summary:hover { background: var(--surface-2); }
+    .tool-name { font-family: var(--mono); color: #d2a8ff; }
+    details.tool.result .tool-name { color: #f0883e; }
+    details.tool.think .tool-name { color: var(--muted); }
+    details.tool pre.args { border: none; border-top: 1px solid var(--border); border-radius: 0; max-height: 260px; }
+
+    /* What the response says happened, stated before the answer it produced. */
+    .outcome { font-size: 0.82rem; padding: 0.3rem 0.6rem; border-radius: 6px; margin-bottom: 0.5rem; background: var(--bg); border: 1px solid var(--border); }
+    .outcome b { font-family: var(--mono); }
+    .outcome.ok { border-color: rgba(63,185,80,0.4); }
+    .outcome.ok b { color: var(--ok); }
+    .outcome.warn { border-color: rgba(210,153,34,0.5); }
+    .outcome.warn b { color: var(--warn); }
+    .outcome.err { border-color: rgba(248,81,73,0.5); color: var(--danger); }
+    .outcome.err b { color: var(--danger); }
+
+    /* --- wire view (every SSE frame / every response field) --------------- */
+    .wire { display: grid; gap: 2px; max-height: 560px; overflow-y: auto; }
+    details.ev { border: 1px solid var(--border); border-radius: 5px; background: var(--bg); overflow: hidden; }
+    details.ev > summary {
+      cursor: pointer; list-style: none; padding: 0.25rem 0.5rem;
+      display: grid; grid-template-columns: 2.5rem 15rem minmax(0, 1fr); gap: 0.6rem;
+      align-items: baseline; font-size: 0.78rem;
+    }
+    details.ev > summary::-webkit-details-marker { display: none; }
+    details.ev > summary:hover { background: var(--surface-2); }
+    details.ev[open] > summary { border-bottom: 1px solid var(--border); }
+    .ev-n { color: var(--muted); text-align: right; font-variant-numeric: tabular-nums; }
+    .ev-name { font-family: var(--mono); color: #d2a8ff; overflow: hidden; text-overflow: ellipsis; }
+    /* Deltas carry newlines; nowrap collapses them so every frame stays one
+     * row tall and the list stays scannable. */
+    .ev-sum { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    details.ev pre.args { border: none; border-radius: 0; max-height: 320px; }
   </style>
 </head>
-<body>
-  <h1>Requests <a href="/" style="font-size:0.8rem">← Dashboard</a></h1>
-  <div class="toolbar">
-    <label><input type="checkbox" id="failedOnly" /> Failures only</label>
-    <span id="sessFilter"></span>
-    <span id="filterHint"></span>
-  </div>
-  <table>
-    <thead>
-      <tr>
-        <th></th><th>Time</th>
-        <th title="Client session (from metadata.user_id). Click to filter to just this session.">Session</th>
-        <th>Endpoint</th><th>Model</th><th>Status</th>
-        <th title="Total prompt tokens, with the share served from cache">In</th>
-        <th title="Prompt tokens written into the cache by this request — the new content of this turn">New</th>
-        <th>Out</th>
-        <th title="Longest silence between two upstream chunks. Large = the upstream went quiet; small = it kept sending and any stall was downstream.">Idle</th>
-        <th title="Keepalive probes the proxy wrote to the client. Pair with Idle: long idle + probes sent means the proxy kept signalling and the client ignored it; long idle + 0 probes means the keepalive itself failed.">Probes</th>
-        <th>Duration</th>
-      </tr>
-    </thead>
-    <tbody id="rows"></tbody>
-  </table>
-  <div class="pager">
-    <button id="prev">Prev</button>
-    <span id="info"></span>
-    <button id="next">Next</button>
+<body data-page="requests">
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="/">ghc-proxy</a>
+      <div class="nav-links">
+        <a href="/">Overview</a>
+        <a href="/requests">Requests</a>
+        <a href="/metrics/dashboard">Metrics</a>
+      </div>
+      <div class="nav-status" id="navStatus"><span class="dot"></span> connecting…</div>
+    </div>
+  </nav>
+
+  <div class="wrap">
+    <div class="panel">
+      <div class="panel-head">
+        <h2>Requests</h2>
+        <span class="aside toolbar">
+          <label><input type="checkbox" id="failedOnly" /> Failures only</label>
+          <label title="Capture request and response bodies. Applies from the next request; not saved to config, so it lapses on restart.">
+            <input type="checkbox" id="debugToggle" /> Capture bodies
+          </label>
+          <span id="sessFilter"></span>
+          <span id="filterHint"></span>
+        </span>
+      </div>
+      <div class="panel-body flush scroll-x">
+        <table>
+          <thead>
+            <tr>
+              <th></th><th>Time</th>
+              <th>Endpoint</th><th>Model</th><th>Status</th>
+              <th title="Total prompt tokens, with the share served from cache">In</th>
+              <th>Out</th>
+              <th title="Longest silence between two upstream chunks. Large = the upstream went quiet; small = it kept sending and any stall was downstream. Hover a value to see how many keepalive probes went out during that silence.">Idle</th>
+              <th>Duration</th>
+            </tr>
+          </thead>
+          <tbody id="rows"></tbody>
+        </table>
+        <div class="empty" id="rowsEmpty" style="display:none"></div>
+        <div class="pager">
+          <button id="prev">Prev</button>
+          <span id="info"></span>
+          <button id="next">Next</button>
+        </div>
+      </div>
+    </div>
   </div>
   <script>
     let page = 1;
@@ -127,6 +213,899 @@
               </div>`;
     }
 
+    // ---- conversation view ------------------------------------------------
+    // With --debug the proxy stores the bodies verbatim, which is the right
+    // thing to store and the wrong thing to read: finding what the model
+    // actually said means scrolling past tool schemas, filter results and, for
+    // streams, hundreds of SSE frames. These renderers reconstruct the
+    // conversation; the raw bodies stay one click away.
+
+    function tryParse(s) {
+      if (s == null) return null;
+      try { return JSON.parse(s); } catch (e) { return null; }
+    }
+
+    function isSse(raw) {
+      return typeof raw === 'string' && /^\s*(event|data):/.test(raw.slice(0, 32));
+    }
+
+    // Splits an SSE body into its frames, keeping the exact payload text so the
+    // expanded view shows what was on the wire rather than a re-serialisation.
+    function sseFrames(raw) {
+      const frames = [];
+      for (const frame of raw.split(/\r?\n\r?\n/)) {
+        let name = null;
+        const dataLines = [];
+        for (const line of frame.split(/\r?\n/)) {
+          if (line.startsWith('event:')) name = line.slice(6).trim();
+          else if (line.startsWith('data:')) dataLines.push(line.slice(5).trim());
+        }
+        if (!dataLines.length && !name) continue;
+        const data = dataLines.join('\n');
+        frames.push({ name, data, parsed: tryParse(data) });
+      }
+      return frames;
+    }
+
+    // A WebSocket transcript is newline-delimited JSON events rather than SSE
+    // frames: the same `response.*` vocabulary, one event per socket frame.
+    // Both feed the same reassembly, because only the transport differs.
+    function wireFrames(raw) {
+      if (raw == null || raw === '') return { kind: 'none', frames: [] };
+      if (isSse(raw)) return { kind: 'sse', frames: sseFrames(raw) };
+      const lines = String(raw).split(/\r?\n/).filter(l => l.trim());
+      if (lines.length > 1) {
+        const parsed = lines.map(tryParse);
+        if (parsed.every(p => p && typeof p === 'object' && !Array.isArray(p))) {
+          return {
+            kind: 'ndjson',
+            frames: parsed.map((p, i) => ({ name: null, data: lines[i], parsed: p })),
+          };
+        }
+      }
+      return { kind: 'json', frames: [] };
+    }
+
+    function chip(label, value) {
+      if (value == null || value === '') return '';
+      return `<span class="chip">${escapeHtml(label)} <b>${escapeHtml(value)}</b></span>`;
+    }
+
+    function textBlock(s) {
+      const t = String(s ?? '');
+      if (!t) return '<div class="text dim">(empty)</div>';
+      return `<div class="text">${escapeHtml(t)}</div>`;
+    }
+
+    function toolCard(name, payload, extraClass, idLabel) {
+      const args = typeof payload === 'string' ? payload : JSON.stringify(payload ?? {}, null, 2);
+      const marker = extraClass === 'result' ? '↩' : '⚙';
+      return `<details class="tool ${extraClass || ''}">
+                <summary>${marker} <span class="tool-name">${escapeHtml(name)}</span>` +
+             (idLabel ? ` <span class="dim">${escapeHtml(idLabel)}</span>` : '') +
+             `</summary>
+                <pre class="args">${escapeHtml(args)}</pre>
+              </details>`;
+    }
+
+    // tool_result content is a string in some clients and a block array in
+    // others; both have to read the same way.
+    function flattenContent(c) {
+      if (c == null) return '';
+      if (typeof c === 'string') return c;
+      if (Array.isArray(c)) {
+        return c.map(b => {
+          if (typeof b === 'string') return b;
+          if (b && b.type === 'text') return b.text ?? '';
+          return JSON.stringify(b, null, 2);
+        }).join('\n');
+      }
+      return JSON.stringify(c, null, 2);
+    }
+
+    function contentBlock(b) {
+      if (typeof b === 'string') return textBlock(b);
+      if (!b || typeof b !== 'object') return textBlock(String(b));
+      // Gemini parts carry no `type` discriminator — the field that is present
+      // is the type.
+      if (b.type == null) {
+        if (b.functionCall) return toolCard(b.functionCall.name || 'tool', b.functionCall.args ?? {});
+        if (b.functionResponse) {
+          return toolCard('functionResponse', b.functionResponse.response ?? {}, 'result', b.functionResponse.name);
+        }
+        if (b.inlineData) return `<div class="text dim">[inline ${escapeHtml(b.inlineData.mimeType || '')}]</div>`;
+        if (b.thought === true && typeof b.text === 'string') return toolCard('thought', b.text, 'think');
+        if (typeof b.text === 'string') return textBlock(b.text);
+      }
+      switch (b.type) {
+        case 'text':
+        // The Responses API tags the same thing differently depending on which
+        // direction it travelled.
+        case 'input_text':
+        case 'output_text':
+          return textBlock(b.text);
+        case 'thinking': return toolCard('thinking', b.thinking ?? b.text ?? '', 'think');
+        case 'reasoning':
+          return toolCard('reasoning', flattenContent(b.summary ?? b.content ?? ''), 'think');
+        case 'tool_use': return toolCard(b.name || 'tool', b.input ?? {}, '', b.id);
+        case 'function_call':
+          return toolCard(b.name || 'tool', tryParse(b.arguments) ?? b.arguments ?? {}, '', b.call_id);
+        case 'function_call_output':
+          return toolCard('tool_result', flattenContent(b.output), 'result', b.call_id);
+        case 'tool_result':
+          return toolCard('tool_result', flattenContent(b.content), 'result', b.tool_use_id);
+        case 'image':
+        case 'input_image':
+          return `<div class="text dim">[image ${escapeHtml((b.source && b.source.media_type) || b.detail || '')}]</div>`;
+        default:
+          return toolCard(b.type || 'block', b, '');
+      }
+    }
+
+    function messageRow(m) {
+      const role = (m && m.role) || 'user';
+      let body = '';
+      // Reasoning precedes the answer it explains, so it is rendered first.
+      const reasoning = m.reasoning_text ?? m.reasoning_content ?? m.reasoning;
+      if (typeof reasoning === 'string' && reasoning) body += toolCard('reasoning', reasoning, 'think');
+      // Gemini calls the content array `parts`.
+      const content = m.content != null ? m.content : m.parts;
+      if (typeof content === 'string') body += textBlock(content);
+      else if (Array.isArray(content)) body += content.map(contentBlock).join('');
+      else if (content != null) body += textBlock(JSON.stringify(content, null, 2));
+
+      // OpenAI puts tool calls beside the content rather than inside it.
+      if (Array.isArray(m.tool_calls)) {
+        body += m.tool_calls.map(tc => {
+          const fn = tc.function || {};
+          const parsed = typeof fn.arguments === 'string' ? tryParse(fn.arguments) : fn.arguments;
+          return toolCard(fn.name || 'tool', parsed ?? fn.arguments ?? {}, '', tc.id);
+        }).join('');
+      }
+      if (!body) body = '<div class="text dim">(empty)</div>';
+      return `<div class="msg">
+                <div class="role ${escapeHtml(role)}">${escapeHtml(role)}</div>
+                <div class="msg-body">${body}</div>
+              </div>`;
+    }
+
+    // Which wire protocol this record used. The three surfaces disagree about
+    // almost every optional parameter, so the detail view has to know which one
+    // it is looking at before it can name anything.
+    //
+    // `called` is the endpoint the client used; `actual` is the shape of the
+    // body that was recorded, which is what went upstream. They differ on the
+    // Gemini surface, where the proxy translates to chat completions before
+    // forwarding — and parameters with no counterpart (`topK`,
+    // `safetySettings`) are dropped in that translation. Saying so beats
+    // showing an empty panel and letting the reader assume they took effect.
+    function apiSurface(endpoint, q) {
+      const e = endpoint || '';
+      const called = e.startsWith('/v1beta') ? 'gemini'
+        : e.includes('/responses') ? 'responses'
+        : e.includes('/messages') ? 'anthropic'
+        : 'chat';
+      const actual = q.contents ? 'gemini'
+        : (q.input && !q.messages) ? 'responses'
+        : (q.system != null || q.metadata != null || q.stop_sequences != null || q.top_k != null) ? 'anthropic'
+        : 'chat';
+      return { called, actual };
+    }
+
+    const API_LABEL = {
+      anthropic: 'Anthropic Messages',
+      chat: 'OpenAI Chat Completions',
+      responses: 'OpenAI Responses',
+      gemini: 'Gemini',
+    };
+
+    // Parameters that exist on one surface and not the others. Kept out of the
+    // request table, which can only carry what every protocol has in common —
+    // a column that is structurally empty for two of three APIs is noise.
+    //
+    // Each entry yields a value only when the request actually set it, so the
+    // panel shows what this call did rather than a form of blanks.
+    const API_PARAMS = {
+      anthropic: [
+        ['thinking', q => q.thinking && `${q.thinking.type ?? 'enabled'}${q.thinking.budget_tokens ? ` · ${compactTokens(q.thinking.budget_tokens)} budget` : ''}`],
+        ['system blocks', q => Array.isArray(q.system) && q.system.length],
+        ['cache_control marks', q => countCacheControl(q)],
+        ['top_k', q => q.top_k],
+        ['stop_sequences', q => Array.isArray(q.stop_sequences) && q.stop_sequences.length],
+        ['tool_choice', q => q.tool_choice && (q.tool_choice.type ?? String(q.tool_choice))],
+        ['context_management', q => q.context_management && 'enabled'],
+        ['service_tier', q => q.service_tier],
+      ],
+      chat: [
+        ['seed', q => q.seed],
+        ['n', q => q.n],
+        ['frequency_penalty', q => q.frequency_penalty],
+        ['presence_penalty', q => q.presence_penalty],
+        ['response_format', q => q.response_format && (q.response_format.type ?? String(q.response_format))],
+        ['logprobs', q => q.logprobs && (q.top_logprobs != null ? `top ${q.top_logprobs}` : 'on')],
+        ['parallel_tool_calls', q => q.parallel_tool_calls === false && 'disabled'],
+        ['tool_choice', q => q.tool_choice && (q.tool_choice.type ?? String(q.tool_choice))],
+        ['stop', q => q.stop && (Array.isArray(q.stop) ? q.stop.length + ' sequence(s)' : q.stop)],
+        ['stream usage', q => q.stream_options && q.stream_options.include_usage && 'requested'],
+      ],
+      responses: [
+        ['reasoning effort', q => q.reasoning && q.reasoning.effort],
+        ['reasoning summary', q => q.reasoning && q.reasoning.summary],
+        ['max_output_tokens', q => q.max_output_tokens],
+        ['truncation', q => q.truncation],
+        ['store', q => q.store === false ? 'false' : (q.store === true ? 'true' : null)],
+        ['previous_response_id', q => q.previous_response_id],
+        ['text format', q => q.text && q.text.format && q.text.format.type],
+        ['include', q => Array.isArray(q.include) && q.include.join(', ')],
+      ],
+      gemini: [
+        ['temperature', q => q.generationConfig && q.generationConfig.temperature],
+        ['topK', q => q.generationConfig && q.generationConfig.topK],
+        ['topP', q => q.generationConfig && q.generationConfig.topP],
+        ['maxOutputTokens', q => q.generationConfig && q.generationConfig.maxOutputTokens],
+        ['thinkingBudget', q => q.generationConfig && q.generationConfig.thinkingConfig && q.generationConfig.thinkingConfig.thinkingBudget],
+        ['safetySettings', q => Array.isArray(q.safetySettings) && q.safetySettings.length],
+        ['systemInstruction', q => q.systemInstruction && 'present'],
+        ['functionDeclarations', q => Array.isArray(q.tools) && q.tools.reduce((n, t) => n + ((t.functionDeclarations || []).length), 0)],
+      ],
+    };
+
+    // How much of the prompt the client marked cacheable. A turn that suddenly
+    // stops marking blocks is the cause behind a collapsed hit rate.
+    function countCacheControl(q) {
+      let n = 0;
+      const walk = c => {
+        if (Array.isArray(c)) for (const b of c) { if (b && b.cache_control) n++; }
+      };
+      walk(q.system);
+      for (const m of q.messages || []) walk(m.content);
+      for (const t of q.tools || []) if (t && t.cache_control) n++;
+      return n;
+    }
+
+    function specRows(pairs) {
+      const rows = pairs
+        .map(([label, get]) => {
+          let v;
+          try { v = get(); } catch (e) { v = null; }
+          if (v == null || v === false || v === '' || v === 0) return '';
+          return `<div class="spec-row"><span class="spec-k">${escapeHtml(label)}</span><span class="spec-v">${escapeHtml(v)}</span></div>`;
+        })
+        .filter(Boolean)
+        .join('');
+      return rows;
+    }
+
+    /// Protocol-specific request parameters, plus the session id, which only
+    /// the Anthropic surface carries (Claude Code encodes it as JSON inside
+    /// `metadata.user_id`).
+    function apiPanel(surface, q, sessionId) {
+      const { called, actual } = surface;
+      const translated = called !== actual;
+      const pairs = (API_PARAMS[actual] || []).map(([label, get]) => [label, () => get(q)]);
+      let rows = specRows(pairs);
+      if (sessionId) {
+        rows += `<div class="spec-row"><span class="spec-k">session</span>` +
+                `<span class="spec-v"><span class="sess" data-sess="${escapeHtml(sessionId)}" ` +
+                `title="Click to filter the list to this session">${escapeHtml(sessionId)}</span></span></div>`;
+      }
+      const title = translated
+        ? `${API_LABEL[called]} → ${API_LABEL[actual]}`
+        : API_LABEL[actual] || actual;
+      const head = `<div class="spec-head">${escapeHtml(title)}${translated ? '<span class="spec-tag">translated</span>' : ''}</div>`;
+      // Naming the casualties beats a general apology: these are the only two
+      // Gemini parameters with no counterpart in the chat completions schema,
+      // so they are the only ones that go missing.
+      const note = translated
+        ? `<div class="spec-row dim">Rewritten before forwarding. <b>topK</b> and <b>safetySettings</b> have no counterpart on the target surface and are dropped.</div>`
+        : '';
+      return rows || note
+        ? `<div class="spec">${head}${note}${rows}</div>`
+        : `<div class="spec">${head}<div class="spec-row dim">No protocol-specific parameters set.</div></div>`;
+    }
+
+    function renderRequest(raw, endpoint, sessionId) {
+      const q = tryParse(raw);
+      if (!q) return `<div class="text dim">Body is not JSON — see the Raw tab.</div>`;
+      const surface = apiSurface(endpoint, q);
+
+      const toolNames = Array.isArray(q.tools)
+        ? q.tools.map(t => t.name || (t.function && t.function.name) ||
+            (Array.isArray(t.functionDeclarations) && t.functionDeclarations.map(f => f.name).join(', ')))
+            .filter(Boolean)
+        : [];
+      // Parameters every surface shares. Anything protocol-specific goes to the
+      // panel below rather than into this row, so the row means the same thing
+      // whichever API you are looking at.
+      const chips = [
+        chip('model', q.model),
+        chip('max_tokens', q.max_tokens ?? q.max_output_tokens),
+        chip('temperature', q.temperature),
+        chip('top_p', q.top_p),
+        q.stream ? '<span class="chip"><b>stream</b></span>' : '',
+        toolNames.length
+          ? `<span class="chip">tools <b>${toolNames.length}</b> <span class="dim">${escapeHtml(toolNames.slice(0, 5).join(', '))}${toolNames.length > 5 ? '…' : ''}</span></span>`
+          : ''
+      ].join('');
+
+      let rows = '';
+      if (q.system != null) rows += messageRow({ role: 'system', content: q.system });
+      if (q.systemInstruction != null) {
+        rows += messageRow({ role: 'system', content: q.systemInstruction.parts || q.systemInstruction });
+      }
+      // The same field is `messages` on Anthropic and chat completions, `input`
+      // on the Responses API, and `contents` on Gemini.
+      const msgs = q.messages ?? q.input ?? q.contents ?? [];
+      if (Array.isArray(msgs)) rows += msgs.map(messageRow).join('');
+      // The Responses API also accepts a bare string, which is still a user turn.
+      else if (typeof msgs === 'string') rows += messageRow({ role: 'user', content: msgs });
+      else rows += textBlock(JSON.stringify(msgs, null, 2));
+
+      return (chips ? `<div class="chips">${chips}</div>` : '') +
+             apiPanel(surface, q, sessionId) +
+             (rows || '<div class="text dim">(no messages)</div>');
+    }
+
+    // Reassemble an SSE transcript into the message it describes. Deltas are
+    // concatenated per content block, so a tool call's argument JSON — which
+    // arrives one fragment at a time — reads as the object it becomes.
+    //
+    // Three wire formats reach this function and none of them agree: Anthropic
+    // numbers content blocks and tags every delta, chat completions hides tool
+    // arguments inside `choices[].delta.tool_calls[]`, and the Responses API
+    // uses a flat `response.*` event vocabulary where the delta is a bare
+    // string. Blocks are keyed per format so their indexes cannot collide.
+    // ---- outcome summary --------------------------------------------------
+    // What the response actually says happened. Every surface spells the same
+    // handful of endings differently and buries them in a different place, so
+    // the codes are normalized here and then explained — a turn that stopped at
+    // `length` and one that stopped at `MAX_TOKENS` are the same event, and
+    // both mean the answer on screen is not the whole answer.
+
+    const OUTCOME = {
+      // Anthropic
+      end_turn: ['ok', 'Finished on its own.'],
+      max_tokens: ['warn', 'Cut off at the token limit — the answer is incomplete.'],
+      stop_sequence: ['ok', 'Stopped at a stop sequence.'],
+      tool_use: ['ok', 'Paused to call a tool. Send the result back to continue.'],
+      refusal: ['err', 'The model declined to answer.'],
+      pause_turn: ['warn', 'Paused mid-turn. Resend to continue.'],
+      // Chat completions
+      stop: ['ok', 'Finished on its own.'],
+      length: ['warn', 'Cut off at the token limit — the answer is incomplete.'],
+      tool_calls: ['ok', 'Paused to call a tool. Send the result back to continue.'],
+      function_call: ['ok', 'Paused to call a function.'],
+      content_filter: ['err', 'Blocked by the content filter.'],
+      // Responses API
+      completed: ['ok', 'Finished on its own.'],
+      incomplete: ['warn', 'Ended before finishing.'],
+      failed: ['err', 'The turn failed upstream.'],
+      max_output_tokens: ['warn', 'Cut off at the token limit — the answer is incomplete.'],
+      // Gemini
+      STOP: ['ok', 'Finished on its own.'],
+      MAX_TOKENS: ['warn', 'Cut off at the token limit — the answer is incomplete.'],
+      SAFETY: ['err', 'Blocked by a safety filter.'],
+      RECITATION: ['err', 'Blocked for reproducing training data.'],
+      OTHER: ['warn', 'Stopped for an unstated reason.'],
+    };
+
+    function pushIf(rows, label, value, note) {
+      if (value == null || value === '' || value === false) return;
+      rows.push([label, String(value), note]);
+    }
+
+    /// Reads a response into a normalized outcome, whichever surface produced
+    /// it and whichever transport carried it.
+    function responseFacts(raw) {
+      const wire = wireFrames(raw);
+      const objs = wire.frames.length
+        ? wire.frames.map(f => f.parsed).filter(Boolean)
+        : [tryParse(raw)].filter(Boolean);
+      if (!objs.length) return null;
+
+      let stop = null, usage = null, billed = null, model = null;
+      const rows = [];
+      const flagged = [];
+
+      for (const d of objs) {
+        if (typeof d.copilot_usage?.total_nano_aiu === 'number') billed = d.copilot_usage.total_nano_aiu;
+
+        // Anthropic: streamed in message_delta, top level when not streamed.
+        stop = (d.delta && d.delta.stop_reason) ?? d.stop_reason ?? stop;
+        if (d.stop_sequence) pushIf(rows, 'stop_sequence', d.stop_sequence);
+
+        // Chat completions.
+        for (const c of d.choices || []) {
+          stop = c.finish_reason ?? stop;
+          // Only surface a filter verdict that is actually a verdict; an
+          // all-clear on four categories is noise on every single request.
+          for (const [cat, v] of Object.entries(c.content_filter_results || {})) {
+            if (v && (v.filtered || (v.severity && v.severity !== 'safe'))) {
+              flagged.push(`${cat}: ${v.filtered ? 'filtered' : v.severity}`);
+            }
+          }
+        }
+        for (const pf of d.prompt_filter_results || []) {
+          for (const [cat, v] of Object.entries(pf.content_filter_results || {})) {
+            if (v && (v.filtered || (v.severity && v.severity !== 'safe'))) {
+              flagged.push(`prompt ${cat}: ${v.filtered ? 'filtered' : v.severity}`);
+            }
+          }
+        }
+
+        // Responses API — the whole object when not streamed, under `response`
+        // on the terminal event when streamed.
+        const resp = d.response && typeof d.response === 'object' ? d.response : (d.object === 'response' ? d : null);
+        if (resp) {
+          stop = (resp.incomplete_details && resp.incomplete_details.reason) || resp.status || stop;
+          if (resp.usage) usage = resp.usage;
+          model = resp.model || model;
+          if (resp.reasoning && resp.reasoning.effort) pushIf(rows, 'reasoning effort', resp.reasoning.effort);
+          pushIf(rows, 'service tier', resp.service_tier);
+          pushIf(rows, 'cache retention', resp.prompt_cache_retention,
+                 'How long the prompt prefix stays warm upstream.');
+          if (resp.text && resp.text.verbosity) pushIf(rows, 'verbosity', resp.text.verbosity);
+          if (Array.isArray(resp.output) && resp.output.length) {
+            const kinds = resp.output.map(o => o.type).filter(Boolean);
+            pushIf(rows, 'output items', kinds.join(', '));
+          }
+        }
+
+        // Gemini, native shape.
+        for (const c of d.candidates || []) {
+          stop = c.finishReason ?? stop;
+          for (const s of c.safetyRatings || []) {
+            if (s.blocked || (s.probability && s.probability !== 'NEGLIGIBLE')) {
+              flagged.push(`${s.category}: ${s.blocked ? 'blocked' : s.probability}`);
+            }
+          }
+        }
+        if (d.usageMetadata) usage = d.usageMetadata;
+
+        if (d.usage && typeof d.usage === 'object') usage = d.usage;
+        if (d.message && d.message.usage) usage = d.message.usage;
+        model = d.model || model;
+        pushIf(rows, 'service tier', d.service_tier);
+        pushIf(rows, 'backend build', d.system_fingerprint,
+               'A change here can shift results for identical input.');
+      }
+
+      usage = usage || {};
+      // Anthropic states how long the cache it wrote will live.
+      const cc = usage.cache_creation || {};
+      if (cc.ephemeral_5m_input_tokens) pushIf(rows, 'cache write (5m TTL)', compactTokens(cc.ephemeral_5m_input_tokens));
+      if (cc.ephemeral_1h_input_tokens) pushIf(rows, 'cache write (1h TTL)', compactTokens(cc.ephemeral_1h_input_tokens));
+      if (usage.inference_geo && usage.inference_geo !== 'not_available') {
+        pushIf(rows, 'inference region', usage.inference_geo);
+      }
+      const ctd = usage.completion_tokens_details || {};
+      if (ctd.rejected_prediction_tokens) {
+        pushIf(rows, 'rejected predictions', compactTokens(ctd.rejected_prediction_tokens),
+               'Speculative tokens the model produced and then discarded. Billed.');
+      }
+
+      return { stop, usage, billed, model, rows, flagged };
+    }
+
+    /// Renders the outcome as a headline plus the facts behind it. Replaces the
+    /// bare chip row: the numbers were there before, but not what they meant.
+    function outcomePanel(facts, eventCount) {
+      if (!facts) return '';
+      const [tone, meaning] = OUTCOME[facts.stop] || ['', ''];
+      const u = facts.usage || {};
+      const inTok = u.input_tokens ?? u.prompt_tokens ?? u.promptTokenCount;
+      const outTok = u.output_tokens ?? u.completion_tokens ?? u.candidatesTokenCount;
+      const cacheRead = u.cache_read_input_tokens
+        ?? (u.input_tokens_details && u.input_tokens_details.cached_tokens)
+        ?? (u.prompt_tokens_details && u.prompt_tokens_details.cached_tokens);
+      const reasoning = (u.output_tokens_details && u.output_tokens_details.reasoning_tokens)
+        ?? (u.completion_tokens_details && u.completion_tokens_details.reasoning_tokens)
+        ?? u.reasoning_tokens;
+
+      const chips = [
+        eventCount != null ? `<span class="chip">${eventCount} <b>events</b></span>` : '',
+        chip('model', facts.model),
+        chip('in', inTok == null ? null : compactTokens(inTok)),
+        cacheRead ? chip('cached', compactTokens(cacheRead)) : '',
+        chip('out', outTok == null ? null : compactTokens(outTok)),
+        reasoning ? chip('reasoning', compactTokens(reasoning)) : '',
+        u.cache_creation_input_tokens ? chip('cache write', compactTokens(u.cache_creation_input_tokens)) : '',
+        // What Copilot charged, as opposed to what a price list would guess.
+        facts.billed != null
+          ? `<span class="chip" title="What Copilot billed for this turn, reported by the upstream">billed <b>${(facts.billed / 1e9).toFixed(6)}</b> AIU</span>`
+          : '',
+      ].join('');
+
+      const head = facts.stop
+        ? `<div class="outcome ${tone}"><b>${escapeHtml(facts.stop)}</b>${meaning ? ' — ' + escapeHtml(meaning) : ''}</div>`
+        : '';
+
+      const flagged = facts.flagged.length
+        ? `<div class="outcome err">Content filter: ${escapeHtml([...new Set(facts.flagged)].join(' · '))}</div>`
+        : '';
+
+      // Deduplicate: streams restate the same facts on every frame.
+      const seen = new Set();
+      const rows = facts.rows.filter(([k, v]) => {
+        const key = k + '=' + v;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      }).map(([k, v, note]) =>
+        `<div class="spec-row"><span class="spec-k">${escapeHtml(k)}</span>` +
+        `<span class="spec-v">${escapeHtml(v)}${note ? ` <span class="dim">${escapeHtml(note)}</span>` : ''}</span></div>`
+      ).join('');
+
+      return `<div class="chips">${chips}</div>${head}${flagged}` +
+             (rows ? `<div class="spec">${rows}</div>` : '');
+    }
+
+    function renderSse(frames, summaryFacts) {
+      const blocks = new Map();
+      const at = (key, type) => {
+        let b = blocks.get(key);
+        if (!b) { b = { type: type || 'text', name: null, text: '', json: '' }; blocks.set(key, b); }
+        return b;
+      };
+      let stop = null, model = null, completed = null;
+      const count = frames.length;
+      const usage = {};
+
+      for (const f of frames) {
+        const d = f.parsed;
+        if (!d) continue;
+
+        switch (d.type) {
+          // ---- Anthropic messages ----
+          case 'message_start':
+            model = (d.message && d.message.model) || model;
+            Object.assign(usage, (d.message && d.message.usage) || {});
+            break;
+          case 'content_block_start': {
+            const cb = d.content_block || {};
+            const b = at(`a${d.index ?? 0}`);
+            b.type = cb.type || 'text';
+            b.name = cb.name || null;
+            b.text = cb.text || '';
+            break;
+          }
+          case 'content_block_delta': {
+            const b = at(`a${d.index ?? 0}`);
+            const del = d.delta || {};
+            if (del.type === 'input_json_delta') b.json += del.partial_json || '';
+            else if (del.type === 'thinking_delta') b.text += del.thinking || '';
+            else b.text += del.text || '';
+            break;
+          }
+          case 'message_delta':
+            stop = (d.delta && d.delta.stop_reason) ?? stop;
+            Object.assign(usage, d.usage || {});
+            break;
+
+          // ---- OpenAI Responses API ----
+          case 'response.created':
+          case 'response.in_progress':
+            model = (d.response && d.response.model) || model;
+            break;
+          case 'response.output_item.added': {
+            const item = d.item || {};
+            if (item.type === 'function_call') {
+              const b = at(`r${d.output_index ?? 0}`);
+              b.type = 'tool_use';
+              b.name = item.name || 'tool';
+            }
+            break;
+          }
+          case 'response.output_text.delta':
+            at(`r${d.output_index ?? 0}`).text += typeof d.delta === 'string' ? d.delta : '';
+            break;
+          case 'response.reasoning_summary_text.delta': {
+            const b = at(`rs${d.output_index ?? 0}`, 'thinking');
+            b.type = 'thinking';
+            b.text += typeof d.delta === 'string' ? d.delta : '';
+            break;
+          }
+          case 'response.function_call_arguments.delta': {
+            const b = at(`r${d.output_index ?? 0}`);
+            b.type = 'tool_use';
+            b.json += typeof d.delta === 'string' ? d.delta : '';
+            break;
+          }
+          case 'response.completed':
+          case 'response.incomplete':
+          case 'response.failed': {
+            const resp = d.response || {};
+            completed = resp;
+            model = resp.model || model;
+            stop = (resp.incomplete_details && resp.incomplete_details.reason) || resp.status || stop;
+            const u = resp.usage || {};
+            if (u.input_tokens != null) usage.input_tokens = u.input_tokens;
+            if (u.output_tokens != null) usage.output_tokens = u.output_tokens;
+            const cached = u.input_tokens_details && u.input_tokens_details.cached_tokens;
+            if (cached != null) usage.cache_read_input_tokens = cached;
+            break;
+          }
+
+          default:
+            // ---- OpenAI chat completions chunk ----
+            if (Array.isArray(d.choices)) {
+              model = d.model || model;
+              if (d.usage) Object.assign(usage, d.usage);
+              for (const c of d.choices) {
+                const del = c.delta || {};
+                if (del.content) at('o0').text += del.content;
+                // Reasoning arrives beside the answer rather than inside it,
+                // under a name that varies by family. Dropping it loses the
+                // part of the turn that explains the rest.
+                const reasoning = del.reasoning_text ?? del.reasoning_content ?? del.reasoning;
+                if (typeof reasoning === 'string' && reasoning) {
+                  const b = at('othink', 'thinking');
+                  b.type = 'thinking';
+                  b.text += reasoning;
+                }
+                // Arguments arrive as fragments; only the first frame carries
+                // the function name, so never overwrite it with undefined.
+                for (const tc of del.tool_calls || []) {
+                  const b = at(`t${tc.index ?? 0}`);
+                  b.type = 'tool_use';
+                  const fn = tc.function || {};
+                  if (fn.name) b.name = fn.name;
+                  if (fn.arguments) b.json += fn.arguments;
+                }
+                if (c.finish_reason) stop = c.finish_reason;
+              }
+            }
+        }
+      }
+
+      let list = [...blocks.values()];
+      // A Responses stream can carry its whole payload in the terminal event
+      // with no deltas at all. Falling back to it beats reporting an empty
+      // stream for a turn that plainly produced text.
+      if (list.length === 0 && completed && Array.isArray(completed.output)) {
+        list = completed.output.flatMap(item => {
+          if (item.type === 'function_call') {
+            return [{ type: 'tool_use', name: item.name, text: '', json: item.arguments || '' }];
+          }
+          return (item.content || [])
+            .filter(p => typeof p.text === 'string')
+            .map(p => ({ type: 'text', text: p.text, json: '' }));
+        });
+      }
+
+      const rendered = list.map(b => {
+        if (b.type === 'tool_use') return toolCard(b.name || 'tool', tryParse(b.json) ?? (b.json || '{}'));
+        if (b.type === 'thinking') return toolCard('thinking', b.text, 'think');
+        return textBlock(b.text);
+      }).join('');
+
+      const out = usage.output_tokens ?? usage.completion_tokens ?? 0;
+      // A stream with billed output but nothing to show is not a rendering
+      // failure: o-series models spend the budget on reasoning the upstream
+      // never emits, and a low max_tokens can exhaust it before any answer.
+      // Saying so beats leaving the reader to suspect the dashboard.
+      const emptyNote = stop === 'length' && out > 0
+        ? `No visible output. The turn stopped at its token limit after ${out} output tokens — reasoning models can spend the whole budget on reasoning the upstream does not send. Raise max_tokens.`
+        : 'Stream produced no content.';
+
+      return outcomePanel(summaryFacts, count) +
+             `<div class="msg">
+                <div class="role assistant">assistant</div>
+                <div class="msg-body">${rendered || `<div class="text dim">${emptyNote}</div>`}</div>
+              </div>`;
+    }
+
+    function renderResponse(raw) {
+      if (raw == null || raw === '') return '<div class="text dim">(none)</div>';
+      // What the response says happened, ahead of what it said.
+      const facts = responseFacts(raw);
+      // An event transcript, whichever transport carried it.
+      const wire = wireFrames(raw);
+      if (wire.frames.length) return renderSse(wire.frames, facts);
+
+      const j = tryParse(raw);
+      if (!j) return `<div class="text">${escapeHtml(raw)}</div>`;
+      if (j.error) {
+        return `<div class="text status-err">${escapeHtml(j.error.message || JSON.stringify(j.error, null, 2))}</div>`;
+      }
+      if (Array.isArray(j.content)) {
+        const body = j.content.map(contentBlock).join('') || '<div class="text dim">(no content)</div>';
+        return outcomePanel(facts) +
+          `<div class="msg"><div class="role assistant">assistant</div><div class="msg-body">${body}</div></div>`;
+      }
+      if (Array.isArray(j.choices)) {
+        return outcomePanel(facts) + j.choices.map(c => messageRow(c.message || c.delta || {})).join('');
+      }
+      // Responses API: a flat list of output items rather than a message.
+      if (Array.isArray(j.output)) {
+        const body = j.output.map(item => {
+          if (Array.isArray(item.content)) return item.content.map(contentBlock).join('');
+          return contentBlock(item);
+        }).join('');
+        return outcomePanel(facts) +
+          `<div class="msg"><div class="role assistant">assistant</div><div class="msg-body">${body || '<div class="text dim">(no content)</div>'}</div></div>`;
+      }
+      // Gemini, native shape.
+      if (Array.isArray(j.candidates)) {
+        const body = j.candidates.map(c => ((c.content || {}).parts || []).map(contentBlock).join('')).join('');
+        return outcomePanel(facts) +
+          `<div class="msg"><div class="role assistant">assistant</div><div class="msg-body">${body || '<div class="text dim">(no content)</div>'}</div></div>`;
+      }
+      return `<div class="text">${escapeHtml(JSON.stringify(j, null, 2))}</div>`;
+    }
+
+    function detailView(r) {
+      const wire = wireFrames(r.response_body);
+      const streamed = wire.frames.length > 0;
+      const wireLabel = streamed ? `Events <b>${wire.frames.length}</b>` : 'Fields';
+      return `<div class="detail">
+                <div class="detail-tabs">
+                  <button class="tab active" data-view="pretty">Conversation</button>
+                  <button class="tab" data-view="wire">${wireLabel}</button>
+                  <button class="tab" data-view="raw">Raw</button>
+                </div>
+                <div data-pane="pretty">
+                  <div class="conv-sec"><h3>Request</h3>${renderRequest(r.request_body, r.endpoint, r.session_id)}</div>
+                  <div class="conv-sec"><h3>Response</h3>${renderResponse(r.response_body)}</div>
+                </div>
+                <div data-pane="wire" hidden>${renderWire(r.response_body, streamed, wire.frames)}</div>
+                <div data-pane="raw" hidden>
+                  ${bodyBlock('Request body', pretty(r.request_body))}
+                  ${bodyBlock('Response body', pretty(r.response_body))}
+                </div>
+              </div>`;
+    }
+
+    // Rendering a frame per DOM node is fine for a normal turn and ruinous for
+    // a very long one, so the list is capped and says when it truncated rather
+    // than quietly dropping the tail. The full text is always on the Raw tab.
+    const MAX_FRAMES = 2000;
+
+    /// Fields that carry no information for a human scanning the list: opaque
+    /// ids, the padding upstream adds, and per-token logprob arrays.
+    const NOISY_FIELDS = new Set(['item_id', 'obfuscation', 'logprobs', 'sequence_number', 'type']);
+
+    /// One-line gist of a frame, so the list can be scanned without expanding
+    /// every row. Falls back to the scalar fields when the shape is unfamiliar —
+    /// an unrecognised event is exactly the one worth seeing.
+    function frameSummary(d, name) {
+      if (d == null) return '';
+      const t = d.type || name;
+      const clip = s => {
+        s = String(s);
+        return s.length > 160 ? s.slice(0, 160) + '…' : s;
+      };
+
+      // Anthropic
+      if (t === 'message_start' && d.message) {
+        const u = d.message.usage || {};
+        return `${d.message.model || ''} · in ${u.input_tokens ?? '?'}`;
+      }
+      if (t === 'content_block_start') {
+        const cb = d.content_block || {};
+        return `[${d.index}] ${cb.type || ''}${cb.name ? ' ' + cb.name : ''}`;
+      }
+      if (t === 'content_block_delta') {
+        const del = d.delta || {};
+        return `[${d.index}] ` + clip(del.text ?? del.partial_json ?? del.thinking ?? '');
+      }
+      if (t === 'content_block_stop') return `[${d.index}]`;
+      if (t === 'message_delta') {
+        const u = d.usage || {};
+        return `stop ${(d.delta && d.delta.stop_reason) ?? '?'} · out ${u.output_tokens ?? '?'}`;
+      }
+
+      // Responses API
+      if (typeof t === 'string' && t.endsWith('.delta') && typeof d.delta === 'string') {
+        return clip(d.delta);
+      }
+      if (t === 'response.output_item.added' || t === 'response.output_item.done') {
+        const item = d.item || {};
+        return `[${d.output_index}] ${item.type || ''}${item.name ? ' ' + item.name : ''}`;
+      }
+      if (d.response) {
+        const u = d.response.usage || {};
+        return `${d.response.status || ''}${u.output_tokens != null ? ` · out ${u.output_tokens}` : ''}`;
+      }
+
+      // Chat completions
+      if (Array.isArray(d.choices)) {
+        if (d.choices.length === 0) return d.usage ? `usage · out ${d.usage.completion_tokens ?? '?'}` : '(no choices)';
+        const c = d.choices[0];
+        const del = c.delta || {};
+        if (del.content) return clip(del.content);
+        const reasoning = del.reasoning_text ?? del.reasoning_content ?? del.reasoning;
+        if (typeof reasoning === 'string' && reasoning) return clip('∴ ' + reasoning);
+        if (Array.isArray(del.tool_calls) && del.tool_calls.length) {
+          const fn = del.tool_calls[0].function || {};
+          return clip(fn.name ? `${fn.name}(` : (fn.arguments ?? ''));
+        }
+        if (c.finish_reason) return `finish ${c.finish_reason}`;
+        if (del.role) return `role ${del.role}`;
+        return '';
+      }
+
+      // Unfamiliar shape: project the small scalar fields rather than dumping
+      // the payload, which on the Responses API is mostly an opaque item id.
+      const parts = [];
+      for (const [k, v] of Object.entries(d)) {
+        if (NOISY_FIELDS.has(k) || v === null || typeof v === 'object') continue;
+        const s = String(v);
+        if (s.length > 60) continue;
+        parts.push(`${k} ${s}`);
+      }
+      return parts.length ? clip(parts.join(' · ')) : clip(JSON.stringify(d));
+    }
+
+    /// Everything the wire actually carried. The conversation view answers what
+    /// was said; this answers what arrived, which is the question when a stream
+    /// stalls, repeats, or ends somewhere unexpected.
+    function renderWire(raw, streamed, frames) {
+      if (raw == null || raw === '') return '<div class="empty">No response body captured.</div>';
+
+      if (!streamed) {
+        // A non-streaming body is one payload, but the conversation view only
+        // renders the message: filters, fingerprints and upstream usage never
+        // appear. List every top-level field so nothing is hidden.
+        const j = tryParse(raw);
+        if (!j || typeof j !== 'object') {
+          return `<div class="conv-sec"><pre class="args">${escapeHtml(raw)}</pre></div>`;
+        }
+        const rows = Object.keys(j).map(k => {
+          const v = j[k];
+          const scalar = v === null || typeof v !== 'object';
+          const summary = scalar
+            ? String(v)
+            : Array.isArray(v) ? `[${v.length}]` : `{${Object.keys(v).join(', ')}}`;
+          return `<details class="ev">
+                    <summary>
+                      <span class="ev-name">${escapeHtml(k)}</span>
+                      <span class="ev-sum">${escapeHtml(summary.length > 160 ? summary.slice(0, 160) + '…' : summary)}</span>
+                    </summary>
+                    <pre class="args">${escapeHtml(JSON.stringify(v, null, 2))}</pre>
+                  </details>`;
+        }).join('');
+        return `<div class="wire">${rows}</div>`;
+      }
+
+      if (frames.length === 0) return '<div class="empty">No event frames found in this body.</div>';
+
+      const shown = frames.slice(0, MAX_FRAMES);
+      const rows = shown.map((f, i) => {
+        const d = f.parsed;
+        // Chat completions frames carry neither an `event:` line nor a `type`,
+        // so without this every row in a 130-frame stream is labelled "data".
+        const label = f.name
+          || (d && (d.type || d.object))
+          || (d && Array.isArray(d.choices) ? 'chat.completion.chunk' : 'data');
+        return `
+        <details class="ev">
+          <summary>
+            <span class="ev-n">${i + 1}</span>
+            <span class="ev-name">${escapeHtml(label)}</span>
+            <span class="ev-sum">${escapeHtml(d ? frameSummary(d, f.name) : f.data)}</span>
+          </summary>
+          <pre class="args">${escapeHtml(d ? JSON.stringify(d, null, 2) : f.data)}</pre>
+        </details>`;
+      }).join('');
+
+      const note = frames.length > shown.length
+        ? `<div class="empty">Showing the first ${shown.length} of ${frames.length} frames. The full stream is on the Raw tab.</div>`
+        : '';
+      return `<div class="wire">${rows}</div>${note}`;
+    }
+
+    // The stored timestamp is a full nanosecond-precision ISO string, which is
+    // a third of the table's width for information nobody reads at a glance.
+    // Show local wall-clock time and keep the exact value in the tooltip.
+    function formatTime(ts) {
+      const d = new Date(ts);
+      if (isNaN(d)) return `<span>${escapeHtml(ts)}</span>`;
+      const p = n => String(n).padStart(2, '0');
+      const txt = `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+      return `<span title="${escapeHtml(ts)}">${txt}</span>`;
+    }
+
     let lastSignature = '';
 
     // Longest upstream silence. This is the number that assigns blame when a
@@ -134,12 +1113,22 @@
     // means it kept sending and the stall was downstream of the proxy.
     // Highlighted past 60s, which is where intermediaries start dropping
     // idle connections.
+    //
+    // The keepalive probe count rides along in the tooltip rather than in its
+    // own column: keepalive only runs on the Anthropic streaming path, so a
+    // column would be four-fifths dashes that read as "zero probes sent" when
+    // they actually mean "not measured here".
     function formatIdle(r) {
       const ms = r.upstream_idle_max_ms;
       if (ms == null) return '—';
       const s = ms / 1000;
       const txt = s < 10 ? s.toFixed(1) + 's' : Math.round(s) + 's';
-      return s >= 60 ? `<span class="idle-hot">${txt}</span>` : txt;
+      const probes = r.keepalive_probes;
+      const title = probes == null
+        ? 'Longest upstream silence. Keepalive probes are not tracked on this path.'
+        : `Longest upstream silence. ${probes} keepalive probe${probes === 1 ? '' : 's'} written to the client` +
+          (s >= 60 && probes === 0 ? ' — a long silence with no probes means the keepalive itself failed.' : '.');
+      return `<span title="${escapeHtml(title)}"${s >= 60 ? ' class="idle-hot"' : ''}>${txt}</span>`;
     }
     function render(data) {
       // Records are immutable once stored, so an identical id list means
@@ -167,28 +1156,23 @@
         const open = expanded.has(id);
         const hasBody = r.request_body != null || r.response_body != null;
         const detail = hasBody
-          ? `<div class="detail">
-               ${bodyBlock('Request body', pretty(r.request_body))}
-               ${bodyBlock('Response body', pretty(r.response_body))}
-             </div>`
-          : `<div class="muted">No body captured. Run the proxy with debug enabled (--debug) to record request/response bodies.</div>`;
+          ? detailView(r)
+          : `<div class="muted">No body captured for this request. Turn on <b>Capture bodies</b> above and make the call again — it applies from the next request, not retroactively.</div>`;
         return `<tr class="req-row${ok ? '' : ' row-failed'}" data-id="${escapeHtml(id)}">
           <td class="caret">${open ? '▾' : '▸'}</td>
-          <td>${escapeHtml(r.timestamp)}</td>
-          <td>${r.session_id ? `<span class="sess" data-sess="${escapeHtml(r.session_id)}" title="${escapeHtml(r.session_id)}">${escapeHtml(r.session_id.slice(0,8))}</span>` : '—'}</td>
+          <td class="muted">${formatTime(r.timestamp)}</td>
           <td>${escapeHtml(r.endpoint)}</td>
           <td>${escapeHtml(model)}</td>
           <td class="${ok ? 'status-ok' : 'status-err'}">${r.status_code}${r.failure_kind ? `<div class="fail-kind">${escapeHtml(r.failure_kind)}</div>` : ''}</td>
           <td>${formatInput(r)}</td>
-          <td>${compactTokens(r.cache_creation_input_tokens ?? 0)}</td>
           <td>${formatOutput(r)}</td>
           <td>${formatIdle(r)}</td>
-          <td>${r.keepalive_probes ?? '—'}</td>
           <td>${r.duration}s</td>
         </tr>
-        <tr class="detail-row" data-detail="${escapeHtml(id)}" style="display:${open ? 'table-row' : 'none'}"><td colspan="12">${detail}</td></tr>`;
+        <tr class="detail-row" data-detail="${escapeHtml(id)}" style="display:${open ? 'table-row' : 'none'}"><td colspan="9">${detail}</td></tr>`;
       }).join('');
       document.getElementById('rows').innerHTML = rows;
+      sizeDetails();
 
       // Restore the offsets captured above. A finished request's body never
       // changes, so the position stays meaningful across refreshes.
@@ -225,6 +1209,18 @@
         };
       });
 
+      document.querySelectorAll('.detail-tabs .tab').forEach(btn => {
+        btn.onclick = (e) => {
+          e.stopPropagation();
+          const detail = btn.closest('.detail');
+          const want = btn.getAttribute('data-view');
+          detail.querySelectorAll('.tab').forEach(b => b.classList.toggle('active', b === btn));
+          detail.querySelectorAll('[data-pane]').forEach(p => {
+            p.hidden = p.getAttribute('data-pane') !== want;
+          });
+        };
+      });
+
       document.querySelectorAll('tr.req-row').forEach(tr => {
         tr.onclick = () => {
           const id = tr.getAttribute('data-id');
@@ -238,6 +1234,16 @@
       document.getElementById('info').textContent = `Page ${data.page} / ${data.total_pages || 1} (${data.total} total)`;
       document.getElementById('prev').disabled = page <= 1;
       document.getElementById('next').disabled = page >= (data.total_pages || 1);
+
+      // A table of headers with no rows reads as broken rather than empty.
+      const empty = document.getElementById('rowsEmpty');
+      const none = (data.items || []).length === 0;
+      empty.style.display = none ? '' : 'none';
+      if (none) {
+        empty.textContent = document.getElementById('failedOnly').checked || sessionFilter
+          ? 'No request matches this filter.'
+          : 'No requests recorded yet. Records are kept in memory and reset when the proxy restarts.';
+      }
     }
     let sessionFilter = null;
     async function load() {
@@ -265,8 +1271,53 @@
     };
     document.getElementById('prev').onclick = () => { if (page > 1) { page--; load(); } };
     document.getElementById('next').onclick = () => { page++; load(); };
+
+    // Feeds the sticky width above. The detail cell spans the full table, so
+    // the visible width has to be measured from the scroll container.
+    function sizeDetails() {
+      const box = document.querySelector('.scroll-x');
+      if (box) box.style.setProperty('--visible-width', box.clientWidth + 'px');
+    }
+    window.addEventListener('resize', sizeDetails);
+
+    // Same status pill as the other pages, so "is the proxy healthy" never
+    // requires navigating away from what you are reading.
+    async function navStatus() {
+      try {
+        const h = await (await fetch('/health')).json();
+        document.getElementById('navStatus').innerHTML =
+          `<span class="dot ${h.ready ? 'ok' : 'warn'}"></span>${h.ready ? 'ready' : 'degraded'} · v${escapeHtml(h.version)}`;
+        // Reflect the live value rather than assume the checkbox is authoritative:
+        // the proxy may have restarted, or another tab may have flipped it.
+        document.getElementById('debugToggle').checked = !!h.debug;
+      } catch (e) {
+        document.getElementById('navStatus').innerHTML = '<span class="dot err"></span>unreachable';
+      }
+    }
+
+    // Capture used to require restarting the proxy with --debug, by which point
+    // the request you wanted to inspect was gone.
+    document.getElementById('debugToggle').onchange = async (e) => {
+      const want = e.target.checked;
+      try {
+        const res = await fetch('/api/config/debug', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ debug: want })
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const d = await res.json();
+        e.target.checked = !!d.debug;
+      } catch (err) {
+        e.target.checked = !want;
+        document.getElementById('filterHint').textContent =
+          `Could not change body capture: ${err.message}. An API key is required when one is configured.`;
+      }
+    };
+    navStatus();
     load();
     setInterval(load, 5000);
+    setInterval(navStatus, 15000);
   </script>
 </body>
 </html>

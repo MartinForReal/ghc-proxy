@@ -269,6 +269,15 @@ impl AppState {
         self.config.read().unwrap().debug
     }
 
+    /// Turns body capture on or off for the running process. Debug is read
+    /// live on every request, so this takes effect immediately and without a
+    /// restart — but it is deliberately not written back to `config.yaml`, so
+    /// a proxy that is restarted returns to its configured default rather than
+    /// silently keeping capture on forever.
+    pub fn set_debug(&self, debug: bool) {
+        self.config.write().unwrap().debug = debug;
+    }
+
     pub fn max_connection_retries(&self) -> u32 {
         self.config.read().unwrap().max_connection_retries
     }
@@ -440,6 +449,25 @@ impl AppState {
             let url = format!("{}/chat/completions", self.copilot_base_url());
             (url, self.copilot_headers(vision).await, false)
         }
+    }
+
+    /// Upstream URL and headers for the catalog's `ws:/responses` surface.
+    ///
+    /// The WebSocket lives on the same host as the HTTP API and authenticates
+    /// identically — the token response carries no separate websocket endpoint,
+    /// and `endpoints.api` is the only host involved. Discovered by probing;
+    /// GitHub publishes no documentation for the inference API.
+    pub async fn ws_responses_upstream(&self) -> (String, HeaderMap) {
+        let base = self.copilot_base_url();
+        let ws = match base.split_once("://") {
+            Some(("https", rest)) => format!("wss://{rest}"),
+            Some(("http", rest)) => format!("ws://{rest}"),
+            _ => base.clone(),
+        };
+        (
+            format!("{}/responses", ws.trim_end_matches('/')),
+            self.copilot_headers(false).await,
+        )
     }
 
     /// Refreshes the Copilot token if it is missing or within 60 seconds of
