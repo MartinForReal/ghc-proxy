@@ -1,0 +1,372 @@
+/* ghc-proxy dashboard — shared design system.
+ *
+ * Served from /app.css so the three pages share one visual language instead of
+ * carrying three drifting copies of the same rules. */
+
+:root {
+  color-scheme: dark;
+
+  --bg: #0d1117;
+  --surface: #161b22;
+  --surface-2: #21262d;
+  --border: #30363d;
+  --border-soft: #21262d;
+  --text: #e6edf3;
+  --muted: #8b949e;
+  --accent: #58a6ff;
+  --ok: #3fb950;
+  --warn: #d29922;
+  --danger: #f85149;
+
+  --radius: 8px;
+  --radius-sm: 6px;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+  /* Page width is per-page, not global: the overview is a handful of large
+   * numbers and short labels, which just drift apart when stretched, while the
+   * request table and the metric list are data that a wide screen genuinely
+   * helps you read. Capped rather than fluid so an ultrawide does not turn a
+   * table row into a journey for the eye. */
+  --page-max: 1280px;
+}
+
+body[data-page="requests"] { --page-max: 2000px; }
+body[data-page="metrics"] { --page-max: 1600px; }
+
+* { box-sizing: border-box; }
+
+body {
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+.wrap {
+  max-width: var(--page-max);
+  margin: 0 auto;
+  padding: 0 1.5rem 4rem;
+}
+
+/* ---------------------------------------------------------------- nav ---- */
+/* Persistent across all three pages: the "trunk test" wants every page to
+ * answer what this is, where you are, and what the other sections are. */
+
+.nav {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  background: rgba(13, 17, 23, 0.85);
+  backdrop-filter: blur(8px);
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 1.75rem;
+}
+
+.nav-inner {
+  max-width: var(--page-max);
+  margin: 0 auto;
+  padding: 0 1.5rem;
+  display: flex;
+  align-items: center;
+  gap: 1.5rem;
+  height: 52px;
+}
+
+.brand {
+  font-weight: 600;
+  color: var(--text);
+  letter-spacing: -0.01em;
+  white-space: nowrap;
+}
+.brand:hover { text-decoration: none; }
+
+.nav-links { display: flex; gap: 0.25rem; flex: 1; }
+
+.nav-links a {
+  color: var(--muted);
+  padding: 0.3rem 0.7rem;
+  border-radius: var(--radius-sm);
+  font-size: 0.875rem;
+}
+.nav-links a:hover { color: var(--text); background: var(--surface-2); text-decoration: none; }
+
+/* Current section, set via <body data-page="..."> */
+body[data-page="overview"] .nav-links a[href="/"],
+body[data-page="requests"] .nav-links a[href="/requests"],
+body[data-page="metrics"] .nav-links a[href="/metrics/dashboard"] {
+  color: var(--text);
+  background: var(--surface);
+  box-shadow: inset 0 0 0 1px var(--border);
+}
+
+.nav-status {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.8rem;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
+.dot.ok { background: var(--ok); }
+.dot.warn { background: var(--warn); }
+.dot.err { background: var(--danger); }
+
+/* -------------------------------------------------------------- panels --- */
+
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  margin-bottom: 1.25rem;
+  overflow: hidden;
+}
+
+.panel-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.7rem 1rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.panel-head h2 {
+  margin: 0;
+  font-size: 0.72rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+}
+
+.panel-head .aside { font-size: 0.8rem; color: var(--muted); }
+.panel-body { padding: 1rem; }
+.panel-body.flush { padding: 0; }
+
+/* -------------------------------------------------------------- metrics -- */
+/* Deliberately unequal: the hero row is what the page is *for*, so it gets
+ * size, and everything else is demoted rather than competing with it. */
+
+.hero {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 1px;
+  background: var(--border);
+}
+
+.hero .metric { background: var(--surface); padding: 1.1rem 1.25rem; }
+
+.metric .label {
+  color: var(--muted);
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+}
+
+.metric .value {
+  font-size: 2rem;
+  font-weight: 600;
+  line-height: 1.15;
+  margin-top: 0.35rem;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+}
+
+.metric .sub { color: var(--muted); font-size: 0.8rem; margin-top: 0.2rem; }
+.metric .sub b { color: var(--text); font-weight: 600; }
+
+/* Secondary stats: same information architecture, a third of the weight. */
+.stat-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 0.9rem 1.5rem;
+}
+
+.stat .label {
+  color: var(--muted);
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+}
+.stat .value {
+  font-size: 1.15rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  margin-top: 0.15rem;
+}
+.stat .value.ok { color: var(--ok); }
+.stat .value.warn { color: var(--warn); }
+.stat .value.err { color: var(--danger); }
+
+.cols-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 1.25rem; }
+.cols-2 > .panel { margin-bottom: 0; }
+
+/* ---------------------------------------------------------------- quota -- */
+
+.quota-row { display: grid; gap: 0.3rem; padding: 0.7rem 0; border-bottom: 1px solid var(--border-soft); }
+.quota-row:last-child { border-bottom: none; padding-bottom: 0; }
+.quota-row:first-child { padding-top: 0; }
+
+.quota-top { display: flex; justify-content: space-between; align-items: baseline; gap: 1rem; }
+.quota-name { font-family: var(--mono); font-size: 0.82rem; }
+.quota-val { font-size: 0.82rem; color: var(--muted); font-variant-numeric: tabular-nums; }
+.quota-val b { color: var(--text); font-weight: 600; }
+
+.bar { height: 6px; border-radius: 3px; background: var(--surface-2); overflow: hidden; }
+.bar > span { display: block; height: 100%; background: var(--ok); border-radius: 3px; }
+.bar > span.warn { background: var(--warn); }
+.bar > span.err { background: var(--danger); }
+
+/* --------------------------------------------------------------- tables -- */
+
+table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+
+th, td {
+  text-align: left;
+  padding: 0.5rem 0.75rem;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+
+th {
+  color: var(--muted);
+  text-transform: uppercase;
+  font-size: 0.7rem;
+  letter-spacing: 0.05em;
+  font-weight: 600;
+}
+
+tbody tr:last-child td { border-bottom: none; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+.mono { font-family: var(--mono); }
+.muted { color: var(--muted); }
+.status-ok { color: var(--ok); }
+.status-err { color: var(--danger); }
+
+/* -------------------------------------------------------------- controls -- */
+
+button, .btn {
+  background: var(--surface-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0.35rem 0.75rem;
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.85rem;
+}
+button:hover:not(:disabled) { border-color: var(--muted); }
+button:disabled { opacity: 0.45; cursor: default; }
+
+input[type="text"], input:not([type]) {
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0.45rem 0.7rem;
+  font: inherit;
+  font-size: 0.85rem;
+}
+input:focus { outline: none; border-color: var(--accent); }
+
+.toolbar {
+  display: flex;
+  gap: 0.75rem;
+  align-items: center;
+  flex-wrap: wrap;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+.toolbar label { display: flex; gap: 0.35rem; align-items: center; cursor: pointer; }
+
+.pager { display: flex; gap: 0.5rem; align-items: center; padding: 0.75rem 1rem; color: var(--muted); font-size: 0.85rem; }
+
+/* Collapsible reference material — present but never competing with the
+ * live numbers above it. */
+details.fold > summary {
+  cursor: pointer;
+  padding: 0.7rem 1rem;
+  color: var(--muted);
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-weight: 600;
+  list-style: none;
+  user-select: none;
+}
+details.fold > summary::-webkit-details-marker { display: none; }
+details.fold > summary::before { content: "▸ "; }
+details.fold[open] > summary::before { content: "▾ "; }
+details.fold > summary:hover { color: var(--text); }
+details.fold[open] > summary { border-bottom: 1px solid var(--border); }
+
+/* Where the input tokens came from, at a glance. Three shares of one bar read
+ * faster than three numbers you have to divide in your head. */
+.split { display: flex; height: 8px; border-radius: 4px; overflow: hidden; background: var(--surface-2); }
+.split > span { display: block; height: 100%; }
+.split .s-read { background: var(--ok); }
+.split .s-write { background: var(--warn); }
+.split .s-fresh { background: #6e7681; }
+/* Inline in a table row, where 8px would crowd the text beside it. */
+.split.mini { height: 6px; min-width: 120px; }
+
+.legend { display: flex; flex-wrap: wrap; gap: 0.9rem; margin-top: 0.55rem; font-size: 0.78rem; color: var(--muted); }
+/* Standing on its own as a key rather than captioning a bar above it. */
+.legend:first-child { margin-top: 0; }
+.legend span { display: flex; align-items: center; gap: 0.35rem; }
+.legend i { width: 8px; height: 8px; border-radius: 2px; flex: none; }
+.legend b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+
+.dim-note { color: var(--muted); font-size: 0.85rem; }
+
+/* A setting you can see is a setting you should be able to change. */
+.toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  margin-top: 0.15rem;
+  padding: 0.2rem 0.6rem 0.2rem 0.3rem;
+  border-radius: 999px;
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: var(--muted);
+}
+.toggle .knob {
+  width: 26px;
+  height: 15px;
+  border-radius: 999px;
+  background: var(--border);
+  position: relative;
+  transition: background 0.12s ease;
+  flex: none;
+}
+.toggle .knob::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  background: var(--muted);
+  transition: transform 0.12s ease, background 0.12s ease;
+}
+.toggle.on { color: var(--warn); border-color: var(--warn); }
+.toggle.on .knob { background: rgba(210, 153, 34, 0.35); }
+.toggle.on .knob::after { transform: translateX(11px); background: var(--warn); }
+.toggle:disabled { opacity: 0.6; cursor: progress; }
+
+.empty { color: var(--muted); padding: 1.25rem 1rem; text-align: center; font-size: 0.875rem; }
+
+.scroll-y { max-height: 420px; overflow-y: auto; }
+
+/* The request table carries more columns than fit on a laptop. Scroll it
+ * rather than let the panel clip columns off the right edge. */
+.scroll-x { overflow-x: auto; }

@@ -20,10 +20,17 @@ pub const API_VERSION: &str = "2025-05-01";
 pub const COPILOT_VERSION: &str = "0.48.1";
 /// Config schema version used to detect when defaults/options changed and a
 /// persisted config should be rewritten with migrated values.
-pub const CONFIG_VERSION: u32 = 2;
+///
+/// Bumped to 4 for the Opus 5 / Sonnet 5 model mappings, so existing files gain
+/// the new aliases and have superseded targets lifted on the next start.
+pub const CONFIG_VERSION: u32 = 4;
 
 /// Default model name that Claude "opus"/"sonnet" requests are mapped to.
-pub const DEFAULT_OPUS: &str = "claude-opus-4.8";
+///
+/// The catalog carries `claude-opus-4.6` through `claude-opus-5`; this is the
+/// newest generally-available one, and it matches 4.8 on every published
+/// capability -- 1M context, 64k output, billing multiplier 1, vision.
+pub const DEFAULT_OPUS: &str = "claude-opus-5";
 /// Default model name that Claude "haiku" requests are mapped to.
 pub const DEFAULT_HAIKU: &str = "claude-haiku-4.5";
 
@@ -135,6 +142,16 @@ pub struct Config {
     pub tool_result_suffix_remove: Vec<String>,
     #[serde(default = "default_max_retries")]
     pub max_connection_retries: u32,
+    /// Maximum seconds of silence allowed between two reads from an upstream
+    /// response before the request is treated as dead. This bounds *silence*,
+    /// not total duration, so long streaming answers are unaffected. `0`
+    /// disables the timeout.
+    ///
+    /// Without it a half-open connection never errors and never ends: the
+    /// request hangs forever, the client hangs with it, and the stream-
+    /// interrupted handling never runs because no error is ever observed.
+    #[serde(default = "default_read_timeout")]
+    pub upstream_read_timeout_seconds: u64,
     /// When true, never route to the upstream `/v1/messages` endpoint; always
     /// translate Anthropic requests through the OpenAI chat completions API.
     #[serde(default)]
@@ -147,9 +164,14 @@ pub struct Config {
     /// the `Editor-Version` header (falling back to `vscode_version`).
     #[serde(default)]
     pub dynamic_vscode_version: bool,
-    /// When true, check GitHub releases and auto-upgrade this binary when a
-    /// newer version is available.
-    #[serde(default)]
+    /// Check GitHub releases on startup and replace this binary when a newer
+    /// version is available. Enabled by default, including for config files
+    /// written before the key existed; disable with `auto_upgrade: false`,
+    /// `--no-auto-upgrade`, or `GHC_PROXY_AUTO_UPGRADE=0`.
+    ///
+    /// The replacement takes effect on the next start; the running process
+    /// keeps serving the old code until then.
+    #[serde(default = "default_true")]
     pub auto_upgrade: bool,
     /// Minimum number of seconds between successive proxied requests. `None`
     /// disables rate limiting.
@@ -197,6 +219,19 @@ fn default_copilot_version() -> String {
 fn default_max_retries() -> u32 {
     3
 }
+/// Deliberately far above the longest silence a healthy upstream produces.
+///
+/// An earlier 120s default was wrong: it was reasoned from the ~60s idle window
+/// the upstream load balancer enforces, but measurement against the real API
+/// showed Copilot buffers `input_json_delta` until a tool call's argument JSON
+/// is complete and then flushes it in one burst. A 35,899-token answer went
+/// **329.5 seconds** without emitting a byte, and the silence scales with
+/// output size at roughly 9.5ms/token — so 120s would have aborted perfectly
+/// healthy large tool calls. 15 minutes clears the worst measured case with
+/// room to spare while still bounding a genuinely dead connection.
+fn default_read_timeout() -> u64 {
+    900
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -215,10 +250,11 @@ impl Default for Config {
             system_prompt_add: Vec::new(),
             tool_result_suffix_remove: Vec::new(),
             max_connection_retries: default_max_retries(),
+            upstream_read_timeout_seconds: default_read_timeout(),
             redirect_anthropic: false,
             show_token: false,
             dynamic_vscode_version: false,
-            auto_upgrade: false,
+            auto_upgrade: true,
             rate_limit_seconds: None,
             rate_limit_wait: false,
             manual_approve: false,
@@ -275,11 +311,17 @@ pub fn default_model_mappings() -> ModelMappings {
     let opus = DEFAULT_OPUS.to_string();
     let haiku = DEFAULT_HAIKU.to_string();
     let mut exact = BTreeMap::new();
-    for k in ["opus", "sonnet", "opus4-7", "opus4-8", "4-7[1m]", "4-8[1m]"] {
+    for k in [
+        "opus", "sonnet", "opus4-7", "opus4-8", "opus5", "4-7[1m]", "4-8[1m]", "5[1m]",
+    ] {
         exact.insert(k.to_string(), opus.clone());
     }
     exact.insert("haiku".to_string(), haiku.clone());
 
+    // Every spelling of a Claude model resolves to the current best one. The
+    // list is exhaustive rather than pattern-based because a request naming a
+    // model that has since been superseded should still be served, and because
+    // Anthropic writes the same version two ways (`4.8` and `4-8`).
     let mut prefix = BTreeMap::new();
     for k in [
         "claude-sonnet-4-",
@@ -287,6 +329,7 @@ pub fn default_model_mappings() -> ModelMappings {
         "claude-opus-4.6-",
         "claude-opus-4.7-",
         "claude-opus-4.8-",
+        "claude-opus-5-",
         "claude-opus-4-5-",
         "claude-opus-4-6-",
         "claude-opus-4-7-",
@@ -295,16 +338,21 @@ pub fn default_model_mappings() -> ModelMappings {
         "claude-opus-4.6",
         "claude-opus-4.7",
         "claude-opus-4.8",
+        "claude-opus-5",
         "claude-opus-4-6",
         "claude-opus-4-7",
         "claude-opus-4-8",
         "claude-opus-4-6[1m]",
         "claude-opus-4-7[1m]",
         "claude-opus-4-8[1m]",
+        "claude-opus-5[1m]",
         "claude-sonnet-4-7",
         "claude-sonnet-4-8",
         "claude-sonnet-4-6",
         "claude-sonnet-4-5",
+        "claude-sonnet-4.6",
+        "claude-sonnet-5-",
+        "claude-sonnet-5",
     ] {
         prefix.insert(k.to_string(), opus.clone());
     }
@@ -385,6 +433,8 @@ pub fn render_config_yaml(cfg: &Config) -> String {
     let _ = writeln!(s, "vscode_version: \"{}\"", cfg.vscode_version);
     let _ = writeln!(s, "api_version: \"{}\"", cfg.api_version);
     let _ = writeln!(s, "copilot_version: \"{}\"", cfg.copilot_version);
+    s.push_str("# Check GitHub releases on startup and replace this binary when a newer\n");
+    s.push_str("# version is available. Takes effect on the next start.\n");
     let _ = writeln!(s, "auto_upgrade: {}", cfg.auto_upgrade);
     s.push('\n');
     s.push_str("# Model Name Mappings\n");
@@ -447,6 +497,14 @@ pub fn render_config_yaml(cfg: &Config) -> String {
     s.push_str("# Retry Settings\n");
     s.push_str("# Max retries for upstream connection errors (0 = no retries)\n");
     let _ = writeln!(s, "max_connection_retries: {}", cfg.max_connection_retries);
+    s.push_str("# Max seconds of silence from an upstream response before it is treated as\n");
+    s.push_str("# dead. Bounds silence, not total duration, so long streams are fine.\n");
+    s.push_str("# 0 disables the timeout.\n");
+    let _ = writeln!(
+        s,
+        "upstream_read_timeout_seconds: {}",
+        cfg.upstream_read_timeout_seconds
+    );
     if cfg.redirect_anthropic {
         s.push('\n');
         s.push_str(
@@ -646,6 +704,21 @@ pub fn load_config_with_options(write_back_on_migration: bool) -> Config {
             );
         }
     }
+    if let Ok(val) = std::env::var("GHC_PROXY_UPSTREAM_READ_TIMEOUT") {
+        match val.parse::<u64>() {
+            Ok(secs) => {
+                cfg.upstream_read_timeout_seconds = secs;
+                tracing::info!(
+                    "✓ Overriding upstream_read_timeout_seconds from GHC_PROXY_UPSTREAM_READ_TIMEOUT: {}",
+                    secs
+                );
+            }
+            Err(_) => tracing::warn!(
+                "Invalid GHC_PROXY_UPSTREAM_READ_TIMEOUT value '{}': expected a number",
+                val
+            ),
+        }
+    }
     if let Ok(val) = std::env::var("GHC_PROXY_REDIRECT_ANTHROPIC") {
         cfg.redirect_anthropic = val.eq_ignore_ascii_case("true") || val == "1";
         tracing::info!(
@@ -781,6 +854,39 @@ fn migrate_config(cfg: &mut Config) -> bool {
         }
     }
 
+    if cfg.config_version < 4 {
+        // Opus 5 and Sonnet 5 entered the catalog. Add their aliases so the new
+        // names resolve, and change nothing else.
+        //
+        // Deliberately no "lift stale defaults to the new one" pass. A value
+        // that equals the previous built-in default is indistinguishable from a
+        // version the user pinned on purpose -- and pinning is common: a real
+        // config in the wild carried `claude-opus-4-7: claude-opus-4.7` beside
+        // `haiku: claude-opus-4.7`, both of which such a pass would silently
+        // rewrite. Existing mappings keep pointing where they were told to;
+        // `--setup` or `--default` is how a user asks for the new defaults.
+        let opus = DEFAULT_OPUS.to_string();
+        for k in ["opus5", "5[1m]"] {
+            cfg.model_mappings
+                .exact
+                .entry(k.to_string())
+                .or_insert_with(|| opus.clone());
+        }
+        for k in [
+            "claude-opus-5-",
+            "claude-opus-5",
+            "claude-opus-5[1m]",
+            "claude-sonnet-5-",
+            "claude-sonnet-5",
+            "claude-sonnet-4.6",
+        ] {
+            cfg.model_mappings
+                .prefix
+                .entry(k.to_string())
+                .or_insert_with(|| opus.clone());
+        }
+    }
+
     // Any older schema version is lifted to the current one; the caller
     // persists the re-rendered document so newly introduced properties appear
     // on disk with their defaults.
@@ -791,6 +897,54 @@ fn migrate_config(cfg: &mut Config) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_upgrade_is_on_by_default_including_for_legacy_configs() {
+        assert!(Config::default().auto_upgrade);
+
+        // Config files written before the key existed must also opt in, which
+        // is what `#[serde(default)]` would have got wrong.
+        let legacy = "address: 127.0.0.1\nport: 8314\nmax_connection_retries: 3\n";
+        let cfg: Config = serde_norway::from_str(legacy).unwrap();
+        assert!(cfg.auto_upgrade);
+
+        // An explicit opt-out is still honoured, and survives a round trip
+        // through the generated config file.
+        let off: Config = serde_norway::from_str("auto_upgrade: false\n").unwrap();
+        assert!(!off.auto_upgrade);
+        let rendered: Config = serde_norway::from_str(&render_config_yaml(&off)).unwrap();
+        assert!(!rendered.auto_upgrade);
+    }
+
+    #[test]
+    fn read_timeout_defaults_are_sane() {
+        // Silence, not total duration — a long stream must never be cut off by
+        // this, but a genuinely dead connection must be.
+        let cfg = Config::default();
+        assert_eq!(cfg.upstream_read_timeout_seconds, 900);
+        // The longest silence measured against the real upstream was 329.5s,
+        // while a tool call's argument JSON was buffered. The default must
+        // clear that with margin or it aborts healthy requests.
+        assert!(cfg.upstream_read_timeout_seconds > 330);
+        // The rendered config round-trips the value, including the 0 (disabled)
+        // case, so operators can turn it off.
+        let off = Config {
+            upstream_read_timeout_seconds: 0,
+            ..Default::default()
+        };
+        let parsed: Config = serde_norway::from_str(&render_config_yaml(&off)).unwrap();
+        assert_eq!(parsed.upstream_read_timeout_seconds, 0);
+        let parsed: Config = serde_norway::from_str(&render_config_yaml(&cfg)).unwrap();
+        assert_eq!(parsed.upstream_read_timeout_seconds, 900);
+    }
+
+    #[test]
+    fn read_timeout_missing_from_legacy_config_uses_default() {
+        // Existing config files predate the key and must keep working.
+        let legacy = "address: 127.0.0.1\nport: 8314\nmax_connection_retries: 3\n";
+        let cfg: Config = serde_norway::from_str(legacy).unwrap();
+        assert_eq!(cfg.upstream_read_timeout_seconds, 900);
+    }
 
     #[test]
     fn github_models_defaults_enabled() {
@@ -942,6 +1096,72 @@ mod tests {
         assert_eq!(
             cfg.model_mappings.exact.get("opus").map(String::as_str),
             Some("my-model")
+        );
+    }
+
+    #[test]
+    fn opus_5_migration_adds_aliases_without_touching_existing_ones() {
+        let yaml = "config_version: 3\n";
+        let mut cfg: Config = serde_norway::from_str(yaml).expect("v3 config parses");
+        // A hand-tuned file: version-specific pins, and a tier alias pointed
+        // somewhere the defaults would never put it. Both shapes were observed
+        // in a real config, and a migration that "lifts stale defaults" rewrites
+        // both, because a pin and a stale default look identical.
+        cfg.model_mappings
+            .exact
+            .insert("opus".to_string(), "claude-opus-4.8".to_string());
+        cfg.model_mappings
+            .exact
+            .insert("haiku".to_string(), "claude-opus-4.7".to_string());
+        cfg.model_mappings
+            .prefix
+            .insert("claude-opus-4-7".to_string(), "claude-opus-4.7".to_string());
+        cfg.model_mappings.prefix.insert(
+            "claude-sonnet-4.6".to_string(),
+            "pinned-by-hand".to_string(),
+        );
+
+        assert!(migrate_config(&mut cfg));
+        assert_eq!(cfg.config_version, CONFIG_VERSION);
+
+        // Nothing already in the file is rewritten, including a key this
+        // migration would otherwise seed.
+        for (k, want) in [("opus", "claude-opus-4.8"), ("haiku", "claude-opus-4.7")] {
+            assert_eq!(
+                cfg.model_mappings.exact.get(k).map(String::as_str),
+                Some(want),
+                "exact alias {k} must not be rewritten"
+            );
+        }
+        for (k, want) in [
+            ("claude-opus-4-7", "claude-opus-4.7"),
+            ("claude-sonnet-4.6", "pinned-by-hand"),
+        ] {
+            assert_eq!(
+                cfg.model_mappings.prefix.get(k).map(String::as_str),
+                Some(want),
+                "prefix {k} must not be rewritten"
+            );
+        }
+
+        // Names that were not in the file are seeded with the new default.
+        assert_eq!(
+            cfg.model_mappings.exact.get("opus5").map(String::as_str),
+            Some(DEFAULT_OPUS)
+        );
+        assert_eq!(
+            cfg.model_mappings
+                .prefix
+                .get("claude-opus-5")
+                .map(String::as_str),
+            Some(DEFAULT_OPUS)
+        );
+        assert_eq!(
+            cfg.model_mappings
+                .prefix
+                .get("claude-sonnet-5")
+                .map(String::as_str),
+            Some(DEFAULT_OPUS)
         );
     }
 }

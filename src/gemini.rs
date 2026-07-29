@@ -162,6 +162,11 @@ pub fn gemini_to_openai(req: &Value, model: &str, stream: bool) -> Value {
     out.insert("stream".into(), Value::Bool(stream));
 
     // generationConfig -> top-level OpenAI sampling params.
+    //
+    // Only `topK` and `safetySettings` have no counterpart in the chat
+    // completions schema; everything else here maps exactly, and dropping it
+    // silently meant a client's `seed` or `candidateCount` had no effect and no
+    // explanation.
     if let Some(gc) = req
         .get("generationConfig")
         .or_else(|| req.get("generation_config"))
@@ -180,6 +185,49 @@ pub fn gemini_to_openai(req: &Value, model: &str, stream: bool) -> Value {
         }
         if let Some(v) = gc.get("stopSequences").or_else(|| gc.get("stop_sequences")) {
             out.insert("stop".into(), v.clone());
+        }
+        if let Some(v) = gc
+            .get("candidateCount")
+            .or_else(|| gc.get("candidate_count"))
+        {
+            out.insert("n".into(), v.clone());
+        }
+        if let Some(v) = gc.get("seed") {
+            out.insert("seed".into(), v.clone());
+        }
+        if let Some(v) = gc
+            .get("presencePenalty")
+            .or_else(|| gc.get("presence_penalty"))
+        {
+            out.insert("presence_penalty".into(), v.clone());
+        }
+        if let Some(v) = gc
+            .get("frequencyPenalty")
+            .or_else(|| gc.get("frequency_penalty"))
+        {
+            out.insert("frequency_penalty".into(), v.clone());
+        }
+        // Gemini asks for JSON with a mime type; chat completions with a
+        // response_format object. A schema, when supplied, carries over as a
+        // json_schema format.
+        let mime = gc
+            .get("responseMimeType")
+            .or_else(|| gc.get("response_mime_type"))
+            .and_then(Value::as_str);
+        if mime == Some("application/json") {
+            let schema = gc
+                .get("responseSchema")
+                .or_else(|| gc.get("response_schema"));
+            out.insert(
+                "response_format".into(),
+                match schema {
+                    Some(s) => json!({
+                        "type": "json_schema",
+                        "json_schema": {"name": "response", "schema": s}
+                    }),
+                    None => json!({"type": "json_object"}),
+                },
+            );
         }
     }
 
@@ -347,6 +395,92 @@ mod tests {
         assert_eq!(out["temperature"], 0.5);
         assert_eq!(out["max_tokens"], 256);
         assert_eq!(out["top_p"], 0.9);
+    }
+
+    /// Everything in `generationConfig` with an exact chat-completions
+    /// counterpart has to carry over. These used to be dropped silently, so a
+    /// client's `seed` had no effect and nothing said why.
+    #[test]
+    fn generation_config_maps_the_rest() {
+        let req = json!({
+            "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+            "generationConfig": {
+                "candidateCount": 2,
+                "seed": 42,
+                "presencePenalty": 0.3,
+                "frequencyPenalty": 0.4,
+                "stopSequences": ["END"]
+            }
+        });
+        let out = gemini_to_openai(&req, "m", false);
+        assert_eq!(out["n"], 2);
+        assert_eq!(out["seed"], 42);
+        assert_eq!(out["presence_penalty"], 0.3);
+        assert_eq!(out["frequency_penalty"], 0.4);
+        assert_eq!(out["stop"], json!(["END"]));
+    }
+
+    #[test]
+    fn response_mime_type_becomes_response_format() {
+        let plain = gemini_to_openai(
+            &json!({
+                "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+                "generationConfig": {"responseMimeType": "application/json"}
+            }),
+            "m",
+            false,
+        );
+        assert_eq!(plain["response_format"], json!({"type": "json_object"}));
+
+        let schema = json!({"type": "object", "properties": {"a": {"type": "string"}}});
+        let with_schema = gemini_to_openai(
+            &json!({
+                "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+                "generationConfig": {
+                    "responseMimeType": "application/json",
+                    "responseSchema": schema
+                }
+            }),
+            "m",
+            false,
+        );
+        assert_eq!(with_schema["response_format"]["type"], "json_schema");
+        assert_eq!(
+            with_schema["response_format"]["json_schema"]["schema"],
+            schema
+        );
+
+        // A plain-text turn must not acquire a response_format it never asked for.
+        let text = gemini_to_openai(
+            &json!({
+                "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+                "generationConfig": {"responseMimeType": "text/plain"}
+            }),
+            "m",
+            false,
+        );
+        assert!(text.get("response_format").is_none());
+    }
+
+    /// `topK` and `safetySettings` have no counterpart in the chat completions
+    /// schema. Asserting they stay out keeps the dashboard's "dropped in
+    /// translation" note honest.
+    #[test]
+    fn params_without_counterparts_are_not_invented() {
+        let out = gemini_to_openai(
+            &json!({
+                "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+                "generationConfig": {"topK": 32},
+                "safetySettings": [{"category": "HARM_CATEGORY_HARASSMENT",
+                                    "threshold": "BLOCK_NONE"}]
+            }),
+            "m",
+            false,
+        );
+        assert!(out.get("top_k").is_none());
+        assert!(out.get("topK").is_none());
+        assert!(out.get("safetySettings").is_none());
+        assert!(out.get("safety_settings").is_none());
     }
 
     #[test]

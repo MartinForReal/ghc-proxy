@@ -16,8 +16,11 @@ name = "ghc-proxy"
 path = "src/main.rs"
 
 [dependencies]
-axum = { version = "0.8", features = ["json"] }
+axum = { version = "0.8", features = ["json", "ws"] }
 tokio = { version = "1", features = ["full"] }
+# Upstream transport for the catalog's `ws:/responses` surface. rustls with the
+# platform trust store, to match reqwest and keep enterprise CAs working.
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.7", features = ["fs"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream", "form"] }
@@ -38,3 +41,6 @@ self_update = { version = "0.44", default-features = false, features = ["reqwest
 toml = "1.1"
 
 [dev-dependencies]
+# `test-util` (not part of tokio's `full`) enables the paused clock used to
+# exercise the SSE keepalive timing deterministically.
+tokio = { version = "1", features = ["full", "test-util"] }

@@ -124,6 +124,7 @@ Options:
       --fetch-version     Fetch the latest VS Code version at startup
       --no-fetch-version  Disable dynamic VS Code version fetching
             --auto-upgrade      Auto-upgrade app when a newer release is available
+                          (default: on)
             --no-auto-upgrade   Disable app auto-upgrade
             --update-config     Persist non-schema config write-backs (schema upgrades apply automatically)
   -v, --version           Show version
@@ -141,7 +142,7 @@ Environment Variables:
   GHC_PROXY_REDIRECT_ANTHROPIC      Redirect Anthropic requests (true/1)
   GHC_PROXY_SHOW_TOKEN              Log tokens on refresh (true/1)
   GHC_PROXY_DYNAMIC_VSCODE_VERSION  Fetch latest VS Code version (true/1)
-    GHC_PROXY_AUTO_UPGRADE            Auto-upgrade app on startup (true/1)
+    GHC_PROXY_AUTO_UPGRADE            Auto-upgrade app on startup (true/1); 0 disables
   GHC_PROXY_RATE_LIMIT_SECONDS      Minimum seconds between requests
   GHC_PROXY_RATE_LIMIT_WAIT         Wait instead of rejecting when limited (true/1)
   GHC_PROXY_MANUAL_APPROVE          Require manual approval per request (true/1)

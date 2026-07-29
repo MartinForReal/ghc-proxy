@@ -34,6 +34,23 @@ pub struct RequestRecord {
     pub cache_read_input_tokens: u64,
     /// Portion of `input_tokens` this request wrote into the cache.
     pub cache_creation_input_tokens: u64,
+    /// Output tokens the model spent reasoning without emitting. Billed, but
+    /// never visible in the answer — which is how a turn can cost a full budget
+    /// and show nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u64>,
+    /// What Copilot itself billed, in nano-AI-units, from the `copilot_usage`
+    /// object on the response. Authoritative, unlike `estimated_cost_usd`
+    /// beside it, which is a list-price guess that cannot know a model is
+    /// included at no charge.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub billed_nano_aiu: Option<u64>,
+    /// What the prompt cache was worth this turn, in nano-AI-units, computed
+    /// from the model's own rates. Negative on a turn that populated a cache
+    /// it did not get to read. `None` when the model reported no rates — not
+    /// every surface charges for the same token types.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_saved_nano_aiu: Option<i64>,
     /// Copilot premium-request cost, from the model catalog's
     /// `billing.multiplier`. `None` when the model is unknown or the endpoint
     /// carries no premium cost — never guessed as 1.0.
@@ -96,6 +113,19 @@ pub struct RequestRecord {
     pub estimated_cost_usd: Option<f64>,
 }
 
+impl RequestRecord {
+    /// Whether this attempt never produced a usable answer.
+    ///
+    /// One definition, because three places ask: the failures-only filter, the
+    /// statistics that must exclude these, and the dashboard. A non-2xx status
+    /// is the obvious case; `failure_kind` catches the ones that carry a
+    /// success status but did not succeed — a stream cut off mid-answer, or a
+    /// client that hung up.
+    pub fn failed(&self) -> bool {
+        self.status_code >= 400 || self.failure_kind.is_some()
+    }
+}
+
 /// Values for [`RequestRecord::failure_kind`], ordered by how far the request
 /// got before dying.
 pub mod failure {
@@ -114,13 +144,26 @@ pub mod failure {
 /// Aggregate statistics returned by `/api/stats`.
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct Stats {
+    /// Requests that produced a usable answer. Failed attempts are counted
+    /// separately rather than here: they consume nothing, and folding them in
+    /// would dilute every rate derived from this — a burst of rejected calls
+    /// would look like a collapse in cache hit rate.
     pub request_count: u64,
+    /// Attempts that never produced a usable answer.
+    pub failed_requests: u64,
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
     /// Input tokens served from cache, across every recorded request.
     pub total_cache_read_tokens: u64,
     /// Input tokens written into the cache, across every recorded request.
     pub total_cache_creation_tokens: u64,
+    /// Output tokens spent on reasoning that was never emitted.
+    pub total_reasoning_tokens: u64,
+    /// What Copilot billed in total, in nano-AI-units. Since the move to
+    /// usage-based billing this, not the premium-request count, is the meter.
+    pub total_nano_aiu: u64,
+    /// Net effect of the prompt cache on the bill, in nano-AI-units.
+    pub cache_saved_nano_aiu: i64,
     /// Copilot premium requests consumed. Fractional because some models
     /// bill at a discounted multiplier.
     pub premium_requests: f64,
@@ -153,11 +196,21 @@ impl RequestStore {
     /// Records a completed request and updates aggregate statistics.
     pub fn add(&self, record: RequestRecord) {
         let mut inner = self.inner.lock().unwrap();
-        inner.stats.request_count += 1;
+        if record.failed() {
+            inner.stats.failed_requests += 1;
+        } else {
+            inner.stats.request_count += 1;
+        }
+        // Token and billing totals count either way. A stream cut off partway
+        // still consumed what it consumed, and hiding that would understate
+        // the bill.
         inner.stats.total_input_tokens += record.input_tokens;
         inner.stats.total_output_tokens += record.output_tokens;
         inner.stats.total_cache_read_tokens += record.cache_read_input_tokens;
         inner.stats.total_cache_creation_tokens += record.cache_creation_input_tokens;
+        inner.stats.total_reasoning_tokens += record.reasoning_tokens.unwrap_or(0);
+        inner.stats.total_nano_aiu += record.billed_nano_aiu.unwrap_or(0);
+        inner.stats.cache_saved_nano_aiu += record.cache_saved_nano_aiu.unwrap_or(0);
         // Only count what the catalog actually priced; an unknown multiplier
         // is left out rather than assumed to be a full premium request.
         if let Some(multiplier) = record.premium_multiplier {
@@ -244,6 +297,9 @@ mod tests {
             output_tokens_final: None,
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
+            reasoning_tokens: None,
+            billed_nano_aiu: None,
+            cache_saved_nano_aiu: None,
             premium_multiplier: None,
             upstream_idle_max_ms: None,
             session_id: None,

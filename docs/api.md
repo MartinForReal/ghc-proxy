@@ -32,16 +32,137 @@ require a key on the LLM endpoints; see [Authentication](#authentication) below.
 | `GET /v1/models/full/` | Raw upstream model catalog with capabilities |
 | `GET /usage` | Copilot plan and quota usage |
 | `GET /health` | Liveness/readiness probe |
-| `GET /` | Web analytics dashboard |
+| `GET /` | Web analytics dashboard — overview |
 | `GET /metrics/dashboard` | Metrics dashboard UI |
 | `GET /metrics` | OpenMetrics exposition endpoint |
 | `GET /requests` | Request browser |
+| `GET /app.css` | Stylesheet shared by the three dashboard pages |
 | `GET /api/stats` | Dashboard statistics (JSON) |
+| `GET /api/cache` | Prompt-cache statistics, overall and per model |
 | `GET /api/requests` | Recent requests (JSON) |
 | `GET /api/audit` | Filtered audit records |
 | `GET /api/audit/summary` | Aggregated audit summary |
 | `POST /api/config/reload` | Reload `config.yaml` without restart |
+| `POST /api/config/debug` | Turn request/response body capture on or off |
 | `GET /openapi.json` | OpenAPI v3 specification of the LLM endpoints |
+| `GET /v1/responses` (Upgrade) | Responses API over WebSocket |
+
+## Responses over WebSocket
+
+Several models advertise `ws:/responses` in `supported_endpoints` alongside
+`/responses`. `GET /v1/responses` (or `/responses`) with a WebSocket upgrade
+exposes that transport.
+
+The protocol is the streaming Responses API with a different carrier: the same
+`response.*` event vocabulary, one event per text frame, so a client already
+written against the SSE stream needs no new parsing. Send one frame to start a
+turn:
+
+```json
+{"type": "response.create", "model": "gpt-5.5", "input": "...", "stream": true}
+```
+
+The frame is flat — `model` sits at the top level beside the request fields, not
+nested under a `response` object. Omitting `type` or nesting the body is
+rejected.
+
+A model that does not advertise the transport is refused with an error frame
+naming the alternative rather than left waiting on the socket:
+
+```json
+{"type": "error", "error": {"code": "unsupported_api_for_model",
+  "message": "Model 'claude-opus-4.6' does not support ws:/responses. Use POST /v1/responses instead."}}
+```
+
+WebSocket turns are recorded like any other request, under the endpoint
+`ws:/responses`.
+
+Read-only dashboard endpoints are reachable without an API key so local
+monitoring keeps working. The `/api/config/` routes are not: they mutate the
+running process, and one of them turns on body capture, which writes whatever
+the client sent — credentials included — into the request log.
+
+## Statistics and failed attempts
+
+`GET /api/stats` counts requests that produced an answer. Attempts that did not
+— a non-2xx status, or a `failure_kind` on an otherwise successful one — are
+reported separately as `failed_requests` and excluded from the rest, so a burst
+of rejected calls cannot dilute a rate computed over requests that consumed
+nothing. Token and billing totals count either way: a stream cut off partway
+consumed what it consumed.
+
+## Prompt cache statistics
+
+`GET /api/cache` reports where input tokens came from. The hit rate is the early
+warning for a broken prompt prefix: on an agent workload it should sit high and
+stable, and a sudden drop means the prompt stopped matching and every turn is
+paying full input price again.
+
+```json
+{
+  "totals": {
+    "input_tokens": 9397,
+    "cache_read_tokens": 4682,
+    "cache_creation_tokens": 4682,
+    "fresh_tokens": 33,
+    "hit_rate": 0.498,
+    "request_count": 4
+  },
+  "dispositions": { "served_from_cache": 1, "wrote_to_cache": 1, "no_cache": 2 },
+  "sampled_requests": 4,
+  "by_model": [
+    {
+      "model": "gemini-3.5-flash",
+      "requests": 4,
+      "input_tokens": 9397,
+      "cache_read_tokens": 4682,
+      "cache_creation_tokens": 0,
+      "fresh_tokens": 33,
+      "hit_rate": 0.498,
+      "saved_nano_aiu": 547830000
+    }
+  ]
+}
+```
+
+`totals` are the all-time running counters. `by_model` is derived from the
+retained ring buffer, so it describes the most recent `sampled_requests` calls
+rather than every one ever served.
+
+### What a zero means
+
+Copilot states its own per-token rates on each response, in
+`copilot_usage.token_details`. `saved_nano_aiu` is computed from those rates
+rather than from a price list, so a model Copilot includes at no charge
+contributes nothing instead of an imagined discount. Positive means the cache
+paid for itself; negative is the normal shape of a turn that populated a cache
+it has not read back yet. `null` means no response for this model reported the
+rates to compute one from — distinct from `0`, which is a real figure: nothing
+was cached, so nothing was saved.
+
+`cache_creation_tokens` is only ever non-zero on the Anthropic surface with an
+explicit `cache_control` marker. Every other surface caches implicitly: the
+first call reads nothing, the next reads the whole prefix back, and no write is
+billed. Measured across twelve calls with a 27k-token prefix, exactly one
+reported a write, on `/v1/messages`. The dashboard hides the column outright
+when nothing wrote.
+
+A model with no cache activity at all is usually not a fault either: Copilot
+needs a minimum cacheable prefix before any of the prompt is eligible.
+`claude-haiku-4.5` was observed caching a 6902-token prefix but not a
+4082-token one.
+
+## Body capture
+
+`POST /api/config/debug` with `{"debug": true}` or `{"debug": false}` turns
+request/response body capture on or off for the running process. The flag is
+read live on every request, so it applies from the next call — no restart, and
+no need to have predicted in advance that you would want the bodies.
+
+It is deliberately not written back to `config.yaml`. Capture puts prompts, tool
+output and any credentials they carry into memory and the log, so it lapses on
+restart rather than staying on because someone forgot. `GET /health` reports the
+current value as `debug`.
 
 Streaming (SSE) is supported on the chat, responses, and messages endpoints by
 setting `"stream": true` in the request body. The Gemini surface streams via the
@@ -75,6 +196,12 @@ has loaded. A degraded proxy still answers `200` with `ready: false` so probes
 can distinguish "process alive" from "able to serve traffic". Add `?strict=true`
 to get `503 Service Unavailable` instead when the proxy is not ready.
 
+The `quota` object holds the most recent per-SKU allowance reported by the
+upstream. Copilot attaches it to every response, so it is current without any
+extra API call — but it stays empty until the first request has been proxied.
+The same figures are exported on `/metrics` as `ghc_proxy_quota_*` gauges
+labelled by `sku`.
+
 ## Retrieve a model
 
 `GET /v1/models/{model}` returns a single catalog entry in the OpenAI shape,
@@ -84,7 +211,7 @@ the mapped Copilot model. Unknown ids return `404` with an OpenAI-style error
 body.
 
 ```bash
-curl http://127.0.0.1:8314/v1/models/claude-opus-4.8
+curl http://127.0.0.1:8314/v1/models/claude-opus-5
 ```
 
 ## Token counting
@@ -239,7 +366,14 @@ counts, estimated cost, and prompt-cache hit rate.
 - **SSE keepalive** — a `: keepalive` comment is emitted after 15 seconds of
   silence so extended thinking does not trip the ~60 second idle timeout
   enforced by the upstream load balancer. Comments are ignored by every
-  spec-compliant SSE client.
+  spec-compliant SSE client. The comment is only injected at an event boundary:
+  if the upstream goes quiet *part way through* writing an event, splicing one
+  in would corrupt it, so that case is left to the read timeout below.
+- **Read timeout** — `upstream_read_timeout_seconds` (default 120) bounds how
+  long an upstream response may stay silent between reads. It does not cap the
+  total duration, so long answers stream normally, but a half-open connection
+  is turned into a reported stream error instead of hanging the request
+  forever. Set it to `0` to disable.
 - **`anthropic-beta` passthrough** — the client's beta flags are forwarded and
   merged with the ones the proxy derives (`context-1m-2025-08-07` for extended
   context models, `context-management-2025-06-27` when the request uses

@@ -11,7 +11,10 @@ use crate::util;
 use crate::util::TokenUsage;
 use axum::{
     body::{Body, Bytes},
-    extract::{DefaultBodyLimit, Path, Query, Request, State},
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        DefaultBodyLimit, Path, Query, Request, State,
+    },
     http::{HeaderMap, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -33,8 +36,8 @@ pub fn router(state: SharedState) -> Router {
         .route("/models/{model_id}", get(get_model))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/chat/completions", post(chat_completions))
-        .route("/v1/responses", post(responses))
-        .route("/responses", post(responses))
+        .route("/v1/responses", post(responses).get(ws_responses))
+        .route("/responses", post(responses).get(ws_responses))
         .route("/v1/messages", post(messages))
         .route("/v1/messages/count_tokens", post(count_tokens))
         .route("/v1/embeddings", post(embeddings))
@@ -45,11 +48,14 @@ pub fn router(state: SharedState) -> Router {
         .route("/", get(dashboard))
         .route("/requests", get(requests_page))
         .route("/metrics/dashboard", get(metrics_page))
+        .route("/app.css", get(stylesheet))
         .route("/api/stats", get(api_stats))
+        .route("/api/cache", get(api_cache))
         .route("/api/requests", get(api_requests))
         .route("/api/audit", get(api_audit))
         .route("/api/audit/summary", get(api_audit_summary))
         .route("/api/config/reload", post(api_reload_config))
+        .route("/api/config/debug", post(api_set_debug))
         .route("/api/models", get(get_models))
         .route("/v1beta/models/{model_action}", post(gemini_generate))
         .route("/openapi.json", get(openapi_spec))
@@ -63,8 +69,14 @@ pub fn router(state: SharedState) -> Router {
 }
 
 /// Whether a request path is an LLM API endpoint that should be guarded by the
-/// optional API key. The dashboard UI, static assets, and metrics endpoints are
-/// intentionally left open so local monitoring keeps working without a key.
+/// optional API key. The dashboard UI, static assets, and read-only metrics
+/// endpoints are intentionally left open so local monitoring keeps working
+/// without a key.
+///
+/// `/api/config/` is guarded despite being part of the dashboard: those routes
+/// mutate the running process, and one of them turns on body capture, which
+/// writes whatever the client sent — credentials included — into the request
+/// log. That is not something an unauthenticated caller should be able to do.
 fn is_protected_path(path: &str) -> bool {
     const PREFIXES: &[&str] = &[
         "/v1/",
@@ -73,6 +85,7 @@ fn is_protected_path(path: &str) -> bool {
         "/embeddings",
         "/models",
         "/v1beta/",
+        "/api/config/",
     ];
     PREFIXES.iter().any(|p| path.starts_with(p))
 }
@@ -451,6 +464,9 @@ fn record_failure(
         output_tokens_final: None,
         cache_read_input_tokens: 0,
         cache_creation_input_tokens: 0,
+        reasoning_tokens: None,
+        billed_nano_aiu: None,
+        cache_saved_nano_aiu: None,
         premium_multiplier: None,
         upstream_idle_max_ms: None,
         keepalive_probes: None,
@@ -489,6 +505,10 @@ fn record_failure(
 #[derive(Debug, Default)]
 struct DirectStreamState {
     usage: TokenUsage,
+    /// What Copilot billed, attached to the terminal event beside `usage`.
+    billed_nano_aiu: Option<u64>,
+    /// What the cache was worth, from the same event's per-token rates.
+    cache_saved_nano_aiu: Option<i64>,
     /// Whether `message_delta` — the only event carrying an authoritative
     /// `output_tokens` — has arrived. Until it does, the count taken from
     /// `message_start` is an opening placeholder, so a record finalized early
@@ -502,6 +522,10 @@ struct DirectStreamState {
 impl DirectStreamState {
     /// Folds one decoded SSE event into the running state.
     fn observe(&mut self, v: &Value) {
+        // Rides along on the terminal event rather than inside `usage`.
+        if let Some(n) = util::copilot_billed_nano_aiu(v) {
+            self.billed_nano_aiu = Some(n);
+        }
         match v.get("type").and_then(|t| t.as_str()) {
             Some("message_start") => {
                 // The input buckets are only ever stated here, and
@@ -563,6 +587,10 @@ struct StreamRecorder {
     /// is still the `message_start` placeholder — from one that saw the real
     /// total in `message_delta`.
     usage_final: bool,
+    /// What Copilot billed for this turn, once its terminal event states it.
+    billed_nano_aiu: Option<u64>,
+    /// What the cache was worth this turn, from the model's own rates.
+    cache_saved_nano_aiu: Option<i64>,
     resp_size: usize,
     idle: util::IdleTracker,
     /// Shared with the keepalive layer wrapping this stream, so the record can
@@ -602,6 +630,9 @@ impl StreamRecorder {
             output_tokens_final: None,
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
+            reasoning_tokens: None,
+            billed_nano_aiu: None,
+            cache_saved_nano_aiu: None,
             premium_multiplier,
             upstream_idle_max_ms: None,
             keepalive_probes: None,
@@ -626,6 +657,8 @@ impl StreamRecorder {
             start,
             usage: TokenUsage::default(),
             usage_final: false,
+            billed_nano_aiu: None,
+            cache_saved_nano_aiu: None,
             resp_size: 0,
             idle: util::IdleTracker::new(Instant::now()),
             probes,
@@ -658,6 +691,10 @@ impl StreamRecorder {
         rec.output_tokens_final = Some(self.usage_final);
         rec.cache_read_input_tokens = self.usage.cache_read_input_tokens;
         rec.cache_creation_input_tokens = self.usage.cache_creation_input_tokens;
+        rec.reasoning_tokens =
+            (self.usage.reasoning_tokens > 0).then_some(self.usage.reasoning_tokens);
+        rec.billed_nano_aiu = self.billed_nano_aiu;
+        rec.cache_saved_nano_aiu = self.cache_saved_nano_aiu;
         rec.upstream_idle_max_ms = Some(self.idle.max_idle_ms_including_now());
         rec.keepalive_probes = Some(self.probes.load(std::sync::atomic::Ordering::Relaxed));
         rec.duration = elapsed_secs(self.start);
@@ -997,6 +1034,8 @@ async fn chat_completions(State(state): State<SharedState>, body: Bytes) -> Resp
     if status.is_success() {
         let parsed: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
         let usage = util::openai_usage(&parsed.get("usage").cloned().unwrap_or(json!({})));
+        let billed = util::copilot_billed_nano_aiu(&parsed);
+        let cache_saved = util::cache_saving_nano_aiu(&parsed, &usage);
         let (tool_count, tool_names) = extract_tools_from_request(&req);
         let cost = calculate_cost(&translated, &usage);
         let premium_multiplier = state.model_premium_multiplier(&translated).await;
@@ -1014,6 +1053,9 @@ async fn chat_completions(State(state): State<SharedState>, body: Bytes) -> Resp
             output_tokens_final: None,
             cache_read_input_tokens: usage.cache_read_input_tokens,
             cache_creation_input_tokens: usage.cache_creation_input_tokens,
+            reasoning_tokens: (usage.reasoning_tokens > 0).then_some(usage.reasoning_tokens),
+            billed_nano_aiu: billed,
+            cache_saved_nano_aiu: cache_saved,
             premium_multiplier,
             upstream_idle_max_ms: None,
             keepalive_probes: None,
@@ -1145,6 +1187,8 @@ async fn responses(State(state): State<SharedState>, body: Bytes) -> Response {
     if status.is_success() {
         let parsed: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
         let usage = util::responses_usage(&parsed.get("usage").cloned().unwrap_or(json!({})));
+        let billed = util::copilot_billed_nano_aiu(&parsed);
+        let cache_saved = util::cache_saving_nano_aiu(&parsed, &usage);
         let (tool_count, tool_names) = extract_tools_from_request(&req);
         let cost = calculate_cost(&translated, &usage);
         let premium_multiplier = state.model_premium_multiplier(&translated).await;
@@ -1162,6 +1206,9 @@ async fn responses(State(state): State<SharedState>, body: Bytes) -> Response {
             output_tokens_final: None,
             cache_read_input_tokens: usage.cache_read_input_tokens,
             cache_creation_input_tokens: usage.cache_creation_input_tokens,
+            reasoning_tokens: (usage.reasoning_tokens > 0).then_some(usage.reasoning_tokens),
+            billed_nano_aiu: billed,
+            cache_saved_nano_aiu: cache_saved,
             premium_multiplier,
             upstream_idle_max_ms: None,
             keepalive_probes: None,
@@ -1187,8 +1234,459 @@ async fn responses(State(state): State<SharedState>, body: Bytes) -> Response {
 }
 
 // ---------------------------------------------------------------------------
-// Anthropic messages
+// Responses over WebSocket
 // ---------------------------------------------------------------------------
+
+/// Message type a client must send to start a turn. The upstream rejects
+/// anything else with `unsupported message type`.
+const WS_RESPONSE_CREATE: &str = "response.create";
+
+/// The catalog's name for this surface.
+const WS_RESPONSES_ENDPOINT: &str = "ws:/responses";
+
+/// Sends a `type: error` frame in the shape the upstream itself uses, so a
+/// client needs no special handling for failures the proxy originates.
+async fn ws_error(socket: &mut WebSocket, code: &str, message: &str) {
+    let frame = json!({"type": "error", "error": {"code": code, "message": message}});
+    let _ = socket.send(Message::Text(frame.to_string().into())).await;
+}
+
+/// The Responses API over WebSocket.
+///
+/// Several models advertise `ws:/responses` in the catalog and nothing else
+/// besides `/responses`; this exposes that transport to clients. The protocol
+/// is the same `response.*` event vocabulary as the SSE path, one event per
+/// text frame — only the transport differs, so a client already written
+/// against the streaming Responses API needs no new parsing.
+///
+/// Undocumented upstream: the request frame must be flat, with `model` at the
+/// top level. Nesting it under `response` is rejected.
+async fn ws_responses(ws: WebSocketUpgrade, State(state): State<SharedState>) -> Response {
+    ws.on_upgrade(move |socket| handle_ws_responses(socket, state))
+}
+
+async fn handle_ws_responses(mut socket: WebSocket, state: SharedState) {
+    // The turn does not begin until the client sends something, so there is no
+    // work to charge for and no record to write if it just connects and leaves.
+    let first = loop {
+        match socket.recv().await {
+            Some(Ok(Message::Text(t))) => break t.to_string(),
+            Some(Ok(Message::Binary(b))) => break String::from_utf8_lossy(&b).into_owned(),
+            // Keepalive traffic before the request is normal; axum answers pings.
+            Some(Ok(_)) => continue,
+            Some(Err(_)) | None => return,
+        }
+    };
+
+    let start = Instant::now();
+    let req_size = first.len();
+
+    let Ok(req) = serde_json::from_str::<Value>(&first) else {
+        // Recorded like any other pre-flight failure: a request that leaves no
+        // trace is a request nobody can diagnose.
+        record_failure(
+            &state,
+            "ws:/responses",
+            "",
+            None,
+            400,
+            crate::store::failure::PRECONDITION,
+            req_size,
+            capture_str(&state, &first),
+            None,
+            start,
+            None,
+        );
+        ws_error(&mut socket, "bad_request", "frame is not JSON").await;
+        return;
+    };
+    let msg_type = req.get("type").and_then(Value::as_str).unwrap_or("");
+    if msg_type != WS_RESPONSE_CREATE {
+        record_failure(
+            &state,
+            "ws:/responses",
+            req.get("model").and_then(Value::as_str).unwrap_or_default(),
+            None,
+            400,
+            crate::store::failure::PRECONDITION,
+            req_size,
+            capture_json(&state, &req),
+            None,
+            start,
+            None,
+        );
+        ws_error(
+            &mut socket,
+            "bad_request",
+            &format!("unsupported message type: {msg_type}"),
+        )
+        .await;
+        return;
+    }
+
+    let original_model = req
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let translated = translate::translate(&state.model_mappings(), &original_model);
+
+    // The transport is only available for models that advertise it, and saying
+    // so beats an opaque upstream rejection.
+    if !state
+        .model_supports_endpoint(&translated, WS_RESPONSES_ENDPOINT)
+        .await
+    {
+        record_failure(
+            &state,
+            "ws:/responses",
+            &original_model,
+            Some(&translated),
+            400,
+            crate::store::failure::PRECONDITION,
+            req_size,
+            capture_json(&state, &req),
+            None,
+            start,
+            None,
+        );
+        ws_error(
+            &mut socket,
+            "unsupported_api_for_model",
+            &format!(
+                "Model '{original_model}' does not support {WS_RESPONSES_ENDPOINT}. \
+                 Use POST /v1/responses instead."
+            ),
+        )
+        .await;
+        return;
+    }
+
+    if let Err(e) = state.ensure_copilot_token().await {
+        record_failure(
+            &state,
+            "ws:/responses",
+            &original_model,
+            Some(&translated),
+            500,
+            crate::store::failure::PRECONDITION,
+            req_size,
+            capture_json(&state, &req),
+            None,
+            start,
+            None,
+        );
+        ws_error(&mut socket, "internal_error", &e).await;
+        return;
+    }
+
+    // Forward the model the mapping resolved to, not the alias the client used.
+    let mut upstream_req = req.clone();
+    if let Some(m) = upstream_req.get_mut("model") {
+        *m = json!(translated);
+    }
+
+    let (url, headers) = state.ws_responses_upstream().await;
+    log_debug_request(&state, "ws:/responses", &upstream_req);
+
+    let mut request =
+        match tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(
+            url.as_str(),
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                ws_error(
+                    &mut socket,
+                    "internal_error",
+                    &format!("bad upstream url: {e}"),
+                )
+                .await;
+                return;
+            }
+        };
+    // The handshake carries the same credentials as the HTTP path.
+    for (k, v) in headers.iter() {
+        request.headers_mut().insert(k.clone(), v.clone());
+    }
+
+    let upstream = match tokio_tungstenite::connect_async(request).await {
+        Ok((s, _)) => s,
+        Err(e) => {
+            record_failure(
+                &state,
+                "ws:/responses",
+                &original_model,
+                Some(&translated),
+                502,
+                crate::store::failure::CONNECT,
+                req_size,
+                capture_json(&state, &req),
+                None,
+                start,
+                None,
+            );
+            ws_error(&mut socket, "connect_error", &format!("upstream: {e}")).await;
+            return;
+        }
+    };
+
+    pump_ws_responses(
+        socket,
+        upstream,
+        state,
+        original_model,
+        translated,
+        req,
+        req_size,
+        start,
+    )
+    .await;
+}
+
+/// Relays frames in both directions until the turn ends, accumulating what the
+/// record needs on the way past. Usage only becomes known at
+/// `response.completed`, so the totals are folded in as the events go by rather
+/// than by re-parsing the transcript afterwards.
+#[allow(clippy::too_many_arguments)]
+async fn pump_ws_responses(
+    mut client: WebSocket,
+    upstream: tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    state: SharedState,
+    original_model: String,
+    translated: String,
+    req: Value,
+    req_size: usize,
+    start: Instant,
+) {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+    let (mut up_tx, mut up_rx) = upstream.split();
+
+    // The first frame was consumed to route the request; send the rewritten one.
+    let mut outbound = req.clone();
+    if let Some(m) = outbound.get_mut("model") {
+        *m = json!(translated);
+    }
+    if up_tx
+        .send(WsMessage::Text(outbound.to_string().into()))
+        .await
+        .is_err()
+    {
+        ws_error(
+            &mut client,
+            "connect_error",
+            "upstream closed before the request was sent",
+        )
+        .await;
+        return;
+    }
+
+    let mut usage = TokenUsage::default();
+    // Copilot reports what it billed only on the terminal event.
+    let mut billed: Option<u64> = None;
+    let mut cache_saved: Option<i64> = None;
+    let mut status = 200u16;
+    let mut failure: Option<&'static str> = None;
+    let mut resp_size = 0usize;
+    let mut transcript = String::new();
+    let capture = state.is_debug();
+    let mut idle = util::IdleTracker::new(Instant::now());
+
+    loop {
+        tokio::select! {
+            // Upstream → client. This is where the answer comes from, so it is
+            // also where the turn ends.
+            frame = up_rx.next() => match frame {
+                Some(Ok(WsMessage::Text(t))) => {
+                    idle.mark_now();
+                    resp_size += t.len();
+                    if capture {
+                        transcript.push_str(&t);
+                        transcript.push('\n');
+                    }
+                    let done = ws_absorb_event(
+                        &t,
+                        &mut usage,
+                        &mut billed,
+                        &mut cache_saved,
+                        &mut status,
+                        &mut failure,
+                    );
+                    if client.send(Message::Text(t.as_str().into())).await.is_err() {
+                        failure.get_or_insert(crate::store::failure::CLIENT_DISCONNECTED);
+                        status = 499;
+                        break;
+                    }
+                    if done {
+                        break;
+                    }
+                }
+                Some(Ok(WsMessage::Binary(b))) => {
+                    idle.mark_now();
+                    resp_size += b.len();
+                    if client.send(Message::Binary(b.to_vec().into())).await.is_err() {
+                        failure.get_or_insert(crate::store::failure::CLIENT_DISCONNECTED);
+                        status = 499;
+                        break;
+                    }
+                }
+                Some(Ok(WsMessage::Close(_))) | None => {
+                    // A close before `response.completed` truncated the turn.
+                    if failure.is_none() && status == 200 && usage.output_tokens == 0 {
+                        failure = Some(crate::store::failure::STREAM_INTERRUPTED);
+                        status = 502;
+                    }
+                    break;
+                }
+                Some(Ok(_)) => {}
+                Some(Err(e)) => {
+                    tracing::warn!("[ws:/responses] upstream error: {e}");
+                    failure = Some(crate::store::failure::STREAM_INTERRUPTED);
+                    status = 502;
+                    let _ = client
+                        .send(Message::Text(
+                            json!({"type": "error", "error": {"code": "stream_interrupted",
+                                   "message": e.to_string()}})
+                            .to_string()
+                            .into(),
+                        ))
+                        .await;
+                    break;
+                }
+            },
+
+            // Client → upstream. Kept open for the whole turn: this transport
+            // is bidirectional, and a client may cancel or send another
+            // `response.create` on the same connection.
+            frame = client.recv() => match frame {
+                Some(Ok(Message::Text(t))) => {
+                    if up_tx.send(WsMessage::Text(t.as_str().into())).await.is_err() {
+                        break;
+                    }
+                }
+                Some(Ok(Message::Binary(b))) => {
+                    if up_tx.send(WsMessage::Binary(b.to_vec().into())).await.is_err() {
+                        break;
+                    }
+                }
+                Some(Ok(Message::Close(_))) | None => {
+                    failure.get_or_insert(crate::store::failure::CLIENT_DISCONNECTED);
+                    status = 499;
+                    let _ = up_tx.send(WsMessage::Close(None)).await;
+                    break;
+                }
+                Some(Ok(_)) => {}
+                Some(Err(_)) => {
+                    failure.get_or_insert(crate::store::failure::CLIENT_DISCONNECTED);
+                    status = 499;
+                    break;
+                }
+            },
+        }
+    }
+
+    let _ = up_tx.send(WsMessage::Close(None)).await;
+
+    let (tool_count, tool_names) = extract_tools_from_request(&req);
+    let cost = calculate_cost(&translated, &usage);
+    let premium_multiplier = state.model_premium_multiplier(&translated).await;
+    if capture {
+        log_debug_response(&state, "ws:/responses", &transcript);
+    }
+    state.store.add(RequestRecord {
+        id: uuid::Uuid::new_v4().to_string(),
+        timestamp: now_iso(),
+        endpoint: "ws:/responses".into(),
+        model: original_model.clone(),
+        translated_model: (translated != original_model).then_some(translated),
+        status_code: status,
+        request_size: req_size,
+        response_size: resp_size,
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        // The upstream sends usage only in the terminal event, so reaching it
+        // is exactly what makes the count authoritative.
+        output_tokens_final: Some(failure.is_none()),
+        cache_read_input_tokens: usage.cache_read_input_tokens,
+        cache_creation_input_tokens: usage.cache_creation_input_tokens,
+        reasoning_tokens: (usage.reasoning_tokens > 0).then_some(usage.reasoning_tokens),
+        billed_nano_aiu: billed,
+        cache_saved_nano_aiu: cache_saved,
+        premium_multiplier,
+        upstream_idle_max_ms: Some(idle.max_idle_ms_including_now()),
+        keepalive_probes: None,
+        duration: elapsed_secs(start),
+        // Both halves use the flag as it stood when the stream opened. A socket
+        // can stay open for minutes, so re-reading it here would let a toggle
+        // mid-turn produce a record with the request captured and the response
+        // missing — half a transcript is more misleading than none.
+        request_body: capture.then(|| req.to_string()),
+        response_body: capture.then_some(transcript),
+        message_count: None,
+        tool_count: (tool_count > 0).then_some(tool_count),
+        tool_names: (tool_count > 0).then_some(tool_names),
+        stop_reason: None,
+        tools_called: None,
+        is_agent_initiated: None,
+        session_id: None,
+        prompt_cache_hit: cache_disposition(&usage),
+        failure_kind: failure.map(String::from),
+        estimated_cost_usd: Some(cost),
+    });
+}
+
+/// Folds one upstream event into the running record state. Returns true when
+/// the event terminates the turn.
+fn ws_absorb_event(
+    text: &str,
+    usage: &mut TokenUsage,
+    billed: &mut Option<u64>,
+    cache_saved: &mut Option<i64>,
+    status: &mut u16,
+    failure: &mut Option<&'static str>,
+) -> bool {
+    let Ok(v) = serde_json::from_str::<Value>(text) else {
+        return false;
+    };
+    // Attached to the terminal event, beside the response rather than inside it.
+    if let Some(n) = util::copilot_billed_nano_aiu(&v) {
+        *billed = Some(n);
+    }
+    let done = match v.get("type").and_then(Value::as_str).unwrap_or("") {
+        "response.completed" | "response.incomplete" => {
+            if let Some(u) = v.pointer("/response/usage") {
+                *usage = util::responses_usage(u);
+            }
+            true
+        }
+        "response.failed" => {
+            if let Some(u) = v.pointer("/response/usage") {
+                *usage = util::responses_usage(u);
+            }
+            *status = 502;
+            *failure = Some(crate::store::failure::UPSTREAM_STATUS);
+            true
+        }
+        "error" => {
+            *status = 502;
+            *failure = Some(crate::store::failure::UPSTREAM_STATUS);
+            true
+        }
+        _ => false,
+    };
+    // After the arms above, so the token counts it is derived from are the ones
+    // the terminal event just stated.
+    if let Some(n) = util::cache_saving_nano_aiu(&v, usage) {
+        *cache_saved = Some(n);
+    }
+    done
+}
+
+// ---------------------------------------------------------------------------
+// Anthropic messages// ---------------------------------------------------------------------------
 
 async fn messages(
     State(state): State<SharedState>,
@@ -1224,10 +1722,23 @@ async fn messages(
     req = anthropic::apply_tool_result_suffix(&req, &cfg);
 
     let client_beta = client_beta_header(&client_headers);
+    // What the client sent, counted once. The retry loops downstream mutate the
+    // request, so measuring it there would report the proxy's version of it and
+    // re-serialise the whole body on every attempt to do so.
+    let req_size = body.len();
     if state.use_direct_anthropic(&translated).await {
-        messages_direct(state, req, original_model, translated, client_beta, start).await
+        messages_direct(
+            state,
+            req,
+            original_model,
+            translated,
+            client_beta,
+            req_size,
+            start,
+        )
+        .await
     } else {
-        messages_translated(state, req, original_model, translated, start).await
+        messages_translated(state, req, original_model, translated, req_size, start).await
     }
 }
 
@@ -1273,6 +1784,7 @@ async fn messages_direct(
     original_model: String,
     translated: String,
     client_beta: Option<String>,
+    req_size: usize,
     start: Instant,
 ) -> Response {
     let vision = anthropic::has_image(&req);
@@ -1304,7 +1816,6 @@ async fn messages_direct(
     for _ in 0..4 {
         let mut sanitized = anthropic::sanitize_anthropic_request(&current);
         sanitized = anthropic::adjust_thinking_budget(&sanitized);
-        let req_size = serde_json::to_vec(&current).map(|v| v.len()).unwrap_or(0);
         let payload = serde_json::to_vec(&sanitized).unwrap_or_default();
         log_debug_request(&state, "/v1/messages", &sanitized);
 
@@ -1405,14 +1916,17 @@ async fn messages_direct(
         };
         let status = resp.status();
         if status.is_success() {
-            let parsed: Value = resp.json().await.unwrap_or(Value::Null);
-            log_debug_response(
-                &state,
-                "/v1/messages",
-                &serde_json::to_string(&parsed).unwrap_or_default(),
-            );
+            // Read once, then parse from that. Asking reqwest for JSON and
+            // re-serialising the tree costs two passes and reports a byte count
+            // that is not the one that came off the wire.
+            let text = resp.text().await.unwrap_or_default();
+            let resp_size = text.len();
+            log_debug_response(&state, "/v1/messages", &text);
+            let parsed: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
             let usage = parsed.get("usage").cloned().unwrap_or(json!({}));
             let usage = util::anthropic_usage(&usage);
+            let billed = util::copilot_billed_nano_aiu(&parsed);
+            let cache_saved = util::cache_saving_nano_aiu(&parsed, &usage);
             let (tool_count, tool_names) = extract_tools_from_request(&req);
             let tools_called: Vec<String> = parsed
                 .get("content")
@@ -1440,12 +1954,15 @@ async fn messages_direct(
                 translated_model: (translated != original_model).then_some(translated.clone()),
                 status_code: status.as_u16(),
                 request_size: req_size,
-                response_size: serde_json::to_vec(&parsed).map(|v| v.len()).unwrap_or(0),
+                response_size: resp_size,
                 input_tokens: usage.input_tokens,
                 output_tokens: usage.output_tokens,
                 output_tokens_final: None,
                 cache_read_input_tokens: usage.cache_read_input_tokens,
                 cache_creation_input_tokens: usage.cache_creation_input_tokens,
+                reasoning_tokens: (usage.reasoning_tokens > 0).then_some(usage.reasoning_tokens),
+                billed_nano_aiu: billed,
+                cache_saved_nano_aiu: cache_saved,
                 premium_multiplier: state.model_premium_multiplier(&translated).await,
                 upstream_idle_max_ms: None,
                 keepalive_probes: None,
@@ -1511,6 +2028,7 @@ async fn messages_translated(
     req: Value,
     original_model: String,
     translated: String,
+    req_size: usize,
     start: Instant,
 ) -> Response {
     let vision = anthropic::has_image(&req);
@@ -1537,7 +2055,6 @@ async fn messages_translated(
         let url = format!("{}/chat/completions", state.copilot_base_url());
         let mut headers = state.copilot_headers(vision).await;
         set_initiator(&mut headers, agent);
-        let req_size = serde_json::to_vec(&current).map(|v| v.len()).unwrap_or(0);
         let payload = serde_json::to_vec(&openai_req).unwrap_or_default();
         log_debug_request(&state, "/v1/messages", &openai_req);
 
@@ -1580,14 +2097,17 @@ async fn messages_translated(
         };
         let status = resp.status();
         if status.is_success() {
-            let parsed: Value = resp.json().await.unwrap_or(Value::Null);
+            // Read once, then parse from that: `resp.json()` followed by a
+            // re-serialisation costs two extra passes over the body and reports
+            // a size that is not the one that came off the wire.
+            let text = resp.text().await.unwrap_or_default();
+            let resp_size = text.len();
+            log_debug_response(&state, "/v1/messages", &text);
+            let parsed: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
             let anthropic_resp = anthropic::openai_to_anthropic(&parsed);
-            log_debug_response(
-                &state,
-                "/v1/messages",
-                &serde_json::to_string(&parsed).unwrap_or_default(),
-            );
             let usage = util::openai_usage(&parsed.get("usage").cloned().unwrap_or(json!({})));
+            let billed = util::copilot_billed_nano_aiu(&parsed);
+            let cache_saved = util::cache_saving_nano_aiu(&parsed, &usage);
             let (tool_count, tool_names) = extract_tools_from_request(&openai_req);
             state.store.add(RequestRecord {
                 id: uuid::Uuid::new_v4().to_string(),
@@ -1597,14 +2117,15 @@ async fn messages_translated(
                 translated_model: (translated != original_model).then_some(translated.clone()),
                 status_code: status.as_u16(),
                 request_size: req_size,
-                response_size: serde_json::to_vec(&anthropic_resp)
-                    .map(|v| v.len())
-                    .unwrap_or(0),
+                response_size: resp_size,
                 input_tokens: usage.input_tokens,
                 output_tokens: usage.output_tokens,
                 output_tokens_final: None,
                 cache_read_input_tokens: usage.cache_read_input_tokens,
                 cache_creation_input_tokens: usage.cache_creation_input_tokens,
+                reasoning_tokens: (usage.reasoning_tokens > 0).then_some(usage.reasoning_tokens),
+                billed_nano_aiu: billed,
+                cache_saved_nano_aiu: cache_saved,
                 premium_multiplier: state.model_premium_multiplier(&translated).await,
                 upstream_idle_max_ms: None,
                 keepalive_probes: None,
@@ -1848,6 +2369,8 @@ async fn gemini_generate(
         let parsed: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
         let gemini_resp = gemini::openai_to_gemini(&parsed);
         let usage = util::openai_usage(&parsed.get("usage").cloned().unwrap_or(json!({})));
+        let billed = util::copilot_billed_nano_aiu(&parsed);
+        let cache_saved = util::cache_saving_nano_aiu(&parsed, &usage);
         let cost = calculate_cost(&translated, &usage);
         let premium_multiplier = state.model_premium_multiplier(&translated).await;
         state.store.add(RequestRecord {
@@ -1864,6 +2387,9 @@ async fn gemini_generate(
             output_tokens_final: None,
             cache_read_input_tokens: usage.cache_read_input_tokens,
             cache_creation_input_tokens: usage.cache_creation_input_tokens,
+            reasoning_tokens: (usage.reasoning_tokens > 0).then_some(usage.reasoning_tokens),
+            billed_nano_aiu: billed,
+            cache_saved_nano_aiu: cache_saved,
             premium_multiplier,
             upstream_idle_max_ms: None,
             keepalive_probes: None,
@@ -1943,6 +2469,7 @@ async fn stream_gemini(
         Ok(r) => r,
         Err(e) => return gemini_error(StatusCode::GATEWAY_TIMEOUT, e.to_string()),
     };
+    state.record_quota_headers(upstream.headers());
     let status = upstream.status().as_u16();
     // Surface a non-2xx upstream (JSON error, not SSE) as a normal error.
     if !is_streamable_status(status) {
@@ -1968,6 +2495,9 @@ async fn stream_gemini(
         let mut byte_stream = upstream.bytes_stream();
         let mut lines = util::SseLineBuffer::new();
         let mut usage = TokenUsage::default();
+            // Copilot reports what it billed only on the terminal event.
+            let mut billed: Option<u64> = None;
+            let mut cache_saved: Option<i64> = None;
         let mut resp_size = 0usize;
         let mut finish: Option<String> = None;
         let mut debug_raw: Vec<u8> = Vec::new();
@@ -1988,6 +2518,8 @@ async fn stream_gemini(
                     if let Some(u) = v.get("usage") {
                         if !u.is_null() {
                             usage.merge_stream_update(util::openai_usage(u));
+                            billed = util::copilot_billed_nano_aiu(&v).or(billed);
+                            cache_saved = util::cache_saving_nano_aiu(&v, &usage).or(cache_saved);
                         }
                     }
                     if let Some(choice) = v.get("choices").and_then(|c| c.as_array()).and_then(|a| a.first()) {
@@ -2033,7 +2565,8 @@ async fn stream_gemini(
             output_tokens: usage.output_tokens,
             output_tokens_final: None,
             cache_read_input_tokens: usage.cache_read_input_tokens,
-            cache_creation_input_tokens: usage.cache_creation_input_tokens,
+            cache_creation_input_tokens: usage.cache_creation_input_tokens,            reasoning_tokens: (usage.reasoning_tokens > 0).then_some(usage.reasoning_tokens),            billed_nano_aiu: billed,
+            cache_saved_nano_aiu: cache_saved,
             premium_multiplier: state.model_premium_multiplier(&translated).await,
             upstream_idle_max_ms: Some(idle.max_idle_ms_including_now()),
             keepalive_probes: None,
@@ -2099,6 +2632,8 @@ async fn embeddings(State(state): State<SharedState>, body: Bytes) -> Response {
     if status.is_success() {
         let parsed: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
         let usage = util::openai_usage(&parsed.get("usage").cloned().unwrap_or(json!({})));
+        let billed = util::copilot_billed_nano_aiu(&parsed);
+        let cache_saved = util::cache_saving_nano_aiu(&parsed, &usage);
         state.store.add(RequestRecord {
             id: uuid::Uuid::new_v4().to_string(),
             timestamp: now_iso(),
@@ -2113,6 +2648,9 @@ async fn embeddings(State(state): State<SharedState>, body: Bytes) -> Response {
             output_tokens_final: None,
             cache_read_input_tokens: usage.cache_read_input_tokens,
             cache_creation_input_tokens: usage.cache_creation_input_tokens,
+            reasoning_tokens: (usage.reasoning_tokens > 0).then_some(usage.reasoning_tokens),
+            billed_nano_aiu: billed,
+            cache_saved_nano_aiu: cache_saved,
             // Embeddings are not billed as premium requests.
             premium_multiplier: None,
             upstream_idle_max_ms: None,
@@ -2146,8 +2684,18 @@ async fn usage(State(state): State<SharedState>) -> Response {
     if let Err(e) = state.ensure_copilot_token().await {
         return error_response(StatusCode::INTERNAL_SERVER_ERROR, e);
     }
+    // The live per-SKU snapshot rides along on every proxied response, so it is
+    // already current; the upstream call below adds the plan name and the
+    // detailed per-category breakdown it does not carry.
+    let live = state.quota_snapshot();
     match state.fetch_usage().await {
-        Ok(v) => Json(crate::state::summarize_usage(&v)).into_response(),
+        Ok(v) => {
+            let mut summary = crate::state::summarize_usage(&v);
+            if !live.is_empty() {
+                summary["live"] = serde_json::to_value(&live).unwrap_or(Value::Null);
+            }
+            Json(summary).into_response()
+        }
         Err(e) => error_response(StatusCode::BAD_GATEWAY, e),
     }
 }
@@ -2183,6 +2731,13 @@ async fn health(
         "models_loaded": model_count,
         "requests_served": stats.request_count,
         "auth_required": state.api_key().is_some(),
+        // Whether request/response bodies are being captured. Surfaced so the
+        // dashboard can say why a request has no body to show, and so an
+        // operator can notice capture was left on.
+        "debug": state.is_debug(),
+        // Reported by the upstream on every response, so this costs no extra
+        // API call. Empty until the first request has been proxied.
+        "quota": state.quota_snapshot(),
     });
     let strict = params
         .get("strict")
@@ -2243,6 +2798,7 @@ async fn stream_openai(
             Ok(r) => r,
             Err(e) => return error_response(StatusCode::GATEWAY_TIMEOUT, e.to_string()),
         };
+        state.record_quota_headers(upstream.headers());
         let status = upstream.status().as_u16();
         // A non-2xx upstream (e.g. GitHub Models returning 401/403 as JSON when
         // the token lacks the `models: read` permission) is not an SSE stream —
@@ -2269,6 +2825,7 @@ async fn stream_openai(
         }
         break upstream;
     };
+    state.record_quota_headers(upstream.headers());
     let status = upstream.status().as_u16();
     let model = translated.clone();
     // Shared with the keepalive wrapper so the record can report how
@@ -2279,6 +2836,9 @@ async fn stream_openai(
         let mut byte_stream = upstream.bytes_stream();
         let mut lines = util::SseLineBuffer::new();
         let mut usage = TokenUsage::default();
+            // Copilot reports what it billed only on the terminal event.
+            let mut billed: Option<u64> = None;
+            let mut cache_saved: Option<i64> = None;
         let mut resp_size = 0usize;
         let mut debug_raw: Vec<u8> = Vec::new();
         let mut interrupted: Option<String> = None;
@@ -2308,6 +2868,8 @@ async fn stream_openai(
                     Ok(v) => {
                         if let Some(u) = v.get("usage") {
                             usage.merge_stream_update(util::openai_usage(u));
+                            billed = util::copilot_billed_nano_aiu(&v).or(billed);
+                            cache_saved = util::cache_saving_nano_aiu(&v, &usage).or(cache_saved);
                         }
                         resp_size += data.len();
                         yield Ok(Bytes::from(format!("data: {data}\n\n")));
@@ -2334,6 +2896,8 @@ async fn stream_openai(
                     if let Ok(v) = serde_json::from_str::<Value>(data) {
                         if let Some(u) = v.get("usage") {
                             usage.merge_stream_update(util::openai_usage(u));
+                            billed = util::copilot_billed_nano_aiu(&v).or(billed);
+                            cache_saved = util::cache_saving_nano_aiu(&v, &usage).or(cache_saved);
                         }
                     }
                     resp_size += data.len();
@@ -2371,7 +2935,8 @@ async fn stream_openai(
             output_tokens: usage.output_tokens,
             output_tokens_final: None,
             cache_read_input_tokens: usage.cache_read_input_tokens,
-            cache_creation_input_tokens: usage.cache_creation_input_tokens,
+            cache_creation_input_tokens: usage.cache_creation_input_tokens,            reasoning_tokens: (usage.reasoning_tokens > 0).then_some(usage.reasoning_tokens),            billed_nano_aiu: billed,
+            cache_saved_nano_aiu: cache_saved,
             premium_multiplier: state.model_premium_multiplier(&translated).await,
             upstream_idle_max_ms: Some(idle.max_idle_ms_including_now()),
             keepalive_probes: None,
@@ -2419,6 +2984,7 @@ async fn stream_responses(
         Ok(r) => r,
         Err(e) => return error_response(StatusCode::GATEWAY_TIMEOUT, e.to_string()),
     };
+    state.record_quota_headers(upstream.headers());
     let status = upstream.status().as_u16();
     // A non-2xx upstream returns a JSON error body, not an SSE stream. Forward
     // it as a normal error response instead of wrapping it in a 200 "stream",
@@ -2440,6 +3006,9 @@ async fn stream_responses(
         let mut byte_stream = upstream.bytes_stream();
         let mut lines = util::SseLineBuffer::new();
         let mut usage = TokenUsage::default();
+            // Copilot reports what it billed only on the terminal event.
+            let mut billed: Option<u64> = None;
+            let mut cache_saved: Option<i64> = None;
         let mut resp_size = 0usize;
         let mut debug_raw: Vec<u8> = Vec::new();
         let mut interrupted: Option<String> = None;
@@ -2466,6 +3035,8 @@ async fn stream_responses(
                         completed = true;
                         let raw = v.get("response").and_then(|r| r.get("usage")).cloned().unwrap_or(json!({}));
                         usage = util::responses_usage(&raw);
+                        billed = util::copilot_billed_nano_aiu(&v).or(billed);
+                        cache_saved = util::cache_saving_nano_aiu(&v, &usage).or(cache_saved);
                     }
                 }
             }
@@ -2503,7 +3074,8 @@ async fn stream_responses(
             output_tokens: usage.output_tokens,
             output_tokens_final: None,
             cache_read_input_tokens: usage.cache_read_input_tokens,
-            cache_creation_input_tokens: usage.cache_creation_input_tokens,
+            cache_creation_input_tokens: usage.cache_creation_input_tokens,            reasoning_tokens: (usage.reasoning_tokens > 0).then_some(usage.reasoning_tokens),            billed_nano_aiu: billed,
+            cache_saved_nano_aiu: cache_saved,
             premium_multiplier: state.model_premium_multiplier(&translated).await,
             upstream_idle_max_ms: Some(idle.max_idle_ms_including_now()),
             keepalive_probes: None,
@@ -2550,6 +3122,7 @@ async fn stream_anthropic_direct(
         session_id,
         start,
     } = meta;
+    state.record_quota_headers(upstream.headers());
     let status = upstream.status().as_u16();
     // Without this the error body is wrapped in a 200 `text/event-stream`, so
     // the client waits on a stream that never produces an event and reports a
@@ -2627,6 +3200,8 @@ async fn stream_anthropic_direct(
                 // this generator: `Drop` can only report what the recorder
                 // itself holds.
                 recorder.usage = st.usage;
+                recorder.billed_nano_aiu = st.billed_nano_aiu;
+                recorder.cache_saved_nano_aiu = st.cache_saved_nano_aiu;
                 recorder.usage_final = st.usage_final;
             }
         }
@@ -2692,6 +3267,7 @@ async fn stream_anthropic_translated(
         Ok(r) => r,
         Err(e) => return anthropic_error(StatusCode::GATEWAY_TIMEOUT, e.to_string()),
     };
+    state.record_quota_headers(upstream.headers());
     let status = upstream.status().as_u16();
     // Surface a non-2xx upstream (JSON error, not SSE) as a normal error.
     if !is_streamable_status(status) {
@@ -2731,6 +3307,9 @@ async fn stream_anthropic_translated(
         let mut conv = AnthropicStreamState::new();
         let mut chunks: Vec<Value> = Vec::new();
         let mut usage = TokenUsage::default();
+            // Copilot reports what it billed only on the terminal event.
+            let mut billed: Option<u64> = None;
+            let mut cache_saved: Option<i64> = None;
         let mut resp_size = 0usize;
         let mut debug_raw: Vec<u8> = Vec::new();
         let mut interrupted: Option<String> = None;
@@ -2752,6 +3331,8 @@ async fn stream_anthropic_translated(
                 };
                 if let Some(u) = v.get("usage") {
                     usage.merge_stream_update(util::openai_usage(u));
+                            billed = util::copilot_billed_nano_aiu(&v).or(billed);
+                            cache_saved = util::cache_saving_nano_aiu(&v, &usage).or(cache_saved);
                 }
                 chunks.push(v.clone());
                 for event in conv.process(&v) {
@@ -2810,7 +3391,8 @@ async fn stream_anthropic_translated(
             output_tokens: usage.output_tokens,
             output_tokens_final: None,
             cache_read_input_tokens: usage.cache_read_input_tokens,
-            cache_creation_input_tokens: usage.cache_creation_input_tokens,
+            cache_creation_input_tokens: usage.cache_creation_input_tokens,            reasoning_tokens: (usage.reasoning_tokens > 0).then_some(usage.reasoning_tokens),            billed_nano_aiu: billed,
+            cache_saved_nano_aiu: cache_saved,
             premium_multiplier: state.model_premium_multiplier(&translated).await,
             upstream_idle_max_ms: Some(idle.max_idle_ms_including_now()),
             keepalive_probes: None,
@@ -2967,7 +3549,16 @@ where
 // ---------------------------------------------------------------------------
 
 async fn dashboard() -> Response {
-    serve_asset("dashboard.html", include_str!("../public/dashboard.html"))
+    serve_asset(
+        include_str!("../public/dashboard.html"),
+        "text/html; charset=utf-8",
+    )
+}
+
+/// Design system shared by the three dashboard pages. Served separately rather
+/// than inlined into each page so the pages cannot drift apart visually.
+async fn stylesheet() -> Response {
+    serve_asset(include_str!("../public/app.css"), "text/css; charset=utf-8")
 }
 
 /// Serves a machine-readable OpenAPI v3 specification describing the proxy's
@@ -3080,19 +3671,23 @@ async fn openapi_spec() -> Response {
 }
 
 async fn requests_page() -> Response {
-    serve_asset("requests.html", include_str!("../public/requests.html"))
+    serve_asset(
+        include_str!("../public/requests.html"),
+        "text/html; charset=utf-8",
+    )
 }
 
 async fn metrics_page() -> Response {
-    serve_asset("metrics.html", include_str!("../public/metrics.html"))
+    serve_asset(
+        include_str!("../public/metrics.html"),
+        "text/html; charset=utf-8",
+    )
 }
 
-fn serve_asset(_name: &str, contents: &'static str) -> Response {
+fn serve_asset(contents: &'static str, content_type: &'static str) -> Response {
     let mut resp = Response::new(Body::from(contents));
-    resp.headers_mut().insert(
-        "Content-Type",
-        HeaderValue::from_static("text/html; charset=utf-8"),
-    );
+    resp.headers_mut()
+        .insert("Content-Type", HeaderValue::from_static(content_type));
     resp
 }
 
@@ -3255,6 +3850,45 @@ async fn metrics_openmetrics(State(state): State<SharedState>) -> Response {
         state.uptime_secs()
     ));
 
+    // Quota comes from headers the upstream attaches to every response, so
+    // scraping this endpoint never costs an extra API call.
+    let quotas = state.quota_snapshot();
+    if !quotas.is_empty() {
+        out.push_str(
+            "# HELP ghc_proxy_quota_percent_remaining Percent of the entitlement still available.\n",
+        );
+        out.push_str("# TYPE ghc_proxy_quota_percent_remaining gauge\n");
+        for (sku, q) in &quotas {
+            out.push_str(&format!(
+                "ghc_proxy_quota_percent_remaining{{sku=\"{}\"}} {}\n",
+                metrics_label_escape(sku),
+                q.percent_remaining
+            ));
+        }
+
+        out.push_str(
+            "# HELP ghc_proxy_quota_entitlement Allowance for the period; negative means unlimited.\n",
+        );
+        out.push_str("# TYPE ghc_proxy_quota_entitlement gauge\n");
+        for (sku, q) in &quotas {
+            out.push_str(&format!(
+                "ghc_proxy_quota_entitlement{{sku=\"{}\"}} {}\n",
+                metrics_label_escape(sku),
+                q.entitlement
+            ));
+        }
+
+        out.push_str("# HELP ghc_proxy_quota_overage Amount consumed beyond the entitlement.\n");
+        out.push_str("# TYPE ghc_proxy_quota_overage gauge\n");
+        for (sku, q) in &quotas {
+            out.push_str(&format!(
+                "ghc_proxy_quota_overage{{sku=\"{}\"}} {}\n",
+                metrics_label_escape(sku),
+                q.overage
+            ));
+        }
+    }
+
     out.push_str(
         "# HELP ghc_proxy_estimated_cost_usd_total Total estimated request cost in USD.\n",
     );
@@ -3303,8 +3937,148 @@ async fn api_reload_config(State(state): State<SharedState>) -> Response {
     .into_response()
 }
 
+/// Turns request/response body capture on or off without a restart.
+///
+/// Capturing bodies is the only way to see what a client actually sent, but it
+/// used to require stopping the proxy and relaunching it with `--debug` — by
+/// which point the request you wanted to inspect is long gone. The flag is read
+/// live on every request, so flipping it here applies from the next call.
+///
+/// Deliberately not written back to `config.yaml`: capture puts prompts, tool
+/// output and any credentials they carry into memory and the log, so it should
+/// lapse on restart rather than stay on because someone forgot.
+async fn api_set_debug(State(state): State<SharedState>, body: Option<Json<Value>>) -> Response {
+    let requested = body
+        .as_ref()
+        .and_then(|Json(v)| v.get("debug"))
+        .and_then(Value::as_bool);
+    let Some(debug) = requested else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "expected a JSON body of {\"debug\": true} or {\"debug\": false}"
+            })),
+        )
+            .into_response();
+    };
+    state.set_debug(debug);
+    let action = if debug { "enabled" } else { "disabled" };
+    tracing::info!("[debug] body capture {action} from the dashboard");
+    Json(json!({ "ok": true, "debug": debug })).into_response()
+}
+
 async fn api_stats(State(state): State<SharedState>) -> Response {
     Json(state.store.stats()).into_response()
+}
+
+/// Running totals for one model's prompt-cache behaviour.
+#[derive(Default)]
+struct CacheAgg {
+    requests: u64,
+    input: u64,
+    read: u64,
+    write: u64,
+    /// Net effect on the bill, in nano-AI-units, from the model's own rates.
+    saved_nano_aiu: i64,
+    /// Whether any response for this model reported rates to compute the above
+    /// from. Without it a genuine zero — nothing was cached, so nothing was
+    /// saved — is indistinguishable from an unpriced model.
+    priced: bool,
+}
+
+/// Prompt-cache statistics.
+///
+/// The hit rate is the early warning for a broken prompt prefix: on an agent
+/// workload it should sit high and stable, and a sudden drop means the prompt
+/// stopped matching and every turn is paying full input price again. Reporting
+/// it per model is what makes that actionable — a single global number cannot
+/// tell you *which* conversation broke.
+///
+/// Totals come from the all-time running counters. The per-model breakdown is
+/// derived from the retained ring buffer, so it describes the most recent
+/// `sampled_requests` calls rather than every one ever served; the response
+/// says so explicitly rather than letting the two silently disagree.
+async fn api_cache(State(state): State<SharedState>) -> Response {
+    let stats = state.store.stats();
+
+    let (by_model, hit, write_only, uncached, sampled) = state.store.with_records(|records| {
+        let mut by_model: HashMap<String, CacheAgg> = HashMap::new();
+        let (mut hit, mut write_only, mut uncached, mut sampled) = (0u64, 0u64, 0u64, 0u64);
+
+        for r in records {
+            // A rejected attempt has no tokens and no model worth a row; counting
+            // it would add an empty-named entry and drag every disposition
+            // toward "uncached".
+            if r.failed() {
+                continue;
+            }
+            sampled += 1;
+            match r.prompt_cache_hit {
+                Some(true) => hit += 1,
+                Some(false) => write_only += 1,
+                None => uncached += 1,
+            }
+
+            // Price against the model that actually served the request, not the
+            // alias the client asked for.
+            let model = r.translated_model.as_deref().unwrap_or(&r.model);
+            let agg = by_model.entry(model.to_string()).or_default();
+            agg.requests += 1;
+            agg.input += r.input_tokens;
+            agg.read += r.cache_read_input_tokens;
+            agg.write += r.cache_creation_input_tokens;
+            // Derived upstream from the rates that response reported, so a
+            // model Copilot includes at no charge contributes nothing rather
+            // than an imagined saving.
+            agg.saved_nano_aiu += r.cache_saved_nano_aiu.unwrap_or(0);
+            agg.priced |= r.cache_saved_nano_aiu.is_some();
+        }
+        (by_model, hit, write_only, uncached, sampled)
+    });
+
+    let mut models: Vec<Value> = by_model
+        .into_iter()
+        .map(|(model, a)| {
+            json!({
+                "model": model,
+                "requests": a.requests,
+                "input_tokens": a.input,
+                "cache_read_tokens": a.read,
+                "cache_creation_tokens": a.write,
+                "fresh_tokens": a.input.saturating_sub(a.read + a.write),
+                "hit_rate": if a.input > 0 { a.read as f64 / a.input as f64 } else { 0.0 },
+                "saved_nano_aiu": a.priced.then_some(a.saved_nano_aiu),
+            })
+        })
+        .collect();
+    // Biggest prompt first: that is where a broken prefix costs the most.
+    models.sort_by(|a, b| {
+        let key = |v: &Value| v.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
+        key(b).cmp(&key(a))
+    });
+
+    let total_in = stats.total_input_tokens;
+    let cached = stats.total_cache_read_tokens + stats.total_cache_creation_tokens;
+    Json(json!({
+        "totals": {
+            "input_tokens": total_in,
+            "cache_read_tokens": stats.total_cache_read_tokens,
+            "cache_creation_tokens": stats.total_cache_creation_tokens,
+            "fresh_tokens": total_in.saturating_sub(cached),
+            "hit_rate": if total_in > 0 {
+                stats.total_cache_read_tokens as f64 / total_in as f64
+            } else { 0.0 },
+            "request_count": stats.request_count,
+        },
+        "dispositions": {
+            "served_from_cache": hit,
+            "wrote_to_cache": write_only,
+            "no_cache": uncached,
+        },
+        "sampled_requests": sampled,
+        "by_model": models,
+    }))
+    .into_response()
 }
 
 /// Largest page size a dashboard API will honour. Keeps a hostile `per_page`
@@ -3342,7 +4116,7 @@ async fn api_requests(
     let session = params.get("session").map(|s| s.as_str());
     let (items, total) = if failed_only || session.is_some() {
         state.store.filtered_page(per_page, offset, |r| {
-            if failed_only && r.status_code < 400 && r.failure_kind.is_none() {
+            if failed_only && !r.failed() {
                 return false;
             }
             match session {
@@ -3599,6 +4373,19 @@ mod tests {
         assert!(!is_protected_path("/metrics"));
         assert!(!is_protected_path("/api/stats"));
         assert!(!is_protected_path("/requests"));
+    }
+
+    /// Read-only dashboard APIs stay open so local monitoring works without a
+    /// key, but anything that mutates the running process must not. Turning on
+    /// body capture writes whatever the client sent — credentials included —
+    /// into the request log, so it is guarded like an LLM endpoint.
+    #[test]
+    fn protected_paths_cover_config_mutations() {
+        assert!(is_protected_path("/api/config/debug"));
+        assert!(is_protected_path("/api/config/reload"));
+        assert!(!is_protected_path("/api/cache"));
+        assert!(!is_protected_path("/api/requests"));
+        assert!(!is_protected_path("/api/audit/summary"));
     }
 
     #[test]
@@ -3964,6 +4751,7 @@ mod tests {
             cache_read_input_tokens: 1000,
             cache_creation_input_tokens: 1000,
             output_tokens: 1000,
+            reasoning_tokens: 0,
         };
         let (base_in, base_out) = model_rates("claude-opus-4.8");
         let expected = base_in                      // uncached remainder
@@ -3984,6 +4772,7 @@ mod tests {
             cache_read_input_tokens: 101_940,
             cache_creation_input_tokens: 1_731,
             output_tokens: 561,
+            reasoning_tokens: 0,
         };
         let cache_aware = calculate_cost("claude-opus-5", &usage);
         let (base_in, base_out) = model_rates("claude-opus-5");

@@ -4,7 +4,269 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **Live quota with no extra API call.** Copilot attaches per-SKU quota to every
+  response (`x-quota-snapshot-chat`, `-completions`, `-premium_interactions`),
+  carrying entitlement, overage, overage-permitted, percent remaining and reset
+  date. Those are now parsed on every proxied response and surfaced on:
+  - `GET /health` under `quota`
+  - `GET /metrics` as `ghc_proxy_quota_percent_remaining`,
+    `ghc_proxy_quota_entitlement` and `ghc_proxy_quota_overage`, labelled by `sku`
+  - `GET /usage` under `live`, alongside the existing authoritative response
+
+  Previously quota was only available from `/usage`, which costs a separate
+  `/copilot_internal/user` request. The headers are undocumented, so a value
+  that stops parsing is ignored rather than reported as zero, and the previous
+  reading is left in place.
+- **Observability for streams and failures.** Records now carry
+  `upstream_idle_max_ms` (longest silence between upstream chunks, which is what
+  assigns blame for a stall), `keepalive_probes`, `failure_kind`, `session_id`
+  parsed from `metadata.user_id`, and `output_tokens_final` so a count that is
+  still the `message_start` placeholder renders as `—` instead of being
+  presented as fact. The dashboard gained the matching columns, a failures-only
+  filter, and premium-request/cache-hit stats.
+- **The Responses API over WebSocket.** Eight models advertise `ws:/responses`
+  in the catalog — six of them alongside `/responses` and nothing else — and the
+  proxy had no way to reach it. `GET /v1/responses` with an upgrade now exposes
+  that transport, relayed to the matching upstream socket.
+
+  The surface is undocumented — GitHub publishes no reference for the inference
+  API at all, and the token response carries no websocket URL — so the protocol
+  was established by probing: it lives on the same host as the HTTP API, speaks
+  the same `response.*` events one per text frame, and takes a *flat* request
+  frame with `model` at the top level. Nesting the body under `response` is
+  rejected, as is omitting `type`. `scripts/ws_probe.py` and
+  `scripts/ws_explore.py` are the tools that established this, kept for when it
+  changes.
+
+  A model that does not advertise the transport is refused with an error frame
+  naming the alternative, rather than left waiting on the socket. Refusals and
+  malformed frames are recorded with a `failure_kind` like every other path, so
+  a failed attempt leaves something to diagnose from. WebSocket turns appear in
+  the dashboard under `ws:/responses`, and their transcript renders through the
+  same reassembly as SSE — only the transport differs.
+- `scripts/ws_check.py` sweeps every model the catalog says supports the
+  transport, discovering the list rather than hard-coding it, and asserts the
+  event vocabulary, monotonic sequence numbers, termination, text and usage.
+- `scripts/replay.py` replays a captured request at the upstream or back through
+  the proxy and times the SSE stream event by event, with no stall watchdog.
+- `scripts/protocol_check.py` asserts protocol conformance against a running
+  proxy. The property that matters for a translating gateway is not "did it
+  return 200" but "did it return the shape the *client* asked for", so every
+  check is an assertion about the client-facing response: a Gemini caller must
+  receive `candidates`, never the `choices` the upstream actually sent. Covers
+  all four surfaces in both streaming and non-streaming modes, tool calls and
+  tool-result round trips, stream terminators (`message_stop`, `[DONE]`,
+  `response.completed`), token counting, and the error paths — an unknown model
+  must not arrive as a `200` SSE stream that never produces an event.
+- **What Copilot actually billed, per request.** Every response carries
+  `copilot_usage.total_nano_aiu` — the AI units the turn cost — alongside a
+  `token_details` breakdown giving the per-token rate for each token type
+  charged. The total was verified against those rates on five responses. It is
+  now recorded on every request across all six paths (four protocols ×
+  streamed/not, plus WebSocket), totalled in `/api/stats` as `total_nano_aiu`,
+  and is the dashboard's headline figure, replacing an estimate derived from
+  published list prices that could not know a model is included at no charge.
+  Reasoning tokens are recorded beside it.
+- **Prompt-cache statistics** at `GET /api/cache` and on the dashboard: where
+  input tokens came from (served from cache / written to cache / fresh), the
+  disposition of recent requests, and a per-model hit rate with its own
+  distribution bar. A single global number cannot tell you *which* conversation
+  stopped matching its prefix, which is the failure that quietly multiplies the
+  bill. What the cache was worth is reported as `saved_nano_aiu`, net of the
+  write premium, because caching is not free — see below for where the rates
+  come from.
+- **Body capture can be toggled at runtime**, from the request browser or via
+  `POST /api/config/debug`. It previously required restarting the proxy with
+  `--debug`, by which point the request you wanted to inspect was gone; the flag
+  is read live, so it applies from the next call. It is not written back to
+  `config.yaml`, since capture puts prompts and any credentials they carry into
+  memory and the log and should lapse on restart. `GET /health` now reports it.
+  The `/api/config/` routes are guarded by the API key when one is configured —
+  read-only dashboard endpoints stay open, but turning on body capture must not
+  be something an unauthenticated caller can do.
+- `upstream_read_timeout_seconds` (default `900`, `0` disables, env
+  `GHC_PROXY_UPSTREAM_READ_TIMEOUT`). Bounds the silence *between* reads from an
+  upstream response rather than the total duration, so long streaming answers
+  are unaffected. Without it a half-open connection yields no data, no error and
+  no end-of-stream: the request hangs forever and the stream-interrupted
+  handling never runs. The default clears the longest silence measured against
+  the real upstream (329.5s, while a tool call's argument JSON was buffered) with
+  room to spare.
+
 ### Changed
+- **The cache panel is per model, and says why a cell is empty.** The panel
+  opened with one aggregate stacked bar, which cannot say *which* model stopped
+  matching — the question a collapsing hit rate raises. The bar is now a
+  Distribution column, one per model, and what remains at the top is the colour
+  key those bars need. Below the table, a footnote separates the two reasons a
+  row comes back empty: a prompt too short to be eligible at all, and one long
+  enough but never sent before, since nothing can be read back on first sight.
+
+  **`Written` only appears when something was written.** Only the Anthropic
+  surface with an explicit `cache_control` marker ever bills a cache write.
+  Every other surface caches implicitly: the first call reads nothing, the next
+  reads the whole prefix back, and no write is billed. Measured across twelve
+  calls with a 27k-token prefix, exactly one reported a write. The column and
+  its swatch are hidden outright on a workload that never writes, rather than
+  showing a wall of zeros for an event that cannot happen.
+
+  Measured while investigating: `claude-haiku-4.5` cached a 6902-token prefix
+  but not a 4082-token one, so a prompt in the low thousands legitimately
+  produces an empty row. Every surface — chat, messages, responses, Gemini and
+  WebSocket, streamed and not — was confirmed to carry
+  `copilot_usage.token_details`, so an empty row is never the proxy failing to
+  read what upstream reported.
+- **Cache savings come from the model's own rates, not a price list.** The
+  per-model saving was `list price × (1 − 0.1)` for reads and
+  `× (1.25 − 1)` for writes — one hard-coded discount applied to every model.
+  Copilot states its actual per-token rate for every token type it charges, in
+  `copilot_usage.token_details`, and the entries are not the same on every
+  model: `claude-haiku-4.5` prices cache writes above its input rate,
+  `gemini-3.5-flash` prices them at zero, `gpt-5.5` does not price them at all,
+  and `gpt-4o-mini` prices nothing because Copilot includes it. The old maths
+  claimed a saving on models that are free.
+
+  `/api/cache` now reports `saved_nano_aiu` in the same AI units the rest of
+  the dashboard bills in, computed per request from the rates that request
+  reported, and drops `saved_usd` / `write_premium_usd` / `net_saved_usd`.
+
+  A `null` `saved_nano_aiu` now means no response reported rates to compute one
+  from, distinct from `0`, which is a real figure: nothing was cached, so
+  nothing was saved.
+- **Failed attempts no longer count as consumption.** `request_count` counted
+  every record, so a burst of rejected calls inflated the request total, added
+  an empty-named row to the per-model cache table, and dragged every cache
+  disposition toward "uncached" — a rate computed over requests that consumed
+  nothing. Statistics now cover requests that produced an answer, `/api/stats`
+  reports `failed_requests` separately, and the overview links to them. Token
+  and billing totals still count either way: a stream cut off partway consumed
+  what it consumed, and hiding that would understate the bill.
+
+  The predicate — non-2xx, or a `failure_kind` on an otherwise successful
+  status — now has one definition shared by the statistics, the failures-only
+  filter and the dashboard, instead of three.
+- **Dashboard restructured around consumption.** The landing page opened with
+  eight identically-weighted stat cards followed by the full 78-row model
+  catalogue, so the number that tracks spend had no more prominence than
+  `bytes_received`, and reference data dominated a page you open to check usage.
+  It now leads with what Copilot billed in AI units, input tokens (with the
+  cache-hit share) and output tokens (with the reasoning share); quota bars per
+  SKU sit directly beneath, since that is the same quantity seen from the other
+  end. Traffic, proxy health and the prompt-cache panel follow, with the model
+  catalogue folded away and the request list on its own tab.
+  - The three pages share one stylesheet at `/app.css` instead of three drifting
+    inline copies, and carry the same persistent nav with a live readiness and
+    version indicator — previously each page offered only a lone
+    `← Dashboard` link.
+  - **Wide screens are used.** The old 1180px cap left a 2560px monitor half
+    empty while the twelve-column request table still scrolled sideways. Width
+    is now per-page: the request table gets 2000px and the metric list 1600px,
+    since both are data a wide screen genuinely helps you read, while the
+    overview keeps a 1280px measure because a handful of large numbers only
+    drift apart when stretched. Message text keeps a 100ch measure so prose
+    stays readable at full width; tool payloads are code and stay unconstrained.
+  - `/health` data (per-SKU quota, Copilot token expiry, uptime, readiness,
+    models loaded) was reachable but shown nowhere; it is now on the overview.
+    The request list stays on its own tab — the overview only reports how many
+    requests failed and links across.
+  - **Debug bodies render as a conversation.** `--debug` stores request and
+    response bodies verbatim, which is the right thing to store and the wrong
+    thing to read: finding what the model actually said meant scrolling past
+    tool schemas, content-filter blocks and, for streams, every SSE frame. The
+    detail view now reconstructs the exchange — system/user/assistant turns,
+    tool calls and results as collapsible cards, token and stop-reason chips —
+    and reassembles streamed fragments into the message they describe. All
+    three wire formats are handled, and none of them agree: Anthropic numbers
+    content blocks and tags every delta, chat completions hides tool arguments
+    inside `choices[].delta.tool_calls[]`, and the Responses API uses a flat
+    `response.*` vocabulary where the delta is a bare string. Reasoning is
+    picked up under every name the families use (`reasoning_text`,
+    `reasoning_content`, `response.reasoning_summary_text.delta`) rather than
+    dropped, and a turn that produced no visible output says whether it ran out
+    of token budget instead of reporting an empty stream. The raw bodies remain
+    one click away on a `Raw` tab.
+  - A third tab shows what the wire actually carried, which is the question when
+    a stream stalls, repeats, or ends somewhere unexpected. For a stream it
+    lists **every SSE frame** — sequence number, event name and a one-line gist,
+    each expandable to the full payload — so the `[DONE]` sentinel, a missing
+    `message_stop` or a duplicated index is visible instead of buried in a
+    scroll of raw text. For a non-streaming completion it lists **every
+    top-level field**, including the ones the conversation view has no place for
+    (`content_filter_results`, `prompt_filter_results`, `system_fingerprint`,
+    `service_tier`, `copilot_usage`).
+  - The request table's full nanosecond ISO timestamp consumed a third of the
+    row width; it renders as local wall-clock time with the exact value in the
+    tooltip, and the table scrolls horizontally rather than letting the panel
+    clip columns off the right edge, with the expanded detail pinned to the left
+    so it stays readable while the table scrolls. Empty results say so instead
+    of showing a header row with nothing under it.
+  - **Each request now says what happened, not just what was said.** The
+    response section opened with a row of bare chips: the numbers were there,
+    but not their meaning. It now leads with the outcome, normalized across
+    surfaces and explained — `length`, `max_tokens`, `max_output_tokens` and
+    `MAX_TOKENS` are the same event on four different APIs, and all four mean
+    the answer on screen is not the whole answer. Endings are colour-coded by
+    whether they are normal (`end_turn`, `stop`, `completed`), truncated, or a
+    refusal or filter block.
+
+    Beneath it sit the facts each surface actually reports, omitted when
+    absent: reasoning effort, service tier, prompt-cache retention, response
+    verbosity and output item types on the Responses API; the backend build
+    fingerprint on chat completions, which is worth noticing because a change
+    there can shift results for identical input; cache-write TTL split and
+    inference region on Anthropic; rejected speculative tokens, which are
+    billed. Content-filter verdicts appear only when something was actually
+    flagged — an all-clear on four categories on every request is noise.
+  - The `Probes` column is gone. Keepalive only runs on the Anthropic streaming
+    path, so four of the five request paths rendered a dash that read as "zero
+    probes sent" when it meant "not measured here". The count now rides in the
+    `Idle` tooltip, which is where it was useful anyway — the pair is what
+    assigns blame for a stall.
+  - **Protocol-specific parameters moved out of the list and into the detail.**
+    The three surfaces agree on very little, so a table column for any of them
+    is structurally empty for the other two: `New` (cache writes) only exists on
+    Anthropic, and `Session` only when the client encodes one into
+    `metadata.user_id` the way Claude Code does. Both columns are gone; the
+    detail now carries a panel naming the surface and listing what that request
+    actually set — `top_k`, `stop_sequences`, `cache_control` marks and
+    `thinking` for Anthropic; `seed`, penalties, `response_format` and
+    `logprobs` for chat completions; `reasoning.effort`, `max_output_tokens`,
+    `store` and `truncation` for the Responses API; `generationConfig` and
+    `safetySettings` for Gemini. Absent parameters are omitted rather than shown
+    as blanks. A Gemini request is labelled `Gemini → OpenAI Chat Completions
+    (translated)`, because the proxy rewrites it before forwarding and the
+    recorded body is the rewritten one — `topK` and `safetySettings` have no
+    counterpart and are dropped, which the panel says instead of leaving the
+    reader to assume they took effect. Gemini's `contents`/`parts`,
+    `functionCall` and `functionResponse` shapes render like every other
+    surface's.
+- **`auto_upgrade` now defaults to `true`**, including for config files written
+  before the setting existed. The proxy checks GitHub releases on startup and
+  replaces its own binary when a newer version is published; the replacement
+  takes effect on the next start. Disable with `auto_upgrade: false`,
+  `--no-auto-upgrade`, or `GHC_PROXY_AUTO_UPGRADE=0` — worth doing when the
+  binary is managed by a package manager, or lives in a build output directory
+  that `cargo build`/`cargo clean` also writes to.
+- **Default model mappings point at Opus 5 and Sonnet 5.** The catalog now
+  carries `claude-opus-5` and `claude-sonnet-5`; both are generally available and
+  match `claude-opus-4.8` on every published capability — 1M context, 64k
+  output, billing multiplier 1, vision. `claude-opus-5` is the new built-in
+  target, and the table gained the `opus5` / `5[1m]` aliases along with the
+  `claude-opus-5*`, `claude-sonnet-5*` and `claude-sonnet-4.6` prefixes.
+
+  **Existing config files are only added to, never rewritten.** A mapping
+  already on disk keeps pointing where it was told to, even when it holds what
+  used to be the built-in default. A value equal to an old default is
+  indistinguishable from a version pinned on purpose, and pinning is common —
+  a config in the wild carried `claude-opus-4-7: claude-opus-4.7` beside
+  `haiku: claude-opus-4.7`, both of which a "lift stale defaults" pass would
+  silently retarget. Run `--setup`, or `--default`, to adopt the new defaults.
+- `config_version` bumped to `4`, so existing `config.yaml` files gain the new
+  aliases on the next start.
+- `config_version` bumped to `3`, so existing `config.yaml` files gain
+  `upstream_read_timeout_seconds` and the new `auto_upgrade` default on the next
+  start.
 - **Config schema upgrades apply automatically.** When a release introduces new
   `config.yaml` properties (signalled by a `config_version` bump), the missing
   keys are now filled with their defaults and written back to `config.yaml` on
@@ -12,6 +274,83 @@ All notable changes to this project will be documented in this file.
   Existing values are preserved, and up-to-date files are never rewritten. The
   Opus 4.8 alias backfill is now scoped to pre-v2 files so it cannot overwrite
   customized mappings in current ones
+
+### Fixed
+- **Recorded request and response sizes on `/v1/messages` measured the wrong
+  bytes, and cost a full serialisation each to get.** Both paths built a byte
+  count by serialising the whole JSON tree —
+  `serde_json::to_vec(&current).map(|v| v.len())` — inside their four-attempt
+  retry loops, and the response was serialised twice more: once for a debug log
+  that discards it unless logging is on, once to measure it.
+
+  The numbers were also not the ones every other endpoint records.
+  `request_size` measured the proxy's version of the request, after system
+  prompt injection, the tool-result suffix and the model rename, so the
+  dashboard's "Sent" total was adding two definitions together. `response_size`
+  measured a re-serialisation of the parsed tree, which differs from the wire
+  bytes in whitespace, key order and number formatting.
+
+  Both now follow the pattern the rest of the file already used: the client's
+  `body.len()` taken once, and the response read as text once, then measured,
+  logged and parsed from that single copy. A 103-byte request returning 865
+  bytes now records exactly 103 and 865.
+- **Output token totals were not comparable across surfaces.** The two
+  conventions for reasoning tokens disagree about whether they are already
+  counted: a Responses turn reports `input 11 + output 17 == total 28` with 10
+  of that output being reasoning, while the translated Gemini surface reports
+  `prompt 5 + completion 1 + reasoning 97 == total 103`. Taken at face value the
+  dashboard showed a reasoning share of 262%. `output_tokens` is now normalized
+  to the true total on both, the way `input_tokens` already was.
+- **Gemini requests lost parameters that had exact counterparts.** The
+  translation to chat completions carried `temperature`, `topP`,
+  `maxOutputTokens` and `stopSequences` and dropped the rest of
+  `generationConfig` in silence, so a client's `seed`, `candidateCount`,
+  `presencePenalty`, `frequencyPenalty` or `responseMimeType` had no effect and
+  nothing said why. They now map to `seed`, `n`, `presence_penalty`,
+  `frequency_penalty` and `response_format` (with `responseSchema` carried over
+  as a `json_schema` format). `topK` and `safetySettings` genuinely have no
+  counterpart in the chat completions schema and are still dropped — the
+  dashboard names them rather than describing the loss in general terms, and a
+  test asserts they are not invented.
+- **Non-2xx upstreams on `/v1/messages` reached the client as an empty `200`
+  stream.** `messages_direct` only intercepted `400`; a `401`, `403`, `429` or
+  `5xx` fell through and was wrapped in a `200 text/event-stream` whose body was
+  a JSON error object, so the client waited on a stream that never produced an
+  event and reported a stall instead of the auth or rate-limit failure that
+  actually happened. This was the one path Claude Code takes. All five streaming
+  paths now gate on a single `is_streamable_status()` predicate
+- **A client that disconnected mid-stream left no record.** axum drops the
+  response body on disconnect, which drops the generator, so the `store.add`
+  after the loop never ran. Recording now happens from `Drop`
+- Pre-flight failures (token refresh, rate gate, connect errors) returned early
+  without recording; they are captured with a `failure_kind`
+- **Keepalive probes could be silenced exactly during a stall.** The boundary
+  flag was set from the last chunk, so a TCP split mid-event left it stuck until
+  a new chunk arrived — and an upstream that went quiet right then produced no
+  probes at all. Partial events are now held back so the downstream always sits
+  on an event boundary, and the Anthropic path sends `event: ping` rather than
+  an SSE comment, since comments are discarded by the parser and never reset a
+  client's idle watchdog
+- **Token counts were read from one bucket.** Anthropic's `input_tokens`,
+  `cache_read_input_tokens` and `cache_creation_input_tokens` are disjoint, so a
+  fully-cached Claude Code turn reported single digits for a 348,483-token
+  prompt. The three protocols slice the total differently and now have separate
+  extractors; cost reprices the cached buckets instead of charging every input
+  token at the full rate
+- **Reassembling one large SSE event was quadratic.** The line buffer rescanned
+  the whole retained buffer on every chunk, so a single event that arrived in
+  many pieces was re-read from the start each time. A 4 MB event delivered in
+  4 KB chunks took **7.9 seconds** of pure CPU; the search now resumes where the
+  previous one stopped, bringing it to milliseconds. Correctness was never
+  affected — only the cost of getting there.
+- The line buffer could grow without bound if an upstream never emitted a
+  newline. A single line is now capped at 64 MB.
+- Stopped scraping the Arch User Repository for the latest VS Code version. The
+  AUR maintainers asked projects to stop; `dynamic_vscode_version` now uses
+  Microsoft's own `update.code.visualstudio.com` release API and ignores
+  non-`major.minor.patch` builds.
+- Removed `scripts/__pycache__` from version control and added the matching
+  `.gitignore` entries.
 
 ## [1.3.0] - 2026-07-27
 
