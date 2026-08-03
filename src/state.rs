@@ -815,6 +815,11 @@ pub fn summarize_usage(raw: &serde_json::Value) -> serde_json::Value {
             let entitlement = snap.get("entitlement").and_then(|v| v.as_f64());
             let remaining = snap.get("remaining").and_then(|v| v.as_f64());
             let percent_remaining = snap.get("percent_remaining").and_then(|v| v.as_f64());
+            // The upstream's own consumption figure. Reported rather than
+            // derived because `entitlement - remaining` does not reproduce it:
+            // measured on a live enterprise seat, that subtraction gave 43,774
+            // against a reported 44,553.
+            let credits_used = snap.get("credits_used").and_then(|v| v.as_f64());
             quotas.insert(
                 name.clone(),
                 json!({
@@ -822,6 +827,7 @@ pub fn summarize_usage(raw: &serde_json::Value) -> serde_json::Value {
                     "entitlement": entitlement,
                     "remaining": remaining,
                     "percent_remaining": percent_remaining,
+                    "credits_used": credits_used,
                 }),
             );
         }

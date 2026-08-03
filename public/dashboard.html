@@ -266,31 +266,80 @@
       renderQuota(h.quota || {});
     }
 
+    // Absolute per-SKU counts from /copilot_internal/user. The snapshot riding
+    // on every response carries only a percent rounded to a tenth, which on a
+    // 10,000,000-unit entitlement cannot resolve less than 10,000 units of
+    // spend — 44,553 consumed and 5,000 consumed both report 99.5%. So the
+    // numbers a reader can act on have to come from the usage endpoint, which
+    // is a real upstream call and therefore refreshed far more slowly than the
+    // rest of the page.
+    let quotaExact = null;
+    let lastQuota = {};
+    async function loadUsage() {
+      try {
+        const u = await (await fetch('/usage')).json();
+        quotaExact = u.quotas || null;
+        renderQuota(lastQuota);
+      } catch (e) {
+        // The header-derived percent still renders; it is just coarser.
+      }
+    }
+
     // Quota arrives on every upstream response, so it is empty only until the
     // first request has been proxied. Hide the panel rather than render zeros,
     // which would read as "exhausted".
     function renderQuota(quota) {
+      lastQuota = quota;
       const skus = Object.keys(quota);
       const panel = document.getElementById('quotaPanel');
       if (skus.length === 0) { panel.hidden = true; return; }
       panel.hidden = false;
 
+      const clamp = p => Math.max(0, Math.min(100, Number(p ?? 0)));
+      // A tenth of a percent is the header's own precision, and rounding it
+      // away is not cosmetic: toFixed(0) turns 99.5% into "100%", so a quota
+      // that has been spent against reads as untouched.
+      const showPct = p => (Number.isInteger(p) ? p.toFixed(0) : p.toFixed(1)) + '%';
+
       let reset = null;
       const rows = skus.map(name => {
         const q = quota[name];
-        const pct = Math.max(0, Math.min(100, Number(q.percent_remaining ?? 0)));
         if (q.reset_date && !reset) reset = q.reset_date;
+
+        const x = (quotaExact || {})[name];
+        const exact = !q.unlimited && x && x.entitlement > 0 && x.remaining != null;
+        const pct = exact ? clamp(x.remaining / x.entitlement * 100)
+                          : clamp(q.percent_remaining);
         const cls = pct <= 10 ? 'err' : pct <= 25 ? 'warn' : '';
+        // The upstream reports consumption itself; `entitlement - remaining`
+        // is only a stand-in for a plan that does not.
+        const used = exact
+          ? (x.credits_used != null ? x.credits_used : x.entitlement - x.remaining)
+          : null;
         const right = q.unlimited
           ? '<b>unlimited</b>'
-          : `<b>${pct.toFixed(0)}%</b> of ${q.entitlement}` +
+          // What is left and what has gone, in the units the entitlement is
+          // denominated in — on a token-billed plan those are the same AI
+          // units the Consumption panel above reports, so the two read together.
+          : (exact
+              ? `<b>${compact(x.remaining)}</b> of ${compact(x.entitlement)} left` +
+                ` · ${compact(used)} used`
+              : `<b>${showPct(pct)}</b> of ${compact(q.entitlement)}`) +
             (q.overage > 0 ? ` · ${q.overage} over` : '');
-        return `<div class="quota-row">
+        const title = q.unlimited ? 'No cap on this SKU.'
+                                  : `${showPct(pct)} remaining` +
+                                    (q.overage_permitted ? '; overage permitted.' : '; no overage allowed.');
+        // No bar for an uncapped SKU: a full one says "100% left", which is a
+        // different claim from "there is nothing to run out of", and it makes
+        // the one row that can actually run out harder to pick out.
+        const bar = q.unlimited ? ''
+          : `<div class="bar"><span class="${cls}" style="width:${pct}%"></span></div>`;
+        return `<div class="quota-row" title="${esc(title)}">
                   <div class="quota-top">
                     <span class="quota-name">${esc(name)}</span>
                     <span class="quota-val">${right}</span>
                   </div>
-                  <div class="bar"><span class="${cls}" style="width:${pct}%"></span></div>
+                  ${bar}
                 </div>`;
       }).join('');
 
@@ -436,7 +485,11 @@
     }
     refresh();
     loadModels();
+    // Unlike everything else on this page, this one costs an upstream API call,
+    // and the figure it returns moves in minutes, not seconds.
+    loadUsage();
     setInterval(refresh, 5000);
+    setInterval(loadUsage, 60000);
   </script>
 </body>
 </html>
