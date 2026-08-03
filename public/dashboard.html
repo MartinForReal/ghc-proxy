@@ -274,11 +274,13 @@
     // is a real upstream call and therefore refreshed far more slowly than the
     // rest of the page.
     let quotaExact = null;
+    let quotaAccount = null;
     let lastQuota = {};
     async function loadUsage() {
       try {
         const u = await (await fetch('/usage')).json();
         quotaExact = u.quotas || null;
+        quotaAccount = u;
         renderQuota(lastQuota);
       } catch (e) {
         // The header-derived percent still renders; it is just coarser.
@@ -344,9 +346,26 @@
       }).join('');
 
       document.getElementById('quotaBody').innerHTML = rows;
-      const resetEl = document.getElementById('quotaReset');
+
+      // Whose seat is being spent, and on what terms. A quota figure with no
+      // account beside it is unreadable the moment more than one token is in
+      // play, and `token-billed` is what says the entitlement above counts AI
+      // units rather than interactions.
+      const a = quotaAccount || {};
       const d = reset ? new Date(reset) : null;
-      resetEl.textContent = d && !isNaN(d) ? 'resets ' + d.toLocaleDateString() : '';
+      const parts = [];
+      if (a.login) parts.push(a.login);
+      if (a.plan) parts.push(a.plan);
+      if (a.token_based_billing) parts.push('token-billed');
+      if (d && !isNaN(d)) parts.push('resets ' + d.toLocaleDateString());
+      const resetEl = document.getElementById('quotaReset');
+      resetEl.textContent = parts.join(' · ');
+      // These figures are polled, not live, so the panel has to be able to say
+      // how old they are.
+      const seen = a.as_of ? new Date(a.as_of) : null;
+      resetEl.title = seen && !isNaN(seen)
+        ? `Upstream reported these at ${seen.toLocaleTimeString()}; refreshed every 60s.`
+        : '';
     }
 
     function pct(x) { return (Number(x ?? 0) * 100).toFixed(0) + '%'; }

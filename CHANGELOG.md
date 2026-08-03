@@ -20,6 +20,15 @@ All notable changes to this project will be documented in this file.
   does not reproduce it: measured on a live enterprise seat that subtraction
   gave 43,774 against a reported 44,553.
 
+### Added
+- **The quota panel names the account it is reporting on**, reading
+  `MartinForReal · enterprise · token-billed · resets 2026/9/1`. A quota figure
+  with no account beside it is unreadable the moment more than one token is in
+  play, and `token-billed` is what says the entitlement counts AI units rather
+  than interactions. Hovering gives the time the upstream reported the figures,
+  since they are polled rather than live. `GET /usage` gained the `login`,
+  `token_based_billing` and `as_of` fields these come from.
+
 ## [1.4.0] - 2026-07-29
 
 ### Added

@@ -798,10 +798,10 @@ fn insert(headers: &mut HeaderMap, name: &'static str, value: &str) {
 }
 
 /// Reshapes the raw `/copilot_internal/user` response into a compact usage
-/// summary: the plan, the quota reset date, and a per-category breakdown
-/// (entitlement / remaining / percent remaining / unlimited) for each entry in
-/// `quota_snapshots`. The original payload is preserved under `raw` so callers
-/// never lose information the upstream may add.
+/// summary: the account and plan it belongs to, the quota reset date, and a
+/// per-category breakdown (entitlement / remaining / percent remaining /
+/// unlimited) for each entry in `quota_snapshots`. The original payload is
+/// preserved under `raw` so callers never lose information the upstream may add.
 pub fn summarize_usage(raw: &serde_json::Value) -> serde_json::Value {
     use serde_json::json;
 
@@ -841,9 +841,30 @@ pub fn summarize_usage(raw: &serde_json::Value) -> serde_json::Value {
         .get("quota_reset_date")
         .and_then(|d| d.as_str())
         .map(|s| s.to_string());
+    // Which account the quota is being spent from. Without it a figure on a
+    // dashboard says nothing the moment more than one token is in play.
+    let login = raw
+        .get("login")
+        .and_then(|l| l.as_str())
+        .map(|s| s.to_string());
+    // Decides what the entitlement is denominated in: AI units, not interactions.
+    let token_based_billing = raw.get("token_based_billing").and_then(|t| t.as_bool());
+    // Every SKU carries the same snapshot time; lifting it lets a caller say how
+    // stale these figures are, which a cached or slowly-polled copy cannot.
+    let as_of = raw
+        .get("quota_snapshots")
+        .and_then(|s| s.as_object())
+        .and_then(|m| {
+            m.values()
+                .find_map(|snap| snap.get("timestamp_utc").and_then(|t| t.as_str()))
+        })
+        .map(|s| s.to_string());
 
     json!({
         "plan": plan,
+        "login": login,
+        "token_based_billing": token_based_billing,
+        "as_of": as_of,
         "quota_reset_date": reset_date,
         "quotas": quotas,
         "raw": raw,
