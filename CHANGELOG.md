@@ -4,6 +4,31 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **Quota panel reported a spent allowance as untouched.** The per-response
+  quota header carries a percentage rounded to a tenth, and the dashboard
+  rendered it with `toFixed(0)` — so 99.5% displayed as "100%", beside a raw
+  `10000000` entitlement. On a token-billed plan that tenth of a percent is
+  10,000 AI units, so the panel could not show consumption at all.
+
+  The panel now reads the absolute counts from `/usage` (refreshed every 60s,
+  since unlike the rest of the page it costs an upstream call) and falls back to
+  the header percentage — now at one decimal — when that call fails. Uncapped
+  SKUs no longer draw a full bar, which claimed "100% left" for something that
+  cannot run out.
+- `GET /usage` now surfaces each SKU's `credits_used`. `entitlement - remaining`
+  does not reproduce it: measured on a live enterprise seat that subtraction
+  gave 43,774 against a reported 44,553.
+
+### Added
+- **The quota panel names the account it is reporting on**, reading
+  `MartinForReal · enterprise · token-billed · resets 2026/9/1`. A quota figure
+  with no account beside it is unreadable the moment more than one token is in
+  play, and `token-billed` is what says the entitlement counts AI units rather
+  than interactions. Hovering gives the time the upstream reported the figures,
+  since they are polled rather than live. `GET /usage` gained the `login`,
+  `token_based_billing` and `as_of` fields these come from.
+
 ## [1.4.0] - 2026-07-29
 
 ### Added
