@@ -182,7 +182,7 @@ curl http://127.0.0.1:8314/health
 {
   "status": "ok",
   "ready": true,
-  "version": "1.4.0",
+  "version": "1.4.1",
   "uptime_seconds": 128,
   "copilot_token": { "present": true, "expires_in_seconds": 1487 },
   "models_loaded": 77,

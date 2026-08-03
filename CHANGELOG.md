@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.4.1] - 2026-08-03
+
 ### Fixed
 - **Quota panel reported a spent allowance as untouched.** The per-response
   quota header carries a percentage rounded to a tenth, and the dashboard
