@@ -2506,7 +2506,7 @@ async fn stream_gemini(
         loop {
             let chunk = match byte_stream.next().await {
                 Some(Ok(chunk)) => chunk,
-                Some(Err(e)) => { interrupted = Some(e.to_string()); break; }
+                Some(Err(e)) => { interrupted = Some(util::error_chain(&e)); break; }
                 None => break,
             };
             idle.mark_now();
@@ -2851,7 +2851,7 @@ async fn stream_openai(
                 // emitted so far is a partial answer; record why and tell the
                 // client below instead of ending the stream as if it were
                 // complete.
-                Some(Err(e)) => { interrupted = Some(e.to_string()); break; }
+                Some(Err(e)) => { interrupted = Some(util::error_chain(&e)); break; }
                 None => break,
             };
             idle.mark_now();
@@ -3017,7 +3017,7 @@ async fn stream_responses(
         loop {
             let chunk = match byte_stream.next().await {
                 Some(Ok(chunk)) => chunk,
-                Some(Err(e)) => { interrupted = Some(e.to_string()); break; }
+                Some(Err(e)) => { interrupted = Some(util::error_chain(&e)); break; }
                 None => break,
             };
             idle.mark_now();
@@ -3182,7 +3182,7 @@ async fn stream_anthropic_direct(
         loop {
             let chunk = match byte_stream.next().await {
                 Some(Ok(chunk)) => chunk,
-                Some(Err(e)) => { interrupted = Some(e.to_string()); break; }
+                Some(Err(e)) => { interrupted = Some(util::error_chain(&e)); break; }
                 None => break,
             };
             recorder.idle.mark_now();
@@ -3317,7 +3317,7 @@ async fn stream_anthropic_translated(
         loop {
             let chunk = match byte_stream.next().await {
                 Some(Ok(chunk)) => chunk,
-                Some(Err(e)) => { interrupted = Some(e.to_string()); break; }
+                Some(Err(e)) => { interrupted = Some(util::error_chain(&e)); break; }
                 None => break,
             };
             idle.mark_now();
