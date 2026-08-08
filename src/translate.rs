@@ -2,6 +2,21 @@
 
 use crate::config::ModelMappings;
 
+/// Suffix a client appends to a model id to ask for its 1M-token context
+/// variant. This is the wire form of Claude Desktop's `supports1m` model
+/// option: the picker offers `<id>` and `<id>[1m]` as separate entries.
+pub const CONTEXT_1M_SUFFIX: &str = "[1m]";
+
+/// Splits a trailing [`CONTEXT_1M_SUFFIX`] off a model id, reporting whether it
+/// was present. Upstream has no separate 1M model -- the variant is the same id
+/// plus the `context-1m-2025-08-07` beta.
+pub fn split_context_1m(model: &str) -> (&str, bool) {
+    match model.strip_suffix(CONTEXT_1M_SUFFIX) {
+        Some(base) => (base, true),
+        None => (model, false),
+    }
+}
+
 /// Translates an incoming model name using the configured mappings.
 ///
 /// Exact matches take priority over prefix matches. When several prefixes
@@ -9,8 +24,23 @@ use crate::config::ModelMappings;
 /// `claude-opus-4.8-` takes precedence over a shorter `claude-opus-4.8`.
 /// If nothing matches the original name is returned unchanged.
 pub fn translate(mappings: &ModelMappings, model: &str) -> String {
+    if let Some(target) = lookup(mappings, model) {
+        return target;
+    }
+    // The full id is tried first so a hand-written `[1m]` mapping still wins.
+    // Falling back to the base id lets any model carry the suffix instead of
+    // only the handful spelled out in the default table.
+    let (base, is_1m) = split_context_1m(model);
+    if is_1m {
+        return lookup(mappings, base).unwrap_or_else(|| base.to_string());
+    }
+    model.to_string()
+}
+
+/// Resolves one id against the mappings, exact table first.
+fn lookup(mappings: &ModelMappings, model: &str) -> Option<String> {
     if let Some(target) = mappings.exact.get(model) {
-        return target.clone();
+        return Some(target.clone());
     }
     let mut best: Option<(&String, &String)> = None;
     for (prefix, target) in &mappings.prefix {
@@ -20,10 +50,7 @@ pub fn translate(mappings: &ModelMappings, model: &str) -> String {
             best = Some((prefix, target));
         }
     }
-    if let Some((_, target)) = best {
-        return target.clone();
-    }
-    model.to_string()
+    best.map(|(_, target)| target.clone())
 }
 
 #[cfg(test)]
@@ -49,6 +76,35 @@ mod tests {
     fn unmapped_passthrough() {
         let m = default_model_mappings();
         assert_eq!(translate(&m, "gpt-4o"), "gpt-4o");
+    }
+
+    #[test]
+    fn context_1m_suffix_is_split_off() {
+        assert_eq!(
+            split_context_1m("claude-opus-5[1m]"),
+            ("claude-opus-5", true)
+        );
+        assert_eq!(split_context_1m("claude-opus-5"), ("claude-opus-5", false));
+        // Only a trailing suffix counts.
+        assert_eq!(split_context_1m("[1m]-model"), ("[1m]-model", false));
+    }
+
+    /// The suffix used to be a handful of hand-written alias entries, so any id
+    /// missing from that table answered 404 instead of resolving.
+    #[test]
+    fn any_model_accepts_the_1m_suffix() {
+        let m = default_model_mappings();
+        assert_eq!(translate(&m, "claude-haiku-4.5[1m]"), DEFAULT_HAIKU);
+        assert_eq!(translate(&m, "sonnet[1m]"), DEFAULT_OPUS);
+        assert_eq!(translate(&m, "gpt-4o[1m]"), "gpt-4o");
+    }
+
+    #[test]
+    fn explicit_1m_mapping_beats_the_base_id() {
+        let mut m = default_model_mappings();
+        m.exact
+            .insert("claude-opus-5[1m]".to_string(), "pinned-1m".to_string());
+        assert_eq!(translate(&m, "claude-opus-5[1m]"), "pinned-1m");
     }
 
     #[test]

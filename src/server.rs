@@ -798,6 +798,15 @@ async fn get_models(State(state): State<SharedState>) -> Response {
             arr.iter()
                 .map(|m| {
                     let id = m.get("id").cloned().unwrap_or(Value::Null);
+                    // Limits travel with the list so an operator can see which
+                    // ids are worth marking `supports1m` without fetching each
+                    // model separately.
+                    let limits = m.get("capabilities").and_then(|c| c.get("limits"));
+                    let context_window = limits
+                        .and_then(|l| l.get("max_context_window_tokens"))
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    let supports_1m = context_window.as_u64().is_some_and(|t| t > 200_000);
                     json!({
                         "id": id,
                         "object": "model",
@@ -806,6 +815,12 @@ async fn get_models(State(state): State<SharedState>) -> Response {
                         "created_at": "1970-01-01T00:00:00.000Z",
                         "owned_by": m.get("vendor").cloned().unwrap_or(Value::String("unknown".into())),
                         "display_name": m.get("name").cloned().or_else(|| m.get("id").cloned()).unwrap_or(Value::Null),
+                        "context_window": context_window,
+                        "max_output_tokens": limits
+                            .and_then(|l| l.get("max_output_tokens"))
+                            .cloned()
+                            .unwrap_or(Value::Null),
+                        "supports_1m_context": supports_1m,
                     })
                 })
                 .collect()
@@ -1759,11 +1774,15 @@ async fn apply_anthropic_beta(
     model: &str,
     req: &Value,
     client_beta: Option<&str>,
+    wants_1m: bool,
 ) {
     let mut derived: Vec<&str> = Vec::new();
     // Mirror the official Anthropic API pattern for unlocking the 1M-token
-    // context window; only for models whose catalog advertises it.
-    if state.model_supports_1m(model).await {
+    // context window. It is opt-in: the client asks by naming the model's
+    // `[1m]` variant, or by sending the beta itself. Deriving it from the
+    // catalog alone would put every request on the extended-context tier and
+    // leave the standard variant with nothing to distinguish it.
+    if wants_1m && state.model_supports_1m(model).await {
         derived.push(anthropic::CONTEXT_1M_BETA);
     }
     // `context_management` is rejected with a misleading "Extra inputs are not
@@ -1798,12 +1817,14 @@ async fn messages_direct(
         .unwrap_or(false);
     let mut headers = state.copilot_headers(vision).await;
     headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+    let (_, wants_1m) = translate::split_context_1m(&original_model);
     apply_anthropic_beta(
         &state,
         &mut headers,
         &translated,
         &req,
         client_beta.as_deref(),
+        wants_1m,
     )
     .await;
     set_initiator(&mut headers, agent);
@@ -2222,6 +2243,7 @@ async fn count_tokens(
             &translated,
             &req,
             client_beta_header(&client_headers).as_deref(),
+            translate::split_context_1m(&original_model).1,
         )
         .await;
         let url = format!("{}/v1/messages/count_tokens", state.copilot_base_url());
