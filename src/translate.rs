@@ -56,7 +56,10 @@ fn lookup(mappings: &ModelMappings, model: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{default_model_mappings, DEFAULT_HAIKU, DEFAULT_OPUS};
+    use crate::config::{
+        default_model_mappings, DEFAULT_GEMINI_FLASH, DEFAULT_GEMINI_PRO, DEFAULT_HAIKU,
+        DEFAULT_OPUS,
+    };
 
     #[test]
     fn exact_mapping_wins() {
@@ -76,6 +79,39 @@ mod tests {
     fn unmapped_passthrough() {
         let m = default_model_mappings();
         assert_eq!(translate(&m, "gpt-4o"), "gpt-4o");
+    }
+
+    /// The Gemini CLI ships its own model table, so it asks for ids Copilot has
+    /// never served. Without these mappings every request from it is rejected.
+    #[test]
+    fn gemini_ids_resolve_to_a_served_model() {
+        let m = default_model_mappings();
+        assert_eq!(translate(&m, "gemini-2.5-pro"), DEFAULT_GEMINI_PRO);
+        assert_eq!(translate(&m, "gemini-3-pro-preview"), DEFAULT_GEMINI_PRO);
+        assert_eq!(translate(&m, "gemini-9-pro-unheard-of"), DEFAULT_GEMINI_PRO);
+    }
+
+    /// The catch-all `gemini-` prefix must not swallow the flash tier: longest
+    /// match wins, so a flash request stays on a flash model.
+    #[test]
+    fn gemini_flash_stays_on_the_flash_tier() {
+        let m = default_model_mappings();
+        for id in [
+            "gemini-2.5-flash",
+            "gemini-3-flash-preview",
+            "gemini-3.5-flash",
+            "gemini-3.1-flash-lite",
+        ] {
+            assert_eq!(translate(&m, id), DEFAULT_GEMINI_FLASH, "{id}");
+        }
+    }
+
+    /// `gemma-*` is a different family Copilot does not serve; the Gemini
+    /// catch-all must not claim it and hide that with a wrong answer.
+    #[test]
+    fn gemma_is_left_alone() {
+        let m = default_model_mappings();
+        assert_eq!(translate(&m, "gemma-4-31b-it"), "gemma-4-31b-it");
     }
 
     #[test]

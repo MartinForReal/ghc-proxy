@@ -289,6 +289,30 @@ pub fn is_retryable_error(status: u16) -> bool {
     }
 }
 
+/// Performs a single POST with no retries and no backoff, recording the quota
+/// headers the response carries.
+///
+/// For callers that already have a local fallback, retrying a refusal is pure
+/// latency: the backoff runs to completion only to produce the same answer the
+/// fallback would have given immediately.
+pub async fn post_once(
+    state: &AppState,
+    url: &str,
+    headers: reqwest::header::HeaderMap,
+    body: Vec<u8>,
+) -> Option<reqwest::Response> {
+    let resp = state
+        .http
+        .post(url)
+        .headers(headers)
+        .body(body)
+        .send()
+        .await
+        .ok()?;
+    state.record_quota_headers(resp.headers());
+    Some(resp)
+}
+
 pub async fn post_with_retry(
     state: &AppState,
     url: &str,

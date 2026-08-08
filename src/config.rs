@@ -21,9 +21,9 @@ pub const COPILOT_VERSION: &str = "0.48.1";
 /// Config schema version used to detect when defaults/options changed and a
 /// persisted config should be rewritten with migrated values.
 ///
-/// Bumped to 4 for the Opus 5 / Sonnet 5 model mappings, so existing files gain
-/// the new aliases and have superseded targets lifted on the next start.
-pub const CONFIG_VERSION: u32 = 4;
+/// Bumped to 5 for the Gemini model mappings, so existing files gain the
+/// `gemini-*` aliases the Gemini CLI sends.
+pub const CONFIG_VERSION: u32 = 5;
 
 /// Default model name that Claude "opus"/"sonnet" requests are mapped to.
 ///
@@ -33,6 +33,14 @@ pub const CONFIG_VERSION: u32 = 4;
 pub const DEFAULT_OPUS: &str = "claude-opus-5";
 /// Default model name that Claude "haiku" requests are mapped to.
 pub const DEFAULT_HAIKU: &str = "claude-haiku-4.5";
+/// Default model name that Gemini requests are mapped to.
+///
+/// The Gemini CLI ships its own model table and sends ids Copilot has never
+/// served (`gemini-2.5-pro` by default), so without a mapping every request
+/// from it is rejected outright.
+pub const DEFAULT_GEMINI_PRO: &str = "gemini-3.1-pro-preview";
+/// Default model name that Gemini "flash" requests are mapped to.
+pub const DEFAULT_GEMINI_FLASH: &str = "gemini-3.6-flash";
 
 /// GitHub OAuth client id used for the Device Flow (same id used by ghc-tunnel).
 pub const GITHUB_CLIENT_ID: &str = "01ab8ac9400c4e429b23";
@@ -359,6 +367,24 @@ pub fn default_model_mappings() -> ModelMappings {
     }
     for k in ["claude-haiku-4.5-", "claude-haiku-4-5-"] {
         prefix.insert(k.to_string(), haiku.clone());
+    }
+
+    // The Gemini CLI resolves its own aliases client-side and puts a concrete
+    // id on the wire, so the catch-all carries whatever generation it happens
+    // to ship with. Flash spellings are listed separately because the longest
+    // matching prefix wins, and answering a flash request with a pro model
+    // would silently bill the caller for the wrong tier.
+    prefix.insert("gemini-".to_string(), DEFAULT_GEMINI_PRO.to_string());
+    for k in [
+        "gemini-flash",
+        "gemini-2.0-flash",
+        "gemini-2.5-flash",
+        "gemini-3-flash",
+        "gemini-3.1-flash",
+        "gemini-3.5-flash",
+        "gemini-3.6-flash",
+    ] {
+        prefix.insert(k.to_string(), DEFAULT_GEMINI_FLASH.to_string());
     }
 
     ModelMappings { exact, prefix }
@@ -888,13 +914,37 @@ fn migrate_config(cfg: &mut Config) -> bool {
         }
     }
 
+    if cfg.config_version < 5 {
+        // The Gemini CLI sends ids Copilot never served, so files written
+        // before these mappings existed reject every Gemini request. Only
+        // missing keys are added; an id the user already pointed somewhere
+        // stays pointed there.
+        for k in [
+            "gemini-flash",
+            "gemini-2.0-flash",
+            "gemini-2.5-flash",
+            "gemini-3-flash",
+            "gemini-3.1-flash",
+            "gemini-3.5-flash",
+            "gemini-3.6-flash",
+        ] {
+            cfg.model_mappings
+                .prefix
+                .entry(k.to_string())
+                .or_insert_with(|| DEFAULT_GEMINI_FLASH.to_string());
+        }
+        cfg.model_mappings
+            .prefix
+            .entry("gemini-".to_string())
+            .or_insert_with(|| DEFAULT_GEMINI_PRO.to_string());
+    }
+
     // Any older schema version is lifted to the current one; the caller
     // persists the re-rendered document so newly introduced properties appear
     // on disk with their defaults.
     cfg.config_version = CONFIG_VERSION;
     true
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1163,6 +1213,38 @@ mod tests {
                 .get("claude-sonnet-5")
                 .map(String::as_str),
             Some(DEFAULT_OPUS)
+        );
+    }
+
+    #[test]
+    fn migration_seeds_gemini_mappings_without_touching_pins() {
+        let yaml = "config_version: 4\n";
+        let mut cfg: Config = serde_norway::from_str(yaml).expect("v4 config parses");
+        cfg.model_mappings
+            .prefix
+            .insert("gemini-2.5-flash".to_string(), "pinned-by-hand".to_string());
+
+        assert!(migrate_config(&mut cfg));
+        assert_eq!(cfg.config_version, CONFIG_VERSION);
+
+        assert_eq!(
+            cfg.model_mappings
+                .prefix
+                .get("gemini-2.5-flash")
+                .map(String::as_str),
+            Some("pinned-by-hand"),
+            "an id the user pointed somewhere stays pointed there"
+        );
+        assert_eq!(
+            cfg.model_mappings.prefix.get("gemini-").map(String::as_str),
+            Some(DEFAULT_GEMINI_PRO)
+        );
+        assert_eq!(
+            cfg.model_mappings
+                .prefix
+                .get("gemini-3.5-flash")
+                .map(String::as_str),
+            Some(DEFAULT_GEMINI_FLASH)
         );
     }
 }
