@@ -322,6 +322,11 @@ pub fn default_model_mappings() -> ModelMappings {
     // list is exhaustive rather than pattern-based because a request naming a
     // model that has since been superseded should still be served, and because
     // Anthropic writes the same version two ways (`4.8` and `4-8`).
+    //
+    // Full ids need no `[1m]` spelling of their own: the suffix is stripped
+    // generically, and a prefix entry matches the suffixed id anyway. Only the
+    // bare aliases above (`4-8[1m]`) still need listing, because stripping them
+    // leaves `4-8`, which nothing else maps.
     let mut prefix = BTreeMap::new();
     for k in [
         "claude-sonnet-4-",
@@ -342,10 +347,6 @@ pub fn default_model_mappings() -> ModelMappings {
         "claude-opus-4-6",
         "claude-opus-4-7",
         "claude-opus-4-8",
-        "claude-opus-4-6[1m]",
-        "claude-opus-4-7[1m]",
-        "claude-opus-4-8[1m]",
-        "claude-opus-5[1m]",
         "claude-sonnet-4-7",
         "claude-sonnet-4-8",
         "claude-sonnet-4-6",
