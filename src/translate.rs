@@ -99,6 +99,27 @@ mod tests {
         assert_eq!(translate(&m, "gpt-4o[1m]"), "gpt-4o");
     }
 
+    /// The default table used to spell out a `[1m]` entry per full id. They
+    /// were dropped, so pin the two routes that make them unnecessary.
+    #[test]
+    fn full_ids_resolve_with_the_1m_suffix_without_their_own_entry() {
+        let m = default_model_mappings();
+        for id in [
+            "claude-opus-4-6[1m]",
+            "claude-opus-4-7[1m]",
+            "claude-opus-4-8[1m]",
+            "claude-opus-5[1m]",
+            "claude-opus-4.8[1m]",
+        ] {
+            assert_eq!(translate(&m, id), DEFAULT_OPUS, "{id}");
+        }
+        // The bare aliases still need their own entries: stripping `4-8[1m]`
+        // leaves `4-8`, which nothing maps.
+        for alias in ["4-7[1m]", "4-8[1m]", "5[1m]"] {
+            assert_eq!(translate(&m, alias), DEFAULT_OPUS, "{alias}");
+        }
+    }
+
     #[test]
     fn explicit_1m_mapping_beats_the_base_id() {
         let mut m = default_model_mappings();
