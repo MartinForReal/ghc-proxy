@@ -5,6 +5,24 @@ use crate::state::AppState;
 use serde_json::Value;
 use std::time::Duration;
 
+/// Renders an error together with its source chain.
+///
+/// A dropped upstream stream reaches us as `reqwest::Error`, whose `Display` is
+/// the fixed string "error decoding response body". The cause that actually
+/// explains the drop -- a reset connection, an h2 GOAWAY, a truncated body --
+/// only lives in the sources, so recording just the top-level message makes
+/// every distinct failure look identical.
+pub fn error_chain(err: &dyn std::error::Error) -> String {
+    use std::fmt::Write;
+    let mut out = err.to_string();
+    let mut source = err.source();
+    while let Some(e) = source {
+        let _ = write!(out, ": {e}");
+        source = e.source();
+    }
+    out
+}
+
 /// Incremental, chunk-boundary-safe splitter for SSE byte streams.
 ///
 /// Upstream responses arrive as arbitrary byte chunks that do **not** respect
@@ -578,6 +596,44 @@ impl IdleTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The whole point of the helper: the outermost message is often the least
+    /// informative part of the chain.
+    #[test]
+    fn error_chain_appends_every_source() {
+        #[derive(Debug)]
+        struct Err2;
+        impl std::fmt::Display for Err2 {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "connection reset by peer")
+            }
+        }
+        impl std::error::Error for Err2 {}
+
+        #[derive(Debug)]
+        struct Err1(Err2);
+        impl std::fmt::Display for Err1 {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "error decoding response body")
+            }
+        }
+        impl std::error::Error for Err1 {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+
+        assert_eq!(
+            error_chain(&Err1(Err2)),
+            "error decoding response body: connection reset by peer"
+        );
+    }
+
+    #[test]
+    fn error_chain_handles_a_lone_error() {
+        let err = std::io::Error::other("boom");
+        assert_eq!(error_chain(&err), "boom");
+    }
 
     #[test]
     fn detects_thinking_enabled_unsupported_error() {

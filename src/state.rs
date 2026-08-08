@@ -146,6 +146,10 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// How often the upstream connection is probed while a stream is silent. Well
+/// under the ~60s idle cutoff typical of load balancers and NAT tables.
+const UPSTREAM_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
+
 /// Current unix time in milliseconds (13 digits), used for the session id.
 fn now_millis() -> u128 {
     SystemTime::now()
@@ -162,9 +166,20 @@ impl AppState {
         // *between* reads are bounded. The read timeout is what turns a
         // half-open upstream into an error the streaming paths can report,
         // rather than a request that hangs forever.
+        //
+        // The keepalives matter because Copilot withholds `input_json_delta`
+        // until a tool call's argument JSON is complete, so a healthy stream
+        // can go minutes without a byte. Nothing else travels the socket in
+        // that window, and an idle connection is what load balancers, NATs and
+        // corporate middleboxes reap -- which surfaces as a truncated body
+        // partway through the answer.
         let mut builder = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(30))
-            .pool_idle_timeout(Duration::from_secs(90));
+            .pool_idle_timeout(Duration::from_secs(90))
+            .tcp_keepalive(UPSTREAM_KEEPALIVE_INTERVAL)
+            .http2_keep_alive_interval(UPSTREAM_KEEPALIVE_INTERVAL)
+            .http2_keep_alive_timeout(Duration::from_secs(20))
+            .http2_keep_alive_while_idle(true);
         if config.upstream_read_timeout_seconds > 0 {
             builder =
                 builder.read_timeout(Duration::from_secs(config.upstream_read_timeout_seconds));
