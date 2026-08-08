@@ -1897,7 +1897,7 @@ async fn messages_direct(
                     start,
                     extract_session_id(&sanitized),
                 );
-                return passthrough_error(status, text);
+                return anthropic_passthrough_error(status, text);
             }
             return stream_anthropic_direct(
                 state.clone(),
@@ -2039,7 +2039,7 @@ async fn messages_direct(
             start,
             extract_session_id(&sanitized),
         );
-        return passthrough_error(status, text);
+        return anthropic_passthrough_error(status, text);
     }
     anthropic_error(StatusCode::BAD_GATEWAY, "Exhausted retries".into())
 }
@@ -2192,7 +2192,7 @@ async fn messages_translated(
             start,
             extract_session_id(&openai_req),
         );
-        return passthrough_error(status, text);
+        return anthropic_passthrough_error(status, text);
     }
     anthropic_error(StatusCode::BAD_GATEWAY, "Exhausted retries".into())
 }
@@ -2783,10 +2783,68 @@ fn passthrough_error(status: StatusCode, text: String) -> Response {
     resp
 }
 
+/// The Anthropic error `type` for a status class.
+fn anthropic_error_type(status: u16) -> &'static str {
+    match status {
+        400 => "invalid_request_error",
+        401 => "authentication_error",
+        403 => "permission_error",
+        404 => "not_found_error",
+        413 => "request_too_large",
+        429 => "rate_limit_error",
+        529 => "overloaded_error",
+        _ => "api_error",
+    }
+}
+
+/// Forwards a non-2xx upstream response on the Anthropic surface, rewritten
+/// into the Anthropic error envelope.
+///
+/// Copilot rejects a request in OpenAI's shape -- `{"error": {"message": ...}}`
+/// -- which carries neither the top-level `"type": "error"` nor the
+/// `error.type` that Anthropic clients match on. Forwarding that verbatim makes
+/// a perfectly well-formed upstream rejection look like a malformed response to
+/// the SDK, and the reason for the failure stops being legible.
+fn anthropic_passthrough_error(status: StatusCode, text: String) -> Response {
+    let parsed: Option<Value> = serde_json::from_str(&text).ok();
+    // An upstream that already speaks Anthropic is forwarded untouched, so a
+    // richer error keeps whatever fields it came with.
+    if parsed.as_ref().is_some_and(|v| {
+        v.get("type").and_then(Value::as_str) == Some("error")
+            && v.get("error").and_then(|e| e.get("type")).is_some()
+    }) {
+        return passthrough_error(status, text);
+    }
+    let message = parsed
+        .as_ref()
+        .and_then(|v| {
+            v.get("error")
+                .and_then(|e| e.get("message"))
+                .or_else(|| v.get("message"))
+                .and_then(Value::as_str)
+        })
+        .map(str::to_string)
+        // A non-JSON body (an HTML error page from an intermediary, say) is
+        // still the most informative thing available.
+        .unwrap_or(text);
+    let message = if message.trim().is_empty() {
+        status
+            .canonical_reason()
+            .unwrap_or("upstream error")
+            .to_string()
+    } else {
+        message
+    };
+    anthropic_error(status, message)
+}
+
 fn anthropic_error(status: StatusCode, msg: String) -> Response {
     (
         status,
-        Json(json!({"type": "error", "error": {"type": "api_error", "message": msg}})),
+        Json(json!({
+            "type": "error",
+            "error": {"type": anthropic_error_type(status.as_u16()), "message": msg},
+        })),
     )
         .into_response()
 }
@@ -3172,7 +3230,7 @@ async fn stream_anthropic_direct(
             start,
             session_id.clone(),
         );
-        return passthrough_error(
+        return anthropic_passthrough_error(
             StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
             text,
         );
@@ -3314,7 +3372,7 @@ async fn stream_anthropic_translated(
             start,
             session_id.clone(),
         );
-        return passthrough_error(
+        return anthropic_passthrough_error(
             StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
             text,
         );
@@ -4892,5 +4950,78 @@ mod tests {
             client_beta_header(&h).as_deref(),
             Some("claude-code-20250219")
         );
+    }
+
+    /// Body of an `axum` response, for asserting on what a client would see.
+    fn body_json(resp: Response) -> Value {
+        let bytes = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async { axum::body::to_bytes(resp.into_body(), usize::MAX).await })
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// Copilot rejects in OpenAI's shape; an Anthropic client needs the
+    /// envelope to recognise it as an error at all.
+    #[test]
+    fn openai_shaped_upstream_error_is_rewrapped() {
+        let upstream = r#"{"error":{"message":"The use of the web search tool is not supported.","code":"unsupported_value"}}"#;
+        let body = body_json(anthropic_passthrough_error(
+            StatusCode::BAD_REQUEST,
+            upstream.to_string(),
+        ));
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(
+            body["error"]["message"],
+            "The use of the web search tool is not supported."
+        );
+    }
+
+    #[test]
+    fn already_anthropic_shaped_error_is_left_alone() {
+        let upstream = r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"},"request_id":"req_1"}"#;
+        let body = body_json(anthropic_passthrough_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            upstream.to_string(),
+        ));
+        assert_eq!(body["error"]["type"], "overloaded_error");
+        assert_eq!(body["request_id"], "req_1");
+    }
+
+    #[test]
+    fn non_json_upstream_body_becomes_the_message() {
+        let body = body_json(anthropic_passthrough_error(
+            StatusCode::BAD_GATEWAY,
+            "<html>502 Bad Gateway</html>".to_string(),
+        ));
+        assert_eq!(body["error"]["type"], "api_error");
+        assert_eq!(body["error"]["message"], "<html>502 Bad Gateway</html>");
+    }
+
+    #[test]
+    fn empty_upstream_body_falls_back_to_the_status_reason() {
+        let body = body_json(anthropic_passthrough_error(
+            StatusCode::UNAUTHORIZED,
+            String::new(),
+        ));
+        assert_eq!(body["error"]["type"], "authentication_error");
+        assert_eq!(body["error"]["message"], "Unauthorized");
+    }
+
+    #[test]
+    fn status_maps_onto_the_anthropic_error_type() {
+        for (status, expected) in [
+            (400, "invalid_request_error"),
+            (401, "authentication_error"),
+            (403, "permission_error"),
+            (404, "not_found_error"),
+            (429, "rate_limit_error"),
+            (500, "api_error"),
+            (529, "overloaded_error"),
+        ] {
+            assert_eq!(anthropic_error_type(status), expected, "status {status}");
+        }
     }
 }
