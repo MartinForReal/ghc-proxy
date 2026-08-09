@@ -200,6 +200,7 @@ Every config field has a `GHC_PROXY_*` override:
 | `GHC_PROXY_MAX_CONNECTION_RETRIES` | Max connection retries |
 | `GHC_PROXY_UPSTREAM_READ_TIMEOUT` | Max seconds of upstream silence (`0` disables) |
 | `GHC_PROXY_REDIRECT_ANTHROPIC` | Always translate Anthropic via chat completions |
+| `GHC_PROXY_EXTEND_CACHE_TTL` | Promote `cache_control` breakpoints to the 1h tier (`true`/`1`) |
 | `GHC_PROXY_SHOW_TOKEN` | Log tokens on refresh (`true`/`1`) |
 | `GHC_PROXY_DYNAMIC_VSCODE_VERSION` | Fetch latest VS Code version (`true`/`1`) |
 | `GHC_PROXY_AUTO_UPGRADE` | Auto-upgrade app on startup (`true`/`1`); set `0` to disable |

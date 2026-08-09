@@ -164,6 +164,17 @@ pub struct Config {
     /// translate Anthropic requests through the OpenAI chat completions API.
     #[serde(default)]
     pub redirect_anthropic: bool,
+    /// When true, give `cache_control` breakpoints that carry no explicit `ttl`
+    /// the one-hour tier instead of the five-minute default.
+    ///
+    /// Worth it only when turns regularly run longer than five minutes: an
+    /// entry is written during prefill, so a turn that takes longer than the
+    /// TTL outlives its own cache and the next turn pays a full cold prefill.
+    /// The trade is that every write bills at the higher extended rate, which
+    /// on a workload of many small incremental writes costs more than the
+    /// occasional expiry it prevents.
+    #[serde(default)]
+    pub extend_cache_ttl: bool,
     /// When true, log the GitHub and Copilot tokens whenever they are resolved
     /// or refreshed. Useful for debugging; keep disabled in shared environments.
     #[serde(default)]
@@ -260,6 +271,7 @@ impl Default for Config {
             max_connection_retries: default_max_retries(),
             upstream_read_timeout_seconds: default_read_timeout(),
             redirect_anthropic: false,
+            extend_cache_ttl: false,
             show_token: false,
             dynamic_vscode_version: false,
             auto_upgrade: true,
@@ -539,6 +551,15 @@ pub fn render_config_yaml(cfg: &Config) -> String {
         );
         let _ = writeln!(s, "redirect_anthropic: {}", cfg.redirect_anthropic);
     }
+    if cfg.extend_cache_ttl {
+        s.push('\n');
+        s.push_str("# Promote cache_control breakpoints without an explicit ttl to the 1h tier.\n");
+        s.push_str(
+            "# Helps when turns run longer than 5m and expire their own cache; costs more\n",
+        );
+        s.push_str("# per write, so it loses on workloads of many small incremental writes.\n");
+        let _ = writeln!(s, "extend_cache_ttl: {}", cfg.extend_cache_ttl);
+    }
     if cfg.show_token
         || cfg.dynamic_vscode_version
         || cfg.rate_limit_seconds.is_some()
@@ -751,6 +772,13 @@ pub fn load_config_with_options(write_back_on_migration: bool) -> Config {
         tracing::info!(
             "✓ Overriding redirect_anthropic from GHC_PROXY_REDIRECT_ANTHROPIC: {}",
             cfg.redirect_anthropic
+        );
+    }
+    if let Ok(val) = std::env::var("GHC_PROXY_EXTEND_CACHE_TTL") {
+        cfg.extend_cache_ttl = val.eq_ignore_ascii_case("true") || val == "1";
+        tracing::info!(
+            "✓ Overriding extend_cache_ttl from GHC_PROXY_EXTEND_CACHE_TTL: {}",
+            cfg.extend_cache_ttl
         );
     }
     if let Ok(val) = std::env::var("GHC_PROXY_SHOW_TOKEN") {
