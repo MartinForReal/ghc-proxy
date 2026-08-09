@@ -102,24 +102,25 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-/// Extracts a presented API key from the standard provider headers:
+/// Extracts presented API keys from the standard provider headers:
 /// `Authorization: Bearer <key>`, `x-api-key: <key>`, or `x-goog-api-key: <key>`.
-fn presented_api_key(headers: &HeaderMap) -> Option<String> {
+fn presented_api_keys(headers: &HeaderMap) -> Vec<&str> {
+    let mut keys = Vec::with_capacity(3);
     if let Some(v) = headers.get("authorization").and_then(|h| h.to_str().ok()) {
         if let Some(rest) = v
             .strip_prefix("Bearer ")
             .or_else(|| v.strip_prefix("bearer "))
         {
-            return Some(rest.trim().to_string());
+            keys.push(rest.trim());
         }
     }
     if let Some(v) = headers.get("x-api-key").and_then(|h| h.to_str().ok()) {
-        return Some(v.trim().to_string());
+        keys.push(v.trim());
     }
     if let Some(v) = headers.get("x-goog-api-key").and_then(|h| h.to_str().ok()) {
-        return Some(v.trim().to_string());
+        keys.push(v.trim());
     }
-    None
+    keys
 }
 
 /// Authentication middleware. When an API key is configured, every request to a
@@ -137,11 +138,9 @@ async fn auth_middleware(
     if !is_protected_path(path) {
         return next.run(request).await;
     }
-    let presented = presented_api_key(request.headers());
-    let ok = presented
-        .as_deref()
-        .map(|p| constant_time_eq(p.as_bytes(), expected.as_bytes()))
-        .unwrap_or(false);
+    let ok = presented_api_keys(request.headers())
+        .into_iter()
+        .any(|presented| constant_time_eq(presented.as_bytes(), expected.as_bytes()));
     if ok {
         next.run(request).await
     } else {
@@ -779,7 +778,10 @@ fn filter_tools_by_frequency(tools: &Value, _frequency_threshold: f64, max_tools
 // Models
 // ---------------------------------------------------------------------------
 
-async fn get_models(State(state): State<SharedState>) -> Response {
+async fn get_models(
+    State(state): State<SharedState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
     if let Err(e) = state.ensure_copilot_token().await {
         return error_response(StatusCode::INTERNAL_SERVER_ERROR, e);
     }
@@ -790,6 +792,9 @@ async fn get_models(State(state): State<SharedState>) -> Response {
         tracing::warn!("model refresh failed: {e}");
     }
     let models = state.models.read().await;
+    if params.contains_key("client_version") {
+        return Json(codex_models_response(models.as_ref())).into_response();
+    }
     let data: Vec<Value> = models
         .as_ref()
         .and_then(|m| m.get("data"))
@@ -827,6 +832,110 @@ async fn get_models(State(state): State<SharedState>) -> Response {
         })
         .unwrap_or_default();
     Json(json!({"object": "list", "data": data, "has_more": false})).into_response()
+}
+
+fn codex_models_response(catalog: Option<&Value>) -> Value {
+    let models: Vec<Value> = catalog
+        .and_then(|m| m.get("data"))
+        .and_then(|d| d.as_array())
+        .map(|entries| {
+            entries
+                .iter()
+                .enumerate()
+                .filter_map(|(priority, model)| {
+                    let endpoints = model.get("supported_endpoints")?.as_array()?;
+                    if !endpoints
+                        .iter()
+                        .any(|endpoint| endpoint.as_str() == Some("/responses"))
+                    {
+                        return None;
+                    }
+
+                    let slug = model.get("id")?.as_str()?;
+                    let capabilities = model.get("capabilities")?;
+                    let limits = capabilities.get("limits")?;
+                    let context_window = limits.get("max_context_window_tokens")?.as_u64()?;
+                    let supports = capabilities.get("supports");
+                    let parallel_tools = supports
+                        .and_then(|s| s.get("parallel_tool_calls"))
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let vision = supports
+                        .and_then(|s| s.get("vision"))
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let reasoning_efforts: Vec<Value> = supports
+                        .and_then(|s| s.get("reasoning_effort"))
+                        .and_then(Value::as_array)
+                        .map(|efforts| {
+                            efforts
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .map(|effort| {
+                                    json!({
+                                        "effort": effort,
+                                        "description": format!("Use {effort} reasoning effort"),
+                                    })
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let default_reasoning = reasoning_efforts
+                        .iter()
+                        .find(|effort| {
+                            effort.get("effort").and_then(Value::as_str) == Some("medium")
+                        })
+                        .or_else(|| reasoning_efforts.first())
+                        .and_then(|effort| effort.get("effort"))
+                        .cloned();
+                    let mut input_modalities = vec![json!("text")];
+                    if vision {
+                        input_modalities.push(json!("image"));
+                    }
+
+                    Some(json!({
+                        "slug": slug,
+                        "display_name": model.get("name").cloned().unwrap_or_else(|| json!(slug)),
+                        "description": model
+                            .get("policy")
+                            .and_then(|p| p.get("terms"))
+                            .cloned(),
+                        "default_reasoning_level": default_reasoning,
+                        "supported_reasoning_levels": reasoning_efforts,
+                        "shell_type": "shell_command",
+                        "visibility": if model.get("model_picker_enabled").and_then(Value::as_bool).unwrap_or(false) {
+                            "list"
+                        } else {
+                            "hide"
+                        },
+                        "supported_in_api": true,
+                        "priority": priority,
+                        "base_instructions": "You are Codex, a coding agent. Follow the user's instructions, use the provided tools when appropriate, and continue until the task is complete.",
+                        "include_skills_usage_instructions": true,
+                        "include_plugin_usage_instructions": true,
+                        "include_apps_usage_instructions": true,
+                        "supports_reasoning_summary_parameter": !reasoning_efforts.is_empty(),
+                        "default_reasoning_summary": "auto",
+                        "support_verbosity": slug.starts_with("gpt-5"),
+                        "default_verbosity": if slug.starts_with("gpt-5") { Some("low") } else { None },
+                        "apply_patch_tool_type": "freeform",
+                        "web_search_tool_type": if vision { "text_and_image" } else { "text" },
+                        "truncation_policy": {"mode": "tokens", "limit": 10_000},
+                        "supports_parallel_tool_calls": parallel_tools,
+                        "supports_image_detail_original": vision,
+                        "context_window": context_window,
+                        "max_context_window": context_window,
+                        "effective_context_window_percent": 95,
+                        "experimental_supported_tools": [],
+                        "input_modalities": input_modalities,
+                        "supports_search_tool": true,
+                        "use_responses_lite": false,
+                    }))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    json!({"models": models})
 }
 
 async fn get_models_full(State(state): State<SharedState>) -> Response {
@@ -3704,7 +3813,8 @@ async fn openapi_spec() -> Response {
             "/v1/models": {
                 "get": {
                     "summary": "List available models",
-                    "responses": { "200": { "description": "Model list" } }
+                    "parameters": [{ "name": "client_version", "in": "query", "required": false, "schema": { "type": "string" }, "description": "Request Codex-native model metadata and context limits." }],
+                    "responses": { "200": { "description": "OpenAI model list, or Codex-native catalog when client_version is present" } }
                 }
             },
             "/v1/models/{model}": {
@@ -4484,27 +4594,35 @@ mod tests {
     fn presented_key_from_bearer() {
         let mut h = HeaderMap::new();
         h.insert("authorization", HeaderValue::from_static("Bearer abc123"));
-        assert_eq!(presented_api_key(&h).as_deref(), Some("abc123"));
+        assert_eq!(presented_api_keys(&h), vec!["abc123"]);
     }
 
     #[test]
     fn presented_key_from_x_api_key() {
         let mut h = HeaderMap::new();
         h.insert("x-api-key", HeaderValue::from_static("k-456"));
-        assert_eq!(presented_api_key(&h).as_deref(), Some("k-456"));
+        assert_eq!(presented_api_keys(&h), vec!["k-456"]);
     }
 
     #[test]
     fn presented_key_from_goog_header() {
         let mut h = HeaderMap::new();
         h.insert("x-goog-api-key", HeaderValue::from_static("g-789"));
-        assert_eq!(presented_api_key(&h).as_deref(), Some("g-789"));
+        assert_eq!(presented_api_keys(&h), vec!["g-789"]);
     }
 
     #[test]
     fn presented_key_absent() {
         let h = HeaderMap::new();
-        assert_eq!(presented_api_key(&h), None);
+        assert!(presented_api_keys(&h).is_empty());
+    }
+
+    #[test]
+    fn presented_keys_include_secondary_headers() {
+        let mut h = HeaderMap::new();
+        h.insert("authorization", HeaderValue::from_static("Bearer fallback"));
+        h.insert("x-api-key", HeaderValue::from_static("configured-key"));
+        assert_eq!(presented_api_keys(&h), vec!["fallback", "configured-key"]);
     }
 
     #[test]
@@ -4919,6 +5037,44 @@ mod tests {
             .route("/models", get(noop))
             .route("/models/full/", get(noop))
             .route("/models/{model_id}", get(noop));
+    }
+
+    #[test]
+    fn codex_catalog_uses_copilot_context_window() {
+        let catalog = json!({
+            "data": [
+                {
+                    "id": "gpt-5.6-sol",
+                    "name": "GPT-5.6 Sol",
+                    "model_picker_enabled": true,
+                    "supported_endpoints": ["/responses", "ws:/responses"],
+                    "capabilities": {
+                        "limits": {"max_context_window_tokens": 1_050_000},
+                        "supports": {
+                            "parallel_tool_calls": true,
+                            "reasoning_effort": ["low", "medium", "high"],
+                            "vision": true
+                        }
+                    }
+                },
+                {
+                    "id": "chat-only",
+                    "supported_endpoints": ["/chat/completions"],
+                    "capabilities": {
+                        "limits": {"max_context_window_tokens": 128_000}
+                    }
+                }
+            ]
+        });
+
+        let response = codex_models_response(Some(&catalog));
+        assert_eq!(response["models"].as_array().unwrap().len(), 1);
+        let model = &response["models"][0];
+        assert_eq!(model["slug"], "gpt-5.6-sol");
+        assert_eq!(model["context_window"], 1_050_000);
+        assert_eq!(model["max_context_window"], 1_050_000);
+        assert_eq!(model["effective_context_window_percent"], 95);
+        assert_eq!(model["visibility"], "list");
     }
 
     #[test]
