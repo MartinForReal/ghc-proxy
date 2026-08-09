@@ -21,6 +21,9 @@ pub struct Outcome {
     pub cfg: Config,
     /// Whether the user asked to also configure Claude Code.
     pub configure_claude_code: bool,
+    /// The GitHub token resolved during the run, so callers can query the
+    /// catalog without prompting for a second sign-in.
+    pub token: String,
 }
 
 /// Whether an interactive wizard can run, i.e. both stdin and stdout are
@@ -117,6 +120,7 @@ pub async fn run(starting: Config, claudecode_flag: bool) -> Option<Outcome> {
     Some(Outcome {
         cfg,
         configure_claude_code,
+        token,
     })
 }
 

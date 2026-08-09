@@ -77,7 +77,9 @@ upstream Copilot Responses API behave like the Codex client expects:
 - `apply_patch` tool rewriting
 - `X-Initiator` header (`user` vs `agent`)
 - context-compaction trimming
-- `service_tier` nulling
+- `service_tier` nulling — Copilot answers 400 `service_tier is not supported`
+  for every value, including the tiers Codex sends for Fast mode, so the field
+  is normalized to null rather than forwarded
 - stripping of unsupported tools
 
 ### Automatic setup
@@ -89,6 +91,21 @@ upstream Copilot Responses API behave like the Codex client expects:
 This patches `~/.codex/config.toml`, adding a `model_providers.ghc-proxy` block
 (pointing at `http://127.0.0.1:8314/v1`) and selecting it. Existing settings are
 preserved, and the file is left untouched if it is not valid TOML.
+
+A `model` already in the file is treated as a deliberate choice and kept; the
+recommended default is only written when the config has none.
+
+`model_context_window` is written from the live Copilot catalog for whichever
+model ends up selected. Codex otherwise budgets context from its own built-in
+table, which is sized for OpenAI's public limits — Copilot serves the same
+slugs with different windows (1,050,000 for `gpt-5.5`, 264,000 for
+`gpt-5-mini`), so without this the client compacts at the wrong point. The key
+is skipped when the catalog cannot be reached.
+
+When the proxy is configured with an `api_key`, the provider block also gets
+`env_key = "GHC_PROXY_API_KEY"` — the same variable the proxy reads, so one
+exported value serves both sides. It is omitted otherwise, because Codex fails
+a turn when a provider names an environment variable that is not set.
 
 ### Manual setup
 

@@ -1155,6 +1155,9 @@ async fn responses(State(state): State<SharedState>, body: Bytes) -> Response {
         let trimmed = codex::apply_compaction(input);
         req["input"] = Value::Array(trimmed);
     }
+    // Copilot rejects this field outright: any value, including the tiers Codex
+    // sends for Fast mode, answers 400 "service_tier is not supported". An
+    // explicit null is accepted, so normalize rather than forward.
     req["service_tier"] = Value::Null;
 
     let input = req.get("input").cloned().unwrap_or(Value::Null);

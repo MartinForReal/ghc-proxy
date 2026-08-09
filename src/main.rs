@@ -275,12 +275,17 @@ const CODEX_PROVIDER_ID: &str = "ghc-proxy";
 /// Codex `config.toml` content, preserving every other setting. `existing` is
 /// the current file contents (or `None`/empty for a new file). Returns the
 /// serialized TOML to write, or an error if `existing` is not valid TOML.
+///
+/// An existing `model` is left alone: it is an explicit choice, and the
+/// recommended default is only a starting point for a config that has none.
+/// Returns the TOML alongside the model that ended up selected.
 fn merge_codex_config(
     existing: Option<&str>,
     base_url: &str,
     model: &str,
     context_window: Option<u64>,
-) -> Result<String, String> {
+    api_key_required: bool,
+) -> Result<(String, String), String> {
     use toml::Value;
     let mut root: Value = match existing {
         Some(contents) if !contents.trim().is_empty() => toml::from_str::<Value>(contents)
@@ -291,7 +296,12 @@ fn merge_codex_config(
         .as_table_mut()
         .ok_or_else(|| "existing config.toml is not a TOML table".to_string())?;
 
-    table.insert("model".to_string(), Value::String(model.to_string()));
+    let effective_model = table
+        .entry("model".to_string())
+        .or_insert_with(|| Value::String(model.to_string()))
+        .as_str()
+        .unwrap_or(model)
+        .to_string();
     table.insert(
         "model_provider".to_string(),
         Value::String(CODEX_PROVIDER_ID.to_string()),
@@ -321,9 +331,18 @@ fn merge_codex_config(
         "wire_api".to_string(),
         Value::String("responses".to_string()),
     );
+    // Only when the proxy actually demands a key: Codex refuses to start a turn
+    // when a provider names an env var that is not set.
+    if api_key_required {
+        provider.insert(
+            "env_key".to_string(),
+            Value::String("GHC_PROXY_API_KEY".to_string()),
+        );
+    }
     providers.insert(CODEX_PROVIDER_ID.to_string(), Value::Table(provider));
 
-    toml::to_string_pretty(&root).map_err(|e| e.to_string())
+    let rendered = toml::to_string_pretty(&root).map_err(|e| e.to_string())?;
+    Ok((rendered, effective_model))
 }
 
 /// Patches Codex's `~/.codex/config.toml` so it routes through this proxy by
@@ -335,7 +354,7 @@ fn configure_codex(
     cfg: &ghc_proxy::config::Config,
     model: &str,
     context_window: Option<u64>,
-) -> std::io::Result<std::path::PathBuf> {
+) -> std::io::Result<(std::path::PathBuf, String)> {
     let dir = dirs::home_dir()
         .ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::NotFound, "home directory not found")
@@ -345,12 +364,60 @@ fn configure_codex(
     let base_url = format!("http://{}:{}", cfg.address, cfg.port);
 
     let existing = std::fs::read_to_string(&path).ok();
-    let merged = merge_codex_config(existing.as_deref(), &base_url, model, context_window)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let (merged, effective_model) = merge_codex_config(
+        existing.as_deref(),
+        &base_url,
+        model,
+        context_window,
+        cfg.api_key.as_ref().is_some_and(|k| !k.is_empty()),
+    )
+    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
     std::fs::create_dir_all(&dir)?;
     std::fs::write(&path, merged)?;
-    Ok(path)
+    Ok((path, effective_model))
+}
+
+/// The model Codex will end up using: an explicit choice already in its config,
+/// or the recommended default when there is none.
+///
+/// The context window has to be looked up for *that* model. Sizing it from the
+/// default instead would hand a 1M window to a config pinned to a 264K model.
+fn codex_effective_model() -> String {
+    dirs::home_dir()
+        .map(|h| h.join(".codex").join("config.toml"))
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|c| toml::from_str::<toml::Value>(&c).ok())
+        .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(str::to_string))
+        .unwrap_or_else(|| CODEX_DEFAULT_MODEL.to_string())
+}
+
+/// Looks up a model's context window in the live Copilot catalog.
+///
+/// Codex budgets context from its own built-in table, which is sized for
+/// OpenAI's public limits; Copilot serves the same slugs with a different
+/// window, so without this the client either compacts far too early or too
+/// late. Returns `None` whenever the catalog cannot be reached, which leaves
+/// the key unwritten and Codex on its own default.
+async fn fetch_model_context_window(
+    cfg: &ghc_proxy::config::Config,
+    token: &str,
+    model: &str,
+) -> Option<u64> {
+    let state = std::sync::Arc::new(AppState::new(cfg.clone(), token.to_string()));
+    state.refresh_copilot_token().await.ok()?;
+    state.load_models().await.ok()?;
+    let models = state.models.read().await;
+    models
+        .as_ref()?
+        .get("data")?
+        .as_array()?
+        .iter()
+        .find(|m| m.get("id").and_then(|i| i.as_str()) == Some(model))?
+        .get("capabilities")?
+        .get("limits")?
+        .get("max_context_window_tokens")?
+        .as_u64()
 }
 
 /// Default model written for the Gemini CLI when none is detected.
@@ -498,6 +565,7 @@ fn print_setup_guide(
     claudecode: bool,
     codex: bool,
     gemini: bool,
+    codex_context_window: Option<u64>,
 ) {
     let bar = "=".repeat(60);
     println!("\n{bar}");
@@ -564,14 +632,17 @@ fn print_setup_guide(
 
     if codex {
         println!("\nCodex:");
-        match configure_codex(cfg, CODEX_DEFAULT_MODEL, None) {
-            Ok(p) => {
+        match configure_codex(cfg, CODEX_DEFAULT_MODEL, codex_context_window) {
+            Ok((p, selected_model)) => {
                 println!(
-                    "  Added model_provider \"{CODEX_PROVIDER_ID}\" (base_url http://{}:{}/v1)\n  and selected model {CODEX_DEFAULT_MODEL} in:\n    {}",
+                    "  Added model_provider \"{CODEX_PROVIDER_ID}\" (base_url http://{}:{}/v1)\n  and selected model {selected_model} in:\n    {}",
                     cfg.address,
                     cfg.port,
                     p.display()
                 );
+                if let Some(window) = codex_context_window {
+                    println!("  Context window set to {window} tokens from the Copilot catalog.");
+                }
                 println!("  Codex will now route through this proxy.");
             }
             Err(e) => {
@@ -772,6 +843,16 @@ async fn main() {
         let gemini_flag = cli.gemini;
         if setup::is_interactive() {
             if let Some(outcome) = setup::run(cfg, cli.claudecode).await {
+                let window = if codex_flag {
+                    fetch_model_context_window(
+                        &outcome.cfg,
+                        &outcome.token,
+                        &codex_effective_model(),
+                    )
+                    .await
+                } else {
+                    None
+                };
                 match config::write_config(&outcome.cfg) {
                     Ok(path) => print_setup_guide(
                         &outcome.cfg,
@@ -779,13 +860,24 @@ async fn main() {
                         outcome.configure_claude_code,
                         codex_flag,
                         gemini_flag,
+                        window,
                     ),
                     Err(e) => eprintln!("Failed to write config: {e}"),
                 }
             }
         } else {
+            // Headless: use a token already on disk rather than starting a
+            // device flow nobody is watching.
+            let window = match (codex_flag, auth::load_saved_token()) {
+                (true, Some(token)) => {
+                    fetch_model_context_window(&cfg, &token, &codex_effective_model()).await
+                }
+                _ => None,
+            };
             match config::write_config(&cfg) {
-                Ok(path) => print_setup_guide(&cfg, &path, cli.claudecode, codex_flag, gemini_flag),
+                Ok(path) => {
+                    print_setup_guide(&cfg, &path, cli.claudecode, codex_flag, gemini_flag, window)
+                }
                 Err(e) => eprintln!("Failed to write config: {e}"),
             }
         }
@@ -812,8 +904,14 @@ async fn main() {
                     }
                 }
                 if cli.codex {
-                    match configure_codex(&outcome.cfg, CODEX_DEFAULT_MODEL, None) {
-                        Ok(p) => tracing::info!("✓ Codex configured at {}", p.display()),
+                    let window = fetch_model_context_window(
+                        &outcome.cfg,
+                        &outcome.token,
+                        &codex_effective_model(),
+                    )
+                    .await;
+                    match configure_codex(&outcome.cfg, CODEX_DEFAULT_MODEL, window) {
+                        Ok((p, _)) => tracing::info!("✓ Codex configured at {}", p.display()),
                         Err(e) => tracing::warn!("Failed to configure Codex: {e}"),
                     }
                 }
@@ -1016,12 +1114,19 @@ mod tests {
 
     #[test]
     fn codex_config_new_file() {
-        let out =
-            merge_codex_config(None, "http://127.0.0.1:8314", "gpt-5.5", Some(272000)).unwrap();
+        let (out, selected) = merge_codex_config(
+            None,
+            "http://127.0.0.1:8314",
+            "gpt-5.5",
+            Some(1_050_000),
+            false,
+        )
+        .unwrap();
+        assert_eq!(selected, "gpt-5.5");
         let v: toml::Value = toml::from_str(&out).unwrap();
         assert_eq!(v["model"].as_str(), Some("gpt-5.5"));
         assert_eq!(v["model_provider"].as_str(), Some("ghc-proxy"));
-        assert_eq!(v["model_context_window"].as_integer(), Some(272000));
+        assert_eq!(v["model_context_window"].as_integer(), Some(1_050_000));
         assert_eq!(
             v["model_providers"]["ghc-proxy"]["base_url"].as_str(),
             Some("http://127.0.0.1:8314/v1")
@@ -1030,12 +1135,38 @@ mod tests {
             v["model_providers"]["ghc-proxy"]["wire_api"].as_str(),
             Some("responses")
         );
+        // No key configured, so naming an env var Codex would find unset only
+        // breaks startup.
+        assert!(v["model_providers"]["ghc-proxy"].get("env_key").is_none());
+    }
+
+    #[test]
+    fn codex_config_names_the_key_env_var_when_the_proxy_needs_one() {
+        let (out, _) = merge_codex_config(None, "http://x", "gpt-5.5", None, true).unwrap();
+        let v: toml::Value = toml::from_str(&out).unwrap();
+        assert_eq!(
+            v["model_providers"]["ghc-proxy"]["env_key"].as_str(),
+            Some("GHC_PROXY_API_KEY")
+        );
+    }
+
+    /// The model is an explicit user choice; only the provider has to point here.
+    #[test]
+    fn codex_config_keeps_a_model_the_user_already_chose() {
+        let existing = "model = \"gpt-5.6-sol\"\nmodel_provider = \"other\"\n";
+        let (out, selected) =
+            merge_codex_config(Some(existing), "http://x", "gpt-5.5", None, false).unwrap();
+        assert_eq!(selected, "gpt-5.6-sol");
+        let v: toml::Value = toml::from_str(&out).unwrap();
+        assert_eq!(v["model"].as_str(), Some("gpt-5.6-sol"));
+        assert_eq!(v["model_provider"].as_str(), Some("ghc-proxy"));
     }
 
     #[test]
     fn codex_config_preserves_existing_keys() {
         let existing = "approval_policy = \"on-request\"\n[tui]\ntheme = \"dark\"\n";
-        let out = merge_codex_config(Some(existing), "http://x", "gpt-5.5", None).unwrap();
+        let (out, _) =
+            merge_codex_config(Some(existing), "http://x", "gpt-5.5", None, false).unwrap();
         let v: toml::Value = toml::from_str(&out).unwrap();
         // Unrelated keys preserved.
         assert_eq!(v["approval_policy"].as_str(), Some("on-request"));
@@ -1048,7 +1179,7 @@ mod tests {
 
     #[test]
     fn codex_config_rejects_invalid_toml() {
-        assert!(merge_codex_config(Some("=not valid="), "http://x", "m", None).is_err());
+        assert!(merge_codex_config(Some("=not valid="), "http://x", "m", None, false).is_err());
     }
 
     #[test]
