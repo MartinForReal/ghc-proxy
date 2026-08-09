@@ -1838,7 +1838,10 @@ async fn messages_direct(
     let mut current = req.clone();
     let mut thinking_adapted = false;
     for _ in 0..4 {
-        let mut sanitized = anthropic::sanitize_anthropic_request(&current);
+        let mut sanitized = anthropic::sanitize_anthropic_request(
+            &current,
+            state.config_snapshot().extend_cache_ttl,
+        );
         sanitized = anthropic::adjust_thinking_budget(&sanitized);
         let payload = serde_json::to_vec(&sanitized).unwrap_or_default();
         log_debug_request(&state, "/v1/messages", &sanitized);
@@ -2251,8 +2254,9 @@ async fn count_tokens(
         )
         .await;
         let url = format!("{}/v1/messages/count_tokens", state.copilot_base_url());
-        let payload =
-            serde_json::to_vec(&anthropic::sanitize_anthropic_request(&req)).unwrap_or_default();
+        // Counting writes no cache entry, so the ttl is irrelevant here.
+        let payload = serde_json::to_vec(&anthropic::sanitize_anthropic_request(&req, false))
+            .unwrap_or_default();
         // Deliberately not retried: clients call this before every turn, so a
         // backoff here stalls the turn only to arrive at the local estimate
         // anyway.

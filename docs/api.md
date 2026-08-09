@@ -147,6 +147,26 @@ billed. Measured across twelve calls with a 27k-token prefix, exactly one
 reported a write, on `/v1/messages`. The dashboard hides the column outright
 when nothing wrote.
 
+### Cache lifetime
+
+A `cache_control` breakpoint with no `ttl` gets the five-minute tier. That is
+short enough to be self-defeating on long turns: the entry is written during
+prefill, so a turn that itself runs longer than five minutes has already
+outlived its own cache by the time it finishes, and the next turn pays a full
+cold prefill of the whole conversation.
+
+Setting `extend_cache_ttl: true` promotes breakpoints that carry no explicit
+`ttl` to the one-hour tier. An explicit `ttl` is always left as the client sent
+it. Copilot honours both tiers and accounts for them separately, in
+`cache_creation.ephemeral_5m_input_tokens` and `ephemeral_1h_input_tokens`.
+
+It is off by default because it is not free. Extended writes bill at a higher
+rate than five-minute ones while reads cost the same, so the premium is charged
+on *every* write and the saving only lands on an expiry that would otherwise
+have happened. On a conversation that does many small incremental writes
+between rare expiries it costs more than it saves; it pays off when turns
+routinely run past five minutes.
+
 A model with no cache activity at all is usually not a fault either: Copilot
 needs a minimum cacheable prefix before any of the prompt is eligible.
 `claude-haiku-4.5` was observed caching a 6902-token prefix but not a

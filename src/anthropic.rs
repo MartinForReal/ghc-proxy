@@ -773,12 +773,18 @@ pub fn uses_context_management(req: &Value) -> bool {
         .unwrap_or(false)
 }
 
-fn clean_cache_control(block: &mut Value) {
+fn clean_cache_control(block: &mut Value, extend_ttl: bool) {
     if let Some(cc) = block.get_mut("cache_control") {
         if cc.get("type").and_then(|t| t.as_str()) == Some("ephemeral") {
             if let Some(obj) = cc.as_object_mut() {
                 if obj.contains_key("scope") {
                     obj.remove("scope");
+                }
+                // Only fill a gap. An explicit `ttl` is the client's decision
+                // and overriding it would bill the extended rate against a
+                // choice someone deliberately made.
+                if extend_ttl && !obj.contains_key("ttl") {
+                    obj.insert("ttl".to_string(), Value::String("1h".to_string()));
                 }
             }
         }
@@ -797,8 +803,10 @@ fn is_empty_text_block(block: &Value) -> bool {
 }
 
 /// Filters an Anthropic request down to the allowed keys and strips the
-/// unsupported `scope` field from ephemeral `cache_control` blocks.
-pub fn sanitize_anthropic_request(req: &Value) -> Value {
+/// unsupported `scope` field from ephemeral `cache_control` blocks. When
+/// `extend_ttl` is set, breakpoints left without a `ttl` are promoted to the
+/// one-hour tier.
+pub fn sanitize_anthropic_request(req: &Value, extend_ttl: bool) -> Value {
     let mut out = Map::new();
     if let Some(obj) = req.as_object() {
         for (k, v) in obj {
@@ -811,12 +819,12 @@ pub fn sanitize_anthropic_request(req: &Value) -> Value {
 
     if let Some(tools) = out.get_mut("tools").and_then(|t| t.as_array_mut()) {
         for t in tools {
-            clean_cache_control(t);
+            clean_cache_control(t, extend_ttl);
         }
     }
     if let Some(system) = out.get_mut("system").and_then(|s| s.as_array_mut()) {
         for s in system {
-            clean_cache_control(s);
+            clean_cache_control(s, extend_ttl);
         }
     }
     if let Some(messages) = out.get_mut("messages").and_then(|m| m.as_array_mut()) {
@@ -828,7 +836,7 @@ pub fn sanitize_anthropic_request(req: &Value) -> Value {
             }
             if let Some(content) = msg.get_mut("content").and_then(|c| c.as_array_mut()) {
                 for block in content.iter_mut() {
-                    clean_cache_control(block);
+                    clean_cache_control(block, extend_ttl);
                 }
                 content.retain(|block| !is_empty_text_block(block));
             }
@@ -1362,7 +1370,7 @@ mod tests {
             "context_management": {"edits": [{"type": "clear_tool_uses_20250919"}]}
         });
         assert!(uses_context_management(&req));
-        let out = sanitize_anthropic_request(&req);
+        let out = sanitize_anthropic_request(&req, false);
         assert!(out.get("context_management").is_some());
     }
 
@@ -1472,7 +1480,7 @@ mod tests {
     #[test]
     fn sanitize_drops_unknown_keys() {
         let req = json!({"model": "m", "messages": [], "foo": "bar"});
-        let out = sanitize_anthropic_request(&req);
+        let out = sanitize_anthropic_request(&req, false);
         assert!(out.get("foo").is_none());
         assert_eq!(out["model"], "m");
     }
@@ -1480,8 +1488,73 @@ mod tests {
     #[test]
     fn sanitize_keeps_output_config() {
         let req = json!({"model": "m", "messages": [], "output_config": {"effort": "high"}});
-        let out = sanitize_anthropic_request(&req);
+        let out = sanitize_anthropic_request(&req, false);
         assert_eq!(out["output_config"]["effort"], "high");
+    }
+
+    fn ttl_probe_request() -> Value {
+        json!({
+            "model": "m",
+            "tools": [{"name": "t", "cache_control": {"type": "ephemeral"}}],
+            "system": [{"type": "text", "text": "s", "cache_control": {"type": "ephemeral"}}],
+            "messages": [{
+                "role": "user",
+                "content": [{"type": "text", "text": "u", "cache_control": {"type": "ephemeral"}}]
+            }]
+        })
+    }
+
+    /// Off by default: extended writes bill at a higher rate.
+    #[test]
+    fn cache_ttl_is_left_alone_unless_asked_for() {
+        let out = sanitize_anthropic_request(&ttl_probe_request(), false);
+        assert!(out["tools"][0]["cache_control"].get("ttl").is_none());
+        assert!(out["system"][0]["cache_control"].get("ttl").is_none());
+        assert!(out["messages"][0]["content"][0]["cache_control"]
+            .get("ttl")
+            .is_none());
+    }
+
+    #[test]
+    fn cache_ttl_is_extended_at_every_breakpoint() {
+        let out = sanitize_anthropic_request(&ttl_probe_request(), true);
+        assert_eq!(out["tools"][0]["cache_control"]["ttl"], "1h");
+        assert_eq!(out["system"][0]["cache_control"]["ttl"], "1h");
+        assert_eq!(
+            out["messages"][0]["content"][0]["cache_control"]["ttl"],
+            "1h"
+        );
+    }
+
+    /// A client that names a ttl has priced the trade itself.
+    #[test]
+    fn an_explicit_cache_ttl_is_never_overridden() {
+        let req = json!({
+            "model": "m",
+            "system": [{
+                "type": "text", "text": "s",
+                "cache_control": {"type": "ephemeral", "ttl": "5m"}
+            }],
+            "messages": []
+        });
+        let out = sanitize_anthropic_request(&req, true);
+        assert_eq!(out["system"][0]["cache_control"]["ttl"], "5m");
+    }
+
+    /// `scope` is rejected upstream, so it has to go even while a ttl goes in.
+    #[test]
+    fn extending_the_ttl_still_strips_scope() {
+        let req = json!({
+            "model": "m",
+            "system": [{
+                "type": "text", "text": "s",
+                "cache_control": {"type": "ephemeral", "scope": "global"}
+            }],
+            "messages": []
+        });
+        let out = sanitize_anthropic_request(&req, true);
+        assert!(out["system"][0]["cache_control"].get("scope").is_none());
+        assert_eq!(out["system"][0]["cache_control"]["ttl"], "1h");
     }
 
     #[test]
@@ -1496,7 +1569,7 @@ mod tests {
                 ]
             }]
         });
-        let out = sanitize_anthropic_request(&req);
+        let out = sanitize_anthropic_request(&req, false);
         let blocks = out["messages"][0]["content"]
             .as_array()
             .cloned()
@@ -1515,7 +1588,7 @@ mod tests {
                 {"role": "user", "content": [{"type": "text", "text": "hello"}]}
             ]
         });
-        let out = sanitize_anthropic_request(&req);
+        let out = sanitize_anthropic_request(&req, false);
         let messages = out["messages"].as_array().cloned().unwrap_or_default();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0]["role"], "user");
