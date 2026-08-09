@@ -95,28 +95,43 @@ preserved, and the file is left untouched if it is not valid TOML.
 A `model` already in the file is treated as a deliberate choice and kept; the
 recommended default is only written when the config has none.
 
-`model_context_window` is written from the live Copilot catalog for whichever
-model ends up selected. Codex otherwise budgets context from its own built-in
-table, which is sized for OpenAI's public limits — Copilot serves the same
-slugs with different windows (1,050,000 for `gpt-5.5`, 264,000 for
-`gpt-5-mini`), so without this the client compacts at the wrong point. The key
-is skipped when the catalog cannot be reached.
+The provider uses command-backed authentication through `ghc-proxy codex-auth-token`.
+Besides supplying the current local `api_key` (or a harmless
+placeholder when authentication is disabled), this tells Codex to refresh the
+provider's model catalog. No OpenAI account or exported environment variable is
+required. When an `api_key` is active during setup, its resolved value is also
+written as `x-api-key`; this keeps environment-only proxy launches working when
+ChatGPT Desktop does not inherit the server's shell environment.
 
-When the proxy is configured with an `api_key`, the provider block also gets
-`http_headers = { Authorization = "Bearer <key>" }`. Codex otherwise only reads
-credentials from an environment variable named by `env_key`, and it fails a
-turn when that variable is unset — which is exactly what happens when the key
-lives in `config.yaml` and was never exported. The value is written literally
-because it only opens the local proxy; the credential that reaches GitHub is
-the Copilot token the proxy holds. Nothing is written when no key is set.
+Codex requests `GET /v1/models?client_version=...`; the proxy recognizes that
+query and returns Codex-native model metadata with `context_window` and
+`max_context_window` populated from the live Copilot catalog. Plain
+`GET /v1/models` remains the standard OpenAI list. This matters because Copilot
+serves familiar slugs with different limits — currently 1,050,000 for
+`gpt-5.6-sol` and 264,000 for `gpt-5-mini`. The window now follows the selected
+model automatically, so setup removes any stale top-level
+`model_context_window` override.
 
 ### Manual setup
 
-Point the Codex CLI at the proxy's base URL:
+Define a command-authenticated provider so Codex also discovers model limits:
 
-```bash
-export OPENAI_BASE_URL="http://127.0.0.1:8314/v1"
+```toml
+model_provider = "ghc-proxy"
+
+[model_providers.ghc-proxy]
+name = "GHC Proxy"
+base_url = "http://127.0.0.1:8314/v1"
+wire_api = "responses"
+
+[model_providers.ghc-proxy.auth]
+command = "/usr/local/bin/ghc-proxy"
+args = ["codex-auth-token"]
+timeout_ms = 5000
+refresh_interval_ms = 300000
 ```
+
+Use the actual path of the `ghc-proxy` executable for `command`.
 
 ## Gemini CLI
 

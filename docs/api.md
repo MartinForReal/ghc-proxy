@@ -202,7 +202,7 @@ curl http://127.0.0.1:8314/health
 {
   "status": "ok",
   "ready": true,
-  "version": "1.4.2",
+  "version": "1.4.3",
   "uptime_seconds": 128,
   "copilot_token": { "present": true, "expires_in_seconds": 1487 },
   "models_loaded": 77,
@@ -322,8 +322,14 @@ curl http://127.0.0.1:8314/usage
 
 ## Model discovery
 
-`GET /v1/models` returns the OpenAI-style list. For full capability data —
-context-window limits, supported endpoints, vision, tokenizer — use:
+`GET /v1/models` returns the OpenAI-style list. Codex appends a
+`client_version` query parameter; when present, the same endpoint returns its
+native `{ "models": [...] }` catalog with active and maximum context windows
+derived from Copilot. This lets Codex size and compact each selected model
+without a static client-side override.
+
+For full upstream capability data — context-window limits, supported endpoints,
+vision, tokenizer — use:
 
 ```bash
 curl http://127.0.0.1:8314/v1/models/full/

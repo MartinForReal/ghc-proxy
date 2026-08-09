@@ -37,7 +37,8 @@ file.
 - **OpenAI-compatible** `/v1/chat/completions` and `/v1/responses` endpoints
   (with Codex adapters: `apply_patch` tool rewrite, `X-Initiator` header,
   context compaction trimming, `service_tier` nulling, unsupported-tool
-  stripping).
+  stripping). Codex model discovery is negotiated through its `client_version`
+  query so per-model context windows come from the live Copilot catalog.
 - **Anthropic-compatible** `/v1/messages` endpoint (direct passthrough when the
   upstream model supports it, otherwise translated through chat completions).
 - **Gemini-compatible** `/v1beta/models/{model}:generateContent`,
@@ -263,7 +264,7 @@ the dashboard and model listings.
 | `POST /v1/chat/completions` | OpenAI chat completions |
 | `POST /v1/responses` | OpenAI responses API (Codex) |
 | `GET /v1/responses` *(with `Upgrade: websocket`)* | Responses API over WebSocket, for models advertising `ws:/responses` |
-| `GET /v1/models` | List available models |
+| `GET /v1/models` | List available models; returns Codex-native metadata when `client_version` is present |
 | `GET /v1/models/{model}` | Retrieve a single model (aliases resolved) |
 | `POST /v1/messages` | Anthropic messages API |
 | `POST /v1/messages/count_tokens` | Anthropic token counting (local estimate fallback) |
@@ -389,9 +390,10 @@ database. `--setup` launches an interactive wizard (GitHub sign-in, live model
 catalog, model-mapping configuration) and writes/updates the config file; in
 headless or piped contexts it instead re-renders the config non-interactively,
 applying any CLI overrides or resetting to defaults with `--default`.
-`--codex` patches `~/.codex/config.toml` (adding a `model_providers.ghc-proxy`
-block and selecting it), and `--gemini` patches `~/.gemini/.env` (base URL,
-model, and api-key auth selection). `--claudecode` patches `~/.claude/settings.json`, merging
+`--codex` patches `~/.codex/config.toml` (adding a command-authenticated
+`model_providers.ghc-proxy` block, selecting it, and enabling automatic model
+limit discovery), and `--gemini` patches `~/.gemini/.env` (base URL, model, and
+api-key auth selection). `--claudecode` patches `~/.claude/settings.json`, merging
 `env.ANTHROPIC_BASE_URL` and ensuring `env.ANTHROPIC_API_KEY` exists so Claude
 Code routes through this proxy (existing settings are preserved, and an
 existing API key is left untouched). The dashboard lists all supported models

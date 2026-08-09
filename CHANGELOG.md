@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.4.3] - 2026-08-09
+
+### Added
+- **Codex discovers Copilot context windows automatically.** Requests carrying
+  Codex's `client_version` query receive its native model-catalog schema, with
+  `context_window` and `max_context_window` taken from Copilot. Automatic setup
+  now uses command-backed local authentication so Codex refreshes that catalog,
+  and removes the stale global `model_context_window` override.
+
 ## [1.4.2] - 2026-08-09
 
 ### Added
