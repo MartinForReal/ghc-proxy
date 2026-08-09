@@ -39,6 +39,8 @@ pub struct AppState {
     pub started_at: Instant,
     /// Latest per-SKU quota reported by the upstream, keyed by SKU name.
     pub quotas: StdRwLock<BTreeMap<String, QuotaSnapshot>>,
+    /// When upstream token counting may be attempted again after a rate limit.
+    pub counting_paused_until: StdRwLock<Option<Instant>>,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -150,6 +152,10 @@ fn now_secs() -> u64 {
 /// under the ~60s idle cutoff typical of load balancers and NAT tables.
 const UPSTREAM_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
 
+/// How long to serve local token estimates after the upstream counting endpoint
+/// reports a rate limit.
+const COUNTING_COOLDOWN: Duration = Duration::from_secs(60);
+
 /// Current unix time in milliseconds (13 digits), used for the session id.
 fn now_millis() -> u128 {
     SystemTime::now()
@@ -201,6 +207,7 @@ impl AppState {
             session_id: format!("{}{}", uuid::Uuid::new_v4(), now_millis()),
             started_at: Instant::now(),
             quotas: StdRwLock::new(BTreeMap::new()),
+            counting_paused_until: StdRwLock::new(None),
         }
     }
 
@@ -295,6 +302,23 @@ impl AppState {
 
     pub fn max_connection_retries(&self) -> u32 {
         self.config.read().unwrap().max_connection_retries
+    }
+
+    /// Whether upstream token counting is currently rate limited.
+    ///
+    /// Clients call `/v1/messages/count_tokens` before every turn, so once the
+    /// upstream starts refusing there is nothing to gain from asking again on
+    /// each one: the local estimate is the answer either way.
+    pub fn upstream_counting_paused(&self) -> bool {
+        match *self.counting_paused_until.read().unwrap() {
+            Some(until) => Instant::now() < until,
+            None => false,
+        }
+    }
+
+    /// Stops attempting upstream token counting for [`COUNTING_COOLDOWN`].
+    pub fn pause_upstream_counting(&self) {
+        *self.counting_paused_until.write().unwrap() = Some(Instant::now() + COUNTING_COOLDOWN);
     }
 
     pub fn model_mappings(&self) -> ModelMappings {
@@ -951,6 +975,20 @@ mod tests {
                 .percent_remaining,
             7.5
         );
+    }
+
+    #[test]
+    fn counting_cooldown_expires_on_its_own() {
+        let state = AppState::new(Config::default(), "t".into());
+        assert!(!state.upstream_counting_paused());
+
+        state.pause_upstream_counting();
+        assert!(state.upstream_counting_paused());
+
+        // An elapsed deadline lifts the pause without anyone clearing it.
+        *state.counting_paused_until.write().unwrap() =
+            Some(Instant::now() - Duration::from_secs(1));
+        assert!(!state.upstream_counting_paused());
     }
 
     #[test]

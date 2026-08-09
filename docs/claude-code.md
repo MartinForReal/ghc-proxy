@@ -107,10 +107,35 @@ Configure the Gemini CLI automatically:
 ```
 
 This writes `~/.gemini/.env` with `GOOGLE_GEMINI_BASE_URL`
-(`http://127.0.0.1:8314/v1beta`), `GEMINI_MODEL`, and disables telemetry, and
+(`http://127.0.0.1:8314`), `GEMINI_MODEL`, and disables telemetry, and
 selects api-key auth in `~/.gemini/settings.json` to skip the first-launch
 prompt. Any user-set `GEMINI_API_KEY` is preserved. The Gemini surface is served
 at `/v1beta/models/{model}:generateContent` (plus streaming and token counting).
+
+The base URL carries no API version: the Gen AI SDK appends `v1beta` itself, so
+writing it here would send `/v1beta/v1beta/models/...` and 404.
+
+### Context window
+
+Gemini CLI does not read a context window from the server. `tokenLimit()` is a
+hardcoded table whose default branch returns 1,048,576 tokens, so every model
+this proxy serves is assumed to have a 1M window regardless of what actually
+backs it. With the default `model.compressionThreshold` of `0.5`, compaction
+would not trigger until roughly 524K tokens — far past where the upstream
+rejects the request.
+
+Set the threshold to about 80% of the real window, expressed as a fraction of
+1,048,576, in `~/.gemini/settings.json`:
+
+```json
+{
+  "model": {
+    "compressionThreshold": 0.15
+  }
+}
+```
+
+`0.15` suits a 200K model; use `0.1` for 128K.
 
 ## Tips
 

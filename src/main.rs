@@ -354,13 +354,19 @@ fn configure_codex(
 }
 
 /// Default model written for the Gemini CLI when none is detected.
-const GEMINI_DEFAULT_MODEL: &str = "gemini-2.5-pro";
+///
+/// The Gemini CLI's own default (`gemini-2.5-pro`) is not in Copilot's catalog,
+/// so writing it would configure the client to use a model that always 400s.
+const GEMINI_DEFAULT_MODEL: &str = ghc_proxy::config::DEFAULT_GEMINI_PRO;
 /// Default API key placeholder written for local Gemini CLI auth.
 const GEMINI_PROXY_API_KEY: &str = "ghc-proxy";
 
 /// Merges Gemini CLI environment variables into the lines of an existing `.env`
 /// file, preserving unrelated entries and any user-set `GEMINI_API_KEY`. Returns
 /// the full `.env` text to write.
+///
+/// `base_url` carries no API version: the Gen AI SDK appends its own
+/// (`v1beta`), so a version here would be sent twice and 404.
 fn merge_gemini_env(existing: Option<&str>, base_url: &str, model: &str) -> String {
     use std::collections::BTreeSet;
     // Keys we manage; existing values for these are replaced (except the API key
@@ -378,7 +384,7 @@ fn merge_gemini_env(existing: Option<&str>, base_url: &str, model: &str) -> Stri
                 .unwrap_or_default();
             match key.as_str() {
                 "GOOGLE_GEMINI_BASE_URL" => {
-                    out_lines.push(format!("GOOGLE_GEMINI_BASE_URL={base_url}/v1beta"));
+                    out_lines.push(format!("GOOGLE_GEMINI_BASE_URL={base_url}"));
                     seen.insert(key);
                 }
                 "GEMINI_MODEL" => {
@@ -401,7 +407,7 @@ fn merge_gemini_env(existing: Option<&str>, base_url: &str, model: &str) -> Stri
     }
 
     if !seen.contains("GOOGLE_GEMINI_BASE_URL") {
-        out_lines.push(format!("GOOGLE_GEMINI_BASE_URL={base_url}/v1beta"));
+        out_lines.push(format!("GOOGLE_GEMINI_BASE_URL={base_url}"));
     }
     if !has_api_key {
         out_lines.push(format!("GEMINI_API_KEY={GEMINI_PROXY_API_KEY}"));
@@ -584,7 +590,7 @@ fn print_setup_guide(
         match configure_gemini_cli(cfg, GEMINI_DEFAULT_MODEL) {
             Ok(p) => {
                 println!(
-                    "  Set GOOGLE_GEMINI_BASE_URL=http://{}:{}/v1beta and GEMINI_MODEL={GEMINI_DEFAULT_MODEL}\n  in:\n    {}",
+                    "  Set GOOGLE_GEMINI_BASE_URL=http://{}:{} and GEMINI_MODEL={GEMINI_DEFAULT_MODEL}\n  in:\n    {}",
                     cfg.address,
                     cfg.port,
                     p.display()
@@ -594,7 +600,7 @@ fn print_setup_guide(
             Err(e) => {
                 println!("  Failed to update Gemini CLI settings: {e}");
                 println!(
-                    "  Manually set GOOGLE_GEMINI_BASE_URL=http://{}:{}/v1beta in ~/.gemini/.env",
+                    "  Manually set GOOGLE_GEMINI_BASE_URL=http://{}:{} in ~/.gemini/.env",
                     cfg.address, cfg.port
                 );
             }
@@ -1048,10 +1054,18 @@ mod tests {
     #[test]
     fn gemini_env_new_file() {
         let out = super::merge_gemini_env(None, "http://127.0.0.1:8314", "gemini-2.5-pro");
-        assert!(out.contains("GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:8314/v1beta"));
+        assert!(out.contains("GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:8314\n"));
         assert!(out.contains("GEMINI_API_KEY=ghc-proxy"));
         assert!(out.contains("GEMINI_MODEL=gemini-2.5-pro"));
         assert!(out.contains("GEMINI_TELEMETRY_ENABLED=false"));
+    }
+
+    #[test]
+    fn gemini_env_carries_no_api_version() {
+        // The Gen AI SDK appends `v1beta` to whatever base URL it is given, so
+        // spelling it here would send `/v1beta/v1beta/models/...`.
+        let out = super::merge_gemini_env(None, "http://127.0.0.1:8314", "m");
+        assert!(!out.contains("v1beta"));
     }
 
     #[test]
@@ -1064,9 +1078,10 @@ mod tests {
         // User key untouched.
         assert!(out.contains("GEMINI_API_KEY=real-key"));
         assert!(!out.contains("GEMINI_API_KEY=ghc-proxy"));
-        // Base URL updated to the new value (old removed).
-        assert!(out.contains("GOOGLE_GEMINI_BASE_URL=http://x/v1beta"));
-        assert!(!out.contains("http://old/v1beta"));
+        // Base URL updated to the new value, stale version suffix dropped.
+        assert!(out.contains("GOOGLE_GEMINI_BASE_URL=http://x\n"));
+        assert!(!out.contains("http://old"));
+        assert!(!out.contains("v1beta"));
     }
 
     #[test]

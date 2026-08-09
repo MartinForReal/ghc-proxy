@@ -343,7 +343,10 @@ counts, estimated cost, and prompt-cache hit rate.
   advertises an extended context window.
 - **Retry with backoff** — upstream connection errors are retried with
   exponential backoff; retryable upstream HTTP errors are also retried
-  (`max_connection_retries`).
+  (`max_connection_retries`). `/v1/messages/count_tokens` is exempt: clients
+  call it before every turn, so a backoff there stalls the turn only to arrive
+  at the local estimate anyway. A `429` from it also pauses upstream counting
+  for 60 seconds rather than re-asking a limiter that has already refused.
 - **Orphaned tool-result recovery** — when the upstream rejects a request for an
   orphaned `tool_use_id`, the proxy retries with the offending tool results
   stripped.

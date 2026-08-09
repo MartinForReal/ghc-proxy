@@ -2227,12 +2227,13 @@ async fn count_tokens(
     // serve it. Copilot's catalog does not advertise
     // `/v1/messages/count_tokens` separately, so any model exposing the native
     // Anthropic `/v1/messages` surface is worth trying.
-    let native_count = state
-        .model_supports_endpoint(&translated, "/v1/messages/count_tokens")
-        .await
-        || state
-            .model_supports_endpoint(&translated, "/v1/messages")
-            .await;
+    let native_count = !state.upstream_counting_paused()
+        && (state
+            .model_supports_endpoint(&translated, "/v1/messages/count_tokens")
+            .await
+            || state
+                .model_supports_endpoint(&translated, "/v1/messages")
+                .await);
     if native_count {
         let vision = anthropic::has_image(&req);
         let mut headers = state.copilot_headers(vision).await;
@@ -2249,9 +2250,10 @@ async fn count_tokens(
         let url = format!("{}/v1/messages/count_tokens", state.copilot_base_url());
         let payload =
             serde_json::to_vec(&anthropic::sanitize_anthropic_request(&req)).unwrap_or_default();
-        if let Some(resp) =
-            util::post_with_retry(&state, &url, headers, payload, "/v1/messages/count_tokens").await
-        {
+        // Deliberately not retried: clients call this before every turn, so a
+        // backoff here stalls the turn only to arrive at the local estimate
+        // anyway.
+        if let Some(resp) = util::post_once(&state, &url, headers, payload).await {
             let status = resp.status();
             if status.is_success() {
                 let parsed: Value = resp.json().await.unwrap_or(json!({"input_tokens": 1}));
@@ -2259,6 +2261,9 @@ async fn count_tokens(
                     return Json(parsed).into_response();
                 }
             } else {
+                if status == StatusCode::TOO_MANY_REQUESTS {
+                    state.pause_upstream_counting();
+                }
                 tracing::debug!(
                     "[count_tokens] upstream returned {status} for '{translated}'; \
                      falling back to a local estimate"
