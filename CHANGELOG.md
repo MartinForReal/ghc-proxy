@@ -4,6 +4,92 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.4.2] - 2026-08-09
+
+### Added
+- **The `[1m]` context variant works on any model.** Claude Desktop's
+  `supports1m` offers a 1M-context variant beside the standard one and names it
+  `<id>[1m]` on the wire. That suffix was only understood through a hand-written
+  table of aliases, so any id missing from it answered 404 —
+  `claude-haiku-4.5[1m]` and `sonnet[1m]` among them. The suffix is now stripped
+  generically, but only after the configured mappings have been tried on the
+  full id, so a hand-written `[1m]` entry still wins.
+
+  The suffix also means something now. `context-1m-2025-08-07` used to be
+  derived from the catalog alone, which put *every* request on the
+  extended-context tier and left the standard variant with nothing to
+  distinguish it. It is opt-in through the variant, still gated on the model
+  actually advertising the window.
+- `GET /v1/models` reports `context_window`, `max_output_tokens` and
+  `supports_1m_context`, so an operator can see which ids are worth marking
+  `supports1m` without fetching each model separately.
+- **An opt-in one-hour prompt-cache TTL.** A `cache_control` breakpoint with no
+  `ttl` gets the five-minute tier, which is short enough to be self-defeating on
+  long turns: the entry is written during prefill, so a turn that itself runs
+  longer than five minutes has already outlived its own cache by the time it
+  finishes, and the next turn pays a full cold prefill of the whole
+  conversation. Observed live — a 341s turn left a 353s gap to the next, whose
+  prefix was byte-identical, and it still read zero cached tokens and
+  re-prefilled 223K.
+
+  `extend_cache_ttl` fills in `ttl = "1h"` where the client left it unset, and
+  leaves an explicit `ttl` exactly as sent. Off by default: extended writes bill
+  at a higher rate while reads cost the same, so on a conversation doing many
+  small incremental writes between rare expiries it costs more than it saves.
+
+### Fixed
+- **Streams truncated during tool-argument silence.** Copilot withholds
+  `input_json_delta` until a tool call's argument JSON is complete, so a healthy
+  stream can go minutes without a byte. The upstream client set no TCP or HTTP/2
+  keepalive, leaving the socket completely idle in that window — long enough for
+  a load balancer, NAT or corporate middlebox to reap it. The truncated body
+  reached Claude Code as "Server error mid-response". Two captured failures on
+  `claude-opus-5` died at the same point after 55.8s and 85.5s of silence; the
+  900s read timeout was never reached.
+
+  The error source chain is now recorded too, since reqwest renders a dropped
+  body as the fixed string "error decoding response body" and every distinct
+  cause looked identical in the logs.
+- **Upstream errors on the Anthropic surface arrived in OpenAI's shape.**
+  `{"error": {"message": ...}}` carries neither the top-level `"type": "error"`
+  nor the `error.type` Anthropic clients match on, so a well-formed rejection
+  looked like a malformed response to the SDK. Seen when Claude Code's WebSearch
+  subagent sends `web_search_20250305`, which Copilot does not implement. The
+  status is mapped onto the matching Anthropic error type with the upstream
+  message kept; an upstream already speaking Anthropic is forwarded untouched,
+  and the OpenAI, Responses and embeddings paths still pass through verbatim.
+- **The Gemini CLI setup produced a configuration that could not work.**
+  `GOOGLE_GEMINI_BASE_URL` carried an API version, but the Gen AI SDK appends
+  its own, so every request went to `/v1beta/v1beta/models/...` and 404ed before
+  reaching a handler. The default model written was `gemini-2.5-pro`, which
+  Copilot has never served, and there were no `gemini-*` mappings at all. A
+  catch-all `gemini-` prefix now resolves to the pro tier, with the flash
+  spellings listed separately so longest-match keeps a flash request on a flash
+  model rather than silently upgrading it. Config version 5 seeds these into
+  existing files, leaving any id the user already pointed somewhere untouched.
+- **`count_tokens` stalled under a rate limit.** It inherited the shared retry
+  helper, so a 429 cost up to 14s of backoff before falling through to the local
+  estimate it would have produced immediately — and clients call it before every
+  turn. It now issues a single request, and a 429 pauses upstream counting for
+  60s instead of re-asking a limiter that has already refused.
+- **The generated Codex config could not start.** `model_context_window` was
+  never written, so Codex budgeted from its own table sized for OpenAI's public
+  limits while Copilot serves the same slugs with different windows (1,050,000
+  for `gpt-5.5`, 264,000 for `gpt-5-mini`); it is now read from the live catalog
+  for whichever model ends up selected. An explicitly chosen `model` was
+  overwritten on every run, and is now left alone. The proxy's `api_key` was not
+  passed at all — and naming it through `env_key` does not work, because Codex
+  fails a turn when the named variable is unset and the key can come from
+  `config.yaml` with nothing ever exported, so it is written as a static
+  `Authorization` header instead.
+
+### Changed
+- The four full-id `[1m]` alias entries were dropped from the default model
+  table: prefix matching already resolved them and generic suffix stripping
+  covers the rest. The bare aliases stay — stripping `4-8[1m]` leaves `4-8`,
+  which nothing else maps. Existing installs are unaffected, since the
+  migrations only insert keys and never remove them.
+
 ## [1.4.1] - 2026-08-03
 
 ### Fixed
