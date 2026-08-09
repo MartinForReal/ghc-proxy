@@ -103,9 +103,12 @@ slugs with different windows (1,050,000 for `gpt-5.5`, 264,000 for
 is skipped when the catalog cannot be reached.
 
 When the proxy is configured with an `api_key`, the provider block also gets
-`env_key = "GHC_PROXY_API_KEY"` — the same variable the proxy reads, so one
-exported value serves both sides. It is omitted otherwise, because Codex fails
-a turn when a provider names an environment variable that is not set.
+`http_headers = { Authorization = "Bearer <key>" }`. Codex otherwise only reads
+credentials from an environment variable named by `env_key`, and it fails a
+turn when that variable is unset — which is exactly what happens when the key
+lives in `config.yaml` and was never exported. The value is written literally
+because it only opens the local proxy; the credential that reaches GitHub is
+the Copilot token the proxy holds. Nothing is written when no key is set.
 
 ### Manual setup
 

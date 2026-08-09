@@ -284,7 +284,7 @@ fn merge_codex_config(
     base_url: &str,
     model: &str,
     context_window: Option<u64>,
-    api_key_required: bool,
+    api_key: Option<&str>,
 ) -> Result<(String, String), String> {
     use toml::Value;
     let mut root: Value = match existing {
@@ -331,13 +331,17 @@ fn merge_codex_config(
         "wire_api".to_string(),
         Value::String("responses".to_string()),
     );
-    // Only when the proxy actually demands a key: Codex refuses to start a turn
-    // when a provider names an env var that is not set.
-    if api_key_required {
-        provider.insert(
-            "env_key".to_string(),
-            Value::String("GHC_PROXY_API_KEY".to_string()),
+    // Codex takes credentials from an env var or from static headers, and it
+    // fails a turn when a named env var is unset. This key only opens the local
+    // proxy — upstream auth is the Copilot token — so it is written literally
+    // rather than made to depend on the user exporting anything.
+    if let Some(key) = api_key {
+        let mut headers = toml::map::Map::new();
+        headers.insert(
+            "Authorization".to_string(),
+            Value::String(format!("Bearer {key}")),
         );
+        provider.insert("http_headers".to_string(), Value::Table(headers));
     }
     providers.insert(CODEX_PROVIDER_ID.to_string(), Value::Table(provider));
 
@@ -369,7 +373,7 @@ fn configure_codex(
         &base_url,
         model,
         context_window,
-        cfg.api_key.as_ref().is_some_and(|k| !k.is_empty()),
+        cfg.api_key.as_deref().filter(|k| !k.is_empty()),
     )
     .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
@@ -1119,7 +1123,7 @@ mod tests {
             "http://127.0.0.1:8314",
             "gpt-5.5",
             Some(1_050_000),
-            false,
+            None,
         )
         .unwrap();
         assert_eq!(selected, "gpt-5.5");
@@ -1135,19 +1139,25 @@ mod tests {
             v["model_providers"]["ghc-proxy"]["wire_api"].as_str(),
             Some("responses")
         );
-        // No key configured, so naming an env var Codex would find unset only
-        // breaks startup.
+        // Nothing to authenticate against, so no credential is written at all.
+        assert!(v["model_providers"]["ghc-proxy"]
+            .get("http_headers")
+            .is_none());
         assert!(v["model_providers"]["ghc-proxy"].get("env_key").is_none());
     }
 
+    /// Codex fails a turn when a provider names an env var that is not set, and
+    /// the proxy's key can come from `config.yaml` with nothing ever exported.
     #[test]
-    fn codex_config_names_the_key_env_var_when_the_proxy_needs_one() {
-        let (out, _) = merge_codex_config(None, "http://x", "gpt-5.5", None, true).unwrap();
+    fn codex_config_sends_the_key_without_relying_on_the_environment() {
+        let (out, _) =
+            merge_codex_config(None, "http://x", "gpt-5.5", None, Some("s3cret")).unwrap();
         let v: toml::Value = toml::from_str(&out).unwrap();
         assert_eq!(
-            v["model_providers"]["ghc-proxy"]["env_key"].as_str(),
-            Some("GHC_PROXY_API_KEY")
+            v["model_providers"]["ghc-proxy"]["http_headers"]["Authorization"].as_str(),
+            Some("Bearer s3cret")
         );
+        assert!(v["model_providers"]["ghc-proxy"].get("env_key").is_none());
     }
 
     /// The model is an explicit user choice; only the provider has to point here.
@@ -1155,7 +1165,7 @@ mod tests {
     fn codex_config_keeps_a_model_the_user_already_chose() {
         let existing = "model = \"gpt-5.6-sol\"\nmodel_provider = \"other\"\n";
         let (out, selected) =
-            merge_codex_config(Some(existing), "http://x", "gpt-5.5", None, false).unwrap();
+            merge_codex_config(Some(existing), "http://x", "gpt-5.5", None, None).unwrap();
         assert_eq!(selected, "gpt-5.6-sol");
         let v: toml::Value = toml::from_str(&out).unwrap();
         assert_eq!(v["model"].as_str(), Some("gpt-5.6-sol"));
@@ -1166,7 +1176,7 @@ mod tests {
     fn codex_config_preserves_existing_keys() {
         let existing = "approval_policy = \"on-request\"\n[tui]\ntheme = \"dark\"\n";
         let (out, _) =
-            merge_codex_config(Some(existing), "http://x", "gpt-5.5", None, false).unwrap();
+            merge_codex_config(Some(existing), "http://x", "gpt-5.5", None, None).unwrap();
         let v: toml::Value = toml::from_str(&out).unwrap();
         // Unrelated keys preserved.
         assert_eq!(v["approval_policy"].as_str(), Some("on-request"));
@@ -1179,7 +1189,7 @@ mod tests {
 
     #[test]
     fn codex_config_rejects_invalid_toml() {
-        assert!(merge_codex_config(Some("=not valid="), "http://x", "m", None, false).is_err());
+        assert!(merge_codex_config(Some("=not valid="), "http://x", "m", None, None).is_err());
     }
 
     #[test]
