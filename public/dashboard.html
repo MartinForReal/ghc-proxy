@@ -503,9 +503,11 @@
       document.getElementById('modelsBody').innerHTML = models.map(m => {
         const context = m.context_window == null ? '—' : compact(m.context_window);
         const output = m.max_output_tokens == null ? '—' : compact(m.max_output_tokens);
-        const extended = m.supports_1m_context
-          ? '<span class="status-ok">yes</span>'
-          : '<span class="muted">no</span>';
+        const extended = m.supports_1m_context == null
+          ? '<span class="muted">—</span>'
+          : m.supports_1m_context
+            ? '<span class="status-ok">yes</span>'
+            : '<span class="muted">no</span>';
         return `<tr>
           <td class="mono">${esc(m.id)}</td>
           <td>${esc(m.display_name)}</td>
