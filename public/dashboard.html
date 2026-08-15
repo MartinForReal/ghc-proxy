@@ -86,9 +86,16 @@
          it cannot dominate the page you open to check spend. -->
     <details class="panel fold">
       <summary id="modelsSummary">Supported models</summary>
-      <div class="panel-body flush scroll-y">
+      <div class="panel-body flush scroll-y scroll-x">
         <table>
-          <thead><tr><th>ID</th><th>Display name</th><th>Owned by</th></tr></thead>
+          <thead>
+            <tr>
+              <th>ID</th><th>Display name</th><th>Owned by</th>
+              <th class="num">Context window</th>
+              <th class="num">Max output</th>
+              <th class="num">1M context</th>
+            </tr>
+          </thead>
           <tbody id="modelsBody"></tbody>
         </table>
       </div>
@@ -493,9 +500,21 @@
       const data = await (await fetch('/api/models')).json();
       const models = (data && data.data) || [];
       document.getElementById('modelsSummary').textContent = `Supported models (${models.length})`;
-      document.getElementById('modelsBody').innerHTML = models.map(m =>
-        `<tr><td class="mono">${esc(m.id)}</td><td>${esc(m.display_name)}</td><td class="muted">${esc(m.owned_by)}</td></tr>`
-      ).join('');
+      document.getElementById('modelsBody').innerHTML = models.map(m => {
+        const context = m.context_window == null ? '—' : compact(m.context_window);
+        const output = m.max_output_tokens == null ? '—' : compact(m.max_output_tokens);
+        const extended = m.supports_1m_context
+          ? '<span class="status-ok">yes</span>'
+          : '<span class="muted">no</span>';
+        return `<tr>
+          <td class="mono">${esc(m.id)}</td>
+          <td>${esc(m.display_name)}</td>
+          <td class="muted">${esc(m.owned_by)}</td>
+          <td class="num">${context}</td>
+          <td class="num">${output}</td>
+          <td class="num">${extended}</td>
+        </tr>`;
+      }).join('');
     }
 
     async function refresh() {
