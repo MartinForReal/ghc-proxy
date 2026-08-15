@@ -71,6 +71,9 @@ The GitHub token is exchanged for a short-lived **Copilot token** via
 `https://api.github.com/copilot_internal/v2/token`, which the proxy refreshes
 automatically before it expires.
 
+All inference requests use GitHub Copilot. The retired GitHub Models inference
+service is no longer supported.
+
 The Device Flow requests the `read:user copilot` scopes.
 
 To authenticate without starting the server (useful for CI/headless setups):
