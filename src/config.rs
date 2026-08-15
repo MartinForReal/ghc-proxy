@@ -25,12 +25,19 @@ pub const COPILOT_VERSION: &str = "0.48.1";
 /// configuration.
 pub const CONFIG_VERSION: u32 = 6;
 
-/// Default model name that Claude "opus"/"sonnet" requests are mapped to.
+/// Default model name that Claude "opus" requests are mapped to.
 ///
 /// The catalog carries `claude-opus-4.6` through `claude-opus-5`; this is the
 /// newest generally-available one, and it matches 4.8 on every published
 /// capability -- 1M context, 64k output, billing multiplier 1, vision.
 pub const DEFAULT_OPUS: &str = "claude-opus-5";
+/// Default model name that Claude "sonnet" requests are mapped to.
+///
+/// The catalog carries `claude-sonnet-5` alongside `claude-opus-5`; unlike the
+/// Opus aliases, a Sonnet spelling resolves to the newest Sonnet rather than
+/// being folded into Opus, since a caller that asked for the mid tier expects
+/// its cost and rate limits, not the top one's.
+pub const DEFAULT_SONNET: &str = "claude-sonnet-5";
 /// Default model name that Claude "haiku" requests are mapped to.
 pub const DEFAULT_HAIKU: &str = "claude-haiku-4.5";
 /// Default model name that Gemini requests are mapped to.
@@ -248,19 +255,24 @@ impl Config {
 /// Built-in default model mappings (mirrors ghc-tunnel defaults).
 pub fn default_model_mappings() -> ModelMappings {
     let opus = DEFAULT_OPUS.to_string();
+    let sonnet = DEFAULT_SONNET.to_string();
     let haiku = DEFAULT_HAIKU.to_string();
     let mut exact = BTreeMap::new();
     for k in [
-        "opus", "sonnet", "opus4-7", "opus4-8", "opus5", "4-7[1m]", "4-8[1m]", "5[1m]",
+        "opus", "opus4-7", "opus4-8", "opus5", "4-7[1m]", "4-8[1m]", "5[1m]",
     ] {
         exact.insert(k.to_string(), opus.clone());
     }
+    exact.insert("sonnet".to_string(), sonnet.clone());
     exact.insert("haiku".to_string(), haiku.clone());
 
-    // Every spelling of a Claude model resolves to the current best one. The
-    // list is exhaustive rather than pattern-based because a request naming a
-    // model that has since been superseded should still be served, and because
-    // Anthropic writes the same version two ways (`4.8` and `4-8`).
+    // Every spelling of a Claude model resolves to the current best one in its
+    // own tier. The list is exhaustive rather than pattern-based because a
+    // request naming a model that has since been superseded should still be
+    // served, and because Anthropic writes the same version two ways (`4.8`
+    // and `4-8`). Sonnet spellings resolve to the newest Sonnet rather than
+    // being folded into Opus, so a caller that asked for the mid tier keeps
+    // its cost and rate limits.
     //
     // Full ids need no `[1m]` spelling of their own: the suffix is stripped
     // generically, and a prefix entry matches the suffixed id anyway. Only the
@@ -268,7 +280,6 @@ pub fn default_model_mappings() -> ModelMappings {
     // leaves `4-8`, which nothing else maps.
     let mut prefix = BTreeMap::new();
     for k in [
-        "claude-sonnet-4-",
         "claude-opus-4.5-",
         "claude-opus-4.6-",
         "claude-opus-4.7-",
@@ -286,6 +297,11 @@ pub fn default_model_mappings() -> ModelMappings {
         "claude-opus-4-6",
         "claude-opus-4-7",
         "claude-opus-4-8",
+    ] {
+        prefix.insert(k.to_string(), opus.clone());
+    }
+    for k in [
+        "claude-sonnet-4-",
         "claude-sonnet-4-7",
         "claude-sonnet-4-8",
         "claude-sonnet-4-6",
@@ -294,7 +310,7 @@ pub fn default_model_mappings() -> ModelMappings {
         "claude-sonnet-5-",
         "claude-sonnet-5",
     ] {
-        prefix.insert(k.to_string(), opus.clone());
+        prefix.insert(k.to_string(), sonnet.clone());
     }
     for k in ["claude-haiku-4.5-", "claude-haiku-4-5-"] {
         prefix.insert(k.to_string(), haiku.clone());
@@ -797,24 +813,24 @@ fn migrate_config(cfg: &mut Config) -> bool {
         // rewrite. Existing mappings keep pointing where they were told to;
         // `--setup` or `--default` is how a user asks for the new defaults.
         let opus = DEFAULT_OPUS.to_string();
+        let sonnet = DEFAULT_SONNET.to_string();
         for k in ["opus5", "5[1m]"] {
             cfg.model_mappings
                 .exact
                 .entry(k.to_string())
                 .or_insert_with(|| opus.clone());
         }
-        for k in [
-            "claude-opus-5-",
-            "claude-opus-5",
-            "claude-opus-5[1m]",
-            "claude-sonnet-5-",
-            "claude-sonnet-5",
-            "claude-sonnet-4.6",
-        ] {
+        for k in ["claude-opus-5-", "claude-opus-5", "claude-opus-5[1m]"] {
             cfg.model_mappings
                 .prefix
                 .entry(k.to_string())
                 .or_insert_with(|| opus.clone());
+        }
+        for k in ["claude-sonnet-5-", "claude-sonnet-5", "claude-sonnet-4.6"] {
+            cfg.model_mappings
+                .prefix
+                .entry(k.to_string())
+                .or_insert_with(|| sonnet.clone());
         }
     }
 
@@ -1015,7 +1031,7 @@ mod tests {
                 .prefix
                 .get("claude-sonnet-5")
                 .map(String::as_str),
-            Some(DEFAULT_OPUS)
+            Some(DEFAULT_SONNET)
         );
     }
 

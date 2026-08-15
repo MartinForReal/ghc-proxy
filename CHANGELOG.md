@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **`sonnet` now maps to Sonnet, not Opus.** The default model mappings folded
+  every Claude spelling — Sonnet included — into the newest Opus. That is
+  right for aliases actually named after a Claude version Copilot dropped, but
+  `sonnet` and every `claude-sonnet-*` spelling now resolve to `claude-sonnet-5`
+  instead, so a caller that asked for the mid tier gets its cost and rate
+  limits rather than being silently upgraded to Opus.
+
 ### Removed
 - Removed GitHub Models routing, catalog merging, token configuration, and setup
   now that the GitHub Models inference service has been retired. All model

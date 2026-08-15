@@ -183,10 +183,10 @@ auto_upgrade: true                  # self-update on startup; false to disable
 model_mappings:
   exact:
     opus: claude-opus-5
-    sonnet: claude-opus-5
+    sonnet: claude-sonnet-5
     haiku: claude-haiku-4.5
   prefix:
-    claude-sonnet-4-: claude-opus-5
+    claude-sonnet-4-: claude-sonnet-5
 system_prompt_remove: []
 system_prompt_add: []
 tool_result_suffix_remove: []

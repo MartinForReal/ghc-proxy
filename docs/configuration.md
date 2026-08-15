@@ -43,10 +43,10 @@ auto_upgrade: true
 model_mappings:
   exact:
     opus: claude-opus-5
-    sonnet: claude-opus-5
+    sonnet: claude-sonnet-5
     haiku: claude-haiku-4.5
   prefix:
-    claude-sonnet-4-: claude-opus-5
+    claude-sonnet-4-: claude-sonnet-5
 
 # Content filtering
 system_prompt_remove: []
@@ -77,8 +77,9 @@ Incoming model names are rewritten before the request is forwarded upstream:
 Exact matches take priority over prefix matches. Unmapped names pass through
 unchanged. Use the live catalog at `GET /v1/models` to discover valid targets.
 
-The built-in mappings point every Claude spelling at the newest generally
-available Opus — currently `claude-opus-5` — and every Haiku spelling at
+The built-in mappings point every Opus spelling at the newest generally
+available Opus — currently `claude-opus-5` — every Sonnet spelling at the
+newest Sonnet (`claude-sonnet-5`), and every Haiku spelling at
 `claude-haiku-4.5`. Anthropic writes the same version two ways (`4.8` and
 `4-8`), so both forms are listed.
 
