@@ -164,6 +164,9 @@ fn default_loaded_config_version() -> u32 {
 fn default_port() -> u16 {
     DEFAULT_PORT
 }
+fn default_true() -> bool {
+    true
+}
 fn default_account_type() -> String {
     "individual".to_string()
 }
@@ -240,7 +243,6 @@ impl Config {
     pub fn user_agent(&self) -> String {
         format!("GitHubCopilotChat/{}", self.copilot_version)
     }
-
 }
 
 /// Built-in default model mappings (mirrors ghc-tunnel defaults).
