@@ -326,10 +326,7 @@ fn extract_message_count(body: &Value) -> usize {
 /// `gpt-4`, `opus`/`sonnet`/`haiku` before the generic `claude` fallback).
 fn model_rates(model: &str) -> (f64, f64) {
     let m = model.to_ascii_lowercase();
-    // Strip a `publisher/` prefix so GitHub Models ids price like their base
-    // model (e.g. `openai/gpt-4o` -> `gpt-4o`).
-    let m = m.rsplit('/').next().unwrap_or(&m);
-    match m {
+    match m.as_str() {
         m if m.contains("opus") => (0.015, 0.075),
         m if m.contains("sonnet") => (0.003, 0.015),
         m if m.contains("haiku") => (0.0008, 0.004),
@@ -1017,13 +1014,8 @@ async fn chat_completions(State(state): State<SharedState>, body: Bytes) -> Resp
         req["model"] = Value::String(translated.clone());
     }
 
-    // GitHub Models requests use the raw GitHub token, not the Copilot token, so
-    // only ensure the Copilot token when the request routes to Copilot.
-    let to_github_models = state.config_snapshot().routes_to_github_models(&translated);
-    if !to_github_models {
-        if let Err(e) = state.ensure_copilot_token().await {
-            return error_response(StatusCode::INTERNAL_SERVER_ERROR, e);
-        }
+    if let Err(e) = state.ensure_copilot_token().await {
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, e);
     }
     if let Err(e) = state.apply_request_gate("/v1/chat/completions").await {
         return error_response(StatusCode::TOO_MANY_REQUESTS, e);
@@ -1032,10 +1024,9 @@ async fn chat_completions(State(state): State<SharedState>, body: Bytes) -> Resp
     // Some Copilot models are only reachable through `/responses` and answer a
     // chat-completions call with an opaque `unsupported_api_for_model` 400.
     // Turn that into an actionable message before spending the round trip.
-    if !to_github_models
-        && !state
-            .model_supports_endpoint(&translated, "/chat/completions")
-            .await
+    if !state
+        .model_supports_endpoint(&translated, "/chat/completions")
+        .await
         && state
             .model_supports_endpoint(&translated, "/responses")
             .await
@@ -1087,19 +1078,11 @@ async fn chat_completions(State(state): State<SharedState>, body: Bytes) -> Resp
         )
     });
 
-    let (url, mut headers, is_github_models) = state.chat_upstream(&translated, vision).await;
-    if !is_github_models {
-        set_initiator(&mut headers, agent);
-    }
+    let (url, mut headers) = state.chat_upstream(vision).await;
+    set_initiator(&mut headers, agent);
 
     let req_size = body.len();
     let is_stream = req.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
-    // GitHub Models (strict OpenAI-compatible) only emits a final usage chunk on
-    // streaming requests when asked. Copilot emits it unconditionally, so only
-    // opt in for GitHub Models and only when the client hasn't set its own.
-    if is_github_models && is_stream && req.get("stream_options").is_none() {
-        req["stream_options"] = json!({"include_usage": true});
-    }
     let payload = serde_json::to_vec(&req).unwrap_or_default();
     log_debug_request(&state, "/v1/chat/completions", &req);
 
@@ -1230,17 +1213,6 @@ async fn responses(State(state): State<SharedState>, body: Bytes) -> Response {
         req["model"] = Value::String(translated.clone());
     }
 
-    // /v1/responses is the Codex Responses API — Copilot-only.
-    // GitHub Models models (publisher/model convention) are not supported here.
-    if state.config_snapshot().routes_to_github_models(&translated) {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            format!(
-                "Model '{original_model}' routes to GitHub Models which does not support \
-                 the Responses API. Use /v1/chat/completions with '{translated}' instead."
-            ),
-        );
-    }
     if !state
         .model_supports_endpoint(&translated, "/responses")
         .await
@@ -1835,9 +1807,6 @@ async fn messages(
         req["model"] = Value::String(translated.clone());
     }
 
-    // /v1/messages is the Anthropic Messages API used by Claude Code.
-    // GitHub Models only exposes an OpenAI-compatible chat-completions surface,
-    // so we never route this endpoint there — always use Copilot.
     if let Err(e) = state.ensure_copilot_token().await {
         return anthropic_error(StatusCode::INTERNAL_SERVER_ERROR, e);
     }
@@ -2186,8 +2155,6 @@ async fn messages_translated(
                 })
             })
             .unwrap_or(false);
-        // /v1/messages always targets Copilot; GitHub Models routing is handled
-        // at the /v1/chat/completions level only.
         let url = format!("{}/chat/completions", state.copilot_base_url());
         let mut headers = state.copilot_headers(vision).await;
         set_initiator(&mut headers, agent);
@@ -2456,13 +2423,8 @@ async fn gemini_generate(
 
     let is_stream = action == "streamGenerateContent" || action == "streamgeneratecontent";
 
-    // GitHub Models uses the raw GitHub token; only ensure the Copilot token
-    // when the request routes to Copilot.
-    let to_github_models = state.config_snapshot().routes_to_github_models(&translated);
-    if !to_github_models {
-        if let Err(e) = state.ensure_copilot_token().await {
-            return gemini_error(StatusCode::INTERNAL_SERVER_ERROR, e);
-        }
+    if let Err(e) = state.ensure_copilot_token().await {
+        return gemini_error(StatusCode::INTERNAL_SERVER_ERROR, e);
     }
     if let Err(e) = state.apply_request_gate("/v1beta/models").await {
         return gemini_error(StatusCode::TOO_MANY_REQUESTS, e);
@@ -2471,10 +2433,8 @@ async fn gemini_generate(
     let openai_req = gemini::gemini_to_openai(&req, &translated, is_stream);
     let vision = gemini::has_image(&req);
     let agent = gemini::is_agent(&req);
-    let (url, mut headers, is_github_models) = state.chat_upstream(&translated, vision).await;
-    if !is_github_models {
-        set_initiator(&mut headers, agent);
-    }
+    let (url, mut headers) = state.chat_upstream(vision).await;
+    set_initiator(&mut headers, agent);
 
     let req_size = body.len();
     let payload = serde_json::to_vec(&openai_req).unwrap_or_default();
@@ -3001,9 +2961,8 @@ async fn stream_openai(
         };
         state.record_quota_headers(upstream.headers());
         let status = upstream.status().as_u16();
-        // A non-2xx upstream (e.g. GitHub Models returning 401/403 as JSON when
-        // the token lacks the `models: read` permission) is not an SSE stream —
-        // surface it as a normal error instead of forwarding a broken "stream".
+        // A non-2xx upstream is not an SSE stream; surface it as a normal error
+        // instead of forwarding a broken stream.
         if !is_streamable_status(status) {
             let text = upstream.text().await.unwrap_or_default();
             log_debug_response(&state, endpoint, &text);
@@ -4639,8 +4598,6 @@ mod tests {
         assert_eq!(model_rates("gpt-4o"), (0.005, 0.015));
         assert_eq!(model_rates("gpt-4-turbo"), (0.03, 0.06));
         assert_eq!(model_rates("gpt-4o-mini"), (0.00015, 0.0006));
-        // Publisher-qualified GitHub Models ids price like their base model.
-        assert_eq!(model_rates("openai/gpt-4o"), model_rates("gpt-4o"));
         // Claude tiers are distinct.
         assert_eq!(model_rates("claude-opus-4.8"), (0.015, 0.075));
         assert_eq!(model_rates("claude-haiku-4.5"), (0.0008, 0.004));

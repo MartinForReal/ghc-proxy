@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Removed
+- Removed GitHub Models routing, catalog merging, token configuration, and setup
+  now that the GitHub Models inference service has been retired. All model
+  requests now use GitHub Copilot.
+
 ## [1.4.3] - 2026-08-09
 
 ### Added
