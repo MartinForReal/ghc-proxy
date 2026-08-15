@@ -212,6 +212,9 @@ upstream_read_timeout_seconds: 900   # max silence from upstream; 0 disables
 | `POST /v1beta/models/{model}:generateContent` | Gemini generate content |
 | `POST /v1beta/models/{model}:streamGenerateContent` | Gemini streaming (SSE) |
 | `POST /v1beta/models/{model}:countTokens` | Gemini token counting |
+| `POST /v1/embeddings` | Embeddings (also `/embeddings`) |
+| `GET /v1/models/full/` | Raw upstream model catalog with capabilities |
+| `GET /usage` | Copilot plan and quota usage (also `check-usage`) |
 | `GET /health` | Liveness/readiness probe (`?strict=true` for 503 when not ready) |
 | `GET /openapi.json` | OpenAPI v3 specification |
 | `GET /` | Web dashboard — overview |
@@ -223,6 +226,9 @@ upstream_read_timeout_seconds: 900   # max silence from upstream; 0 disables
 | `POST /api/config/debug` | Turn body capture on or off (`{"debug": true}`) |
 | `GET /api/stats` | Running totals, including what Copilot billed |
 | `GET /api/cache` | Prompt-cache statistics, overall and per model |
+| `GET /api/requests` | Recent requests (JSON) |
+| `GET /api/audit` | Filtered audit records |
+| `GET /api/audit/summary` | Aggregated audit summary |
 | `GET /api/models` | All supported models (used by the dashboard) |
 
 The `/api/config/` routes are guarded by the API key when one is configured;
@@ -276,6 +282,7 @@ cargo clippy     # lint
 | File | Responsibility |
 |------|----------------|
 | `src/main.rs` | CLI parsing and server startup |
+| `src/lib.rs` | Library crate root re-exporting the modules below |
 | `src/setup.rs` | Interactive first-run setup wizard |
 | `src/config.rs` | Config dir, YAML config, defaults, model-mapping defaults |
 | `src/auth.rs` | GitHub token resolution (env/file/Device Flow), Copilot token exchange |

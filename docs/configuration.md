@@ -43,7 +43,7 @@ auto_upgrade: true
 model_mappings:
   exact:
     opus: claude-opus-5
-    sonnet: claude-sonnet-5
+    sonnet: claude-opus-5
     haiku: claude-haiku-4.5
   prefix:
     claude-sonnet-4-: claude-opus-5
@@ -119,6 +119,8 @@ Schema versions so far:
 | 2 | Opus 4.8 aliases |
 | 3 | `upstream_read_timeout_seconds`; `auto_upgrade` defaulting to true |
 | 4 | Opus 5 and Sonnet 5 aliases |
+| 5 | Gemini CLI model mappings (`gemini-*` prefixes) |
+| 6 | Removed the retired GitHub Models settings from persisted configuration |
 
 `--update-config` remains for the other, non-schema write-backs (for example
 restoring the built-in `model_mappings` when the file has none).
