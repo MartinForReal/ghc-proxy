@@ -1,7 +1,7 @@
 //! Authentication: GitHub token acquisition (environment variable, token file,
 //! or Device Flow) and Copilot token exchange / refresh.
 
-use crate::config::{config_dir, GITHUB_API, GITHUB_CLIENT_ID, GITHUB_MODELS_BASE};
+use crate::config::{config_dir, GITHUB_API, GITHUB_CLIENT_ID};
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -124,12 +124,6 @@ pub async fn device_flow(client: &reqwest::Client) -> Option<String> {
         .header("Accept", "application/json")
         .form(&[
             ("client_id", GITHUB_CLIENT_ID),
-            // Only request scopes the Copilot OAuth app supports. `models` is
-            // NOT a valid classic OAuth scope, so requesting it here makes the
-            // device-code request fail with `invalid_scope`, blocking all
-            // authentication. GitHub Models (https://models.github.ai) instead
-            // needs a fine-grained PAT with the `models: read` permission,
-            // supplied via `github_models.token` in the config.
             ("scope", "read:user copilot"),
         ])
         .send()
@@ -247,55 +241,6 @@ pub async fn resolve_github_token(client: &reqwest::Client) -> Option<String> {
     let token = device_flow(client).await?;
     save_token(&token);
     Some(token)
-}
-
-/// Checks whether a token can access the GitHub Models inference API by
-/// requesting the model catalog (`GET /catalog/models`) with it. Returns the
-/// number of catalog entries on success, or an error describing the failure
-/// (e.g. an HTTP `401`/`403` when the token lacks the `models: read`
-/// permission). Used by the setup wizard to validate a GitHub Models token
-/// before saving it.
-pub async fn check_models_token_access(
-    client: &reqwest::Client,
-    token: &str,
-    api_version: &str,
-) -> Result<usize, String> {
-    let url = format!("{GITHUB_MODELS_BASE}/catalog/models");
-    let resp = client
-        .get(&url)
-        .header("Authorization", format!("Bearer {token}"))
-        .header("Accept", "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", api_version)
-        .header("User-Agent", "ghc-proxy")
-        .timeout(Duration::from_secs(15))
-        .send()
-        .await
-        .map_err(|e| format!("request failed: {e}"))?;
-    let status = resp.status();
-    if !status.is_success() {
-        return Err(format!("catalog request returned {status}"));
-    }
-    let catalog: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("failed to parse catalog: {e}"))?;
-    let count = catalog
-        .as_array()
-        .map(|a| a.len())
-        .or_else(|| {
-            catalog
-                .get("models")
-                .and_then(|m| m.as_array())
-                .map(|a| a.len())
-        })
-        .or_else(|| {
-            catalog
-                .get("data")
-                .and_then(|d| d.as_array())
-                .map(|a| a.len())
-        })
-        .unwrap_or(0);
-    Ok(count)
 }
 
 #[derive(Debug, Deserialize)]

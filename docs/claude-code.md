@@ -63,9 +63,10 @@ model_mappings:
     claude-opus-4-8: claude-opus-5
 ```
 
-The built-in defaults already do this for every Claude spelling. They apply to
-a *new* config file only — an existing one keeps the targets it has, so if you
-wrote yours before Opus 5 shipped, either edit it or re-run `--setup`.
+The built-in defaults already do this for every Opus and Sonnet spelling. They
+apply to a *new* config file only — an existing one keeps the targets it has,
+so if you wrote yours before Opus 5 shipped, either edit it or re-run
+`--setup`.
 
 Restart the proxy after editing `config.yaml` — mappings are read at startup.
 

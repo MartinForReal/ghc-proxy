@@ -58,20 +58,21 @@ mod tests {
     use super::*;
     use crate::config::{
         default_model_mappings, DEFAULT_GEMINI_FLASH, DEFAULT_GEMINI_PRO, DEFAULT_HAIKU,
-        DEFAULT_OPUS,
+        DEFAULT_OPUS, DEFAULT_SONNET,
     };
 
     #[test]
     fn exact_mapping_wins() {
         let m = default_model_mappings();
         assert_eq!(translate(&m, "opus"), DEFAULT_OPUS);
+        assert_eq!(translate(&m, "sonnet"), DEFAULT_SONNET);
         assert_eq!(translate(&m, "haiku"), DEFAULT_HAIKU);
     }
 
     #[test]
     fn prefix_mapping_applies() {
         let m = default_model_mappings();
-        assert_eq!(translate(&m, "claude-sonnet-4-20250101"), DEFAULT_OPUS);
+        assert_eq!(translate(&m, "claude-sonnet-4-20250101"), DEFAULT_SONNET);
         assert_eq!(translate(&m, "claude-haiku-4.5-20250101"), DEFAULT_HAIKU);
     }
 
@@ -131,7 +132,7 @@ mod tests {
     fn any_model_accepts_the_1m_suffix() {
         let m = default_model_mappings();
         assert_eq!(translate(&m, "claude-haiku-4.5[1m]"), DEFAULT_HAIKU);
-        assert_eq!(translate(&m, "sonnet[1m]"), DEFAULT_OPUS);
+        assert_eq!(translate(&m, "sonnet[1m]"), DEFAULT_SONNET);
         assert_eq!(translate(&m, "gpt-4o[1m]"), "gpt-4o");
     }
 

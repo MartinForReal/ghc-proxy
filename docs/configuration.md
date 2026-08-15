@@ -21,7 +21,7 @@ Windows). Generated on first run, with `--config`, or through the setup wizard.
 
 ```yaml
 # Schema version for migration/write-back behavior
-config_version: 4
+config_version: 6
 
 # Server settings
 address: 127.0.0.1
@@ -46,15 +46,7 @@ model_mappings:
     sonnet: claude-sonnet-5
     haiku: claude-haiku-4.5
   prefix:
-    claude-sonnet-4-: claude-opus-5
-
-# GitHub Models (https://models.github.ai) inference
-# Route publisher/model ids (e.g. openai/gpt-4o) to GitHub Models instead of
-# Copilot. Needs a token with the `models: read` permission (fine-grained PAT).
-github_models:
-  enabled: true
-  # org: my-org
-  # token: ghp_xxx
+    claude-sonnet-4-: claude-sonnet-5
 
 # Content filtering
 system_prompt_remove: []
@@ -85,8 +77,9 @@ Incoming model names are rewritten before the request is forwarded upstream:
 Exact matches take priority over prefix matches. Unmapped names pass through
 unchanged. Use the live catalog at `GET /v1/models` to discover valid targets.
 
-The built-in mappings point every Claude spelling at the newest generally
-available Opus — currently `claude-opus-5` — and every Haiku spelling at
+The built-in mappings point every Opus spelling at the newest generally
+available Opus — currently `claude-opus-5` — every Sonnet spelling at the
+newest Sonnet (`claude-sonnet-5`), and every Haiku spelling at
 `claude-haiku-4.5`. Anthropic writes the same version two ways (`4.8` and
 `4-8`), so both forms are listed.
 
@@ -104,26 +97,6 @@ Controls the upstream base URL only:
 | `enterprise`   | `https://api.enterprise.githubcopilot.com` |
 
 Set this to match the Copilot seat your token actually has.
-
-### GitHub Models
-
-[GitHub Models](https://models.github.ai) is GitHub's OpenAI-compatible model
-**inference** service, separate from Copilot. When `github_models.enabled` is
-true (the default), any request whose *translated* model id uses the
-`publisher/model` form (contains a `/`, e.g. `openai/gpt-4o`) is routed there
-instead of Copilot. These ids never collide with Copilot ids, so mappings and
-existing behavior are unaffected. Routing applies to `/v1/chat/completions`,
-`/v1/messages` (translated), and the Gemini endpoints.
-
-GitHub Models authenticates with the **raw GitHub token** (not the Copilot
-token) via `Authorization: Bearer`. That token must carry the **`models: read`**
-permission (a fine-grained PAT). This is **not** covered by the Device Flow login
-(`models` is not a valid classic OAuth scope), so supply a dedicated token via
-`github_models.token` (or `GHC_PROXY_GITHUB_MODELS_TOKEN`); otherwise GitHub
-Models requests fall back to the Device Flow token, which lacks this permission.
-The [setup wizard](getting-started.md#the-setup-wizard) can capture and validate
-this token for you. Set `github_models.org` to attribute inference to an
-organization. The catalog is merged into `GET /v1/models`.
 
 ### Schema upgrades
 
@@ -147,6 +120,8 @@ Schema versions so far:
 | 2 | Opus 4.8 aliases |
 | 3 | `upstream_read_timeout_seconds`; `auto_upgrade` defaulting to true |
 | 4 | Opus 5 and Sonnet 5 aliases |
+| 5 | Gemini CLI model mappings (`gemini-*` prefixes) |
+| 6 | Removed the retired GitHub Models settings from persisted configuration |
 
 `--update-config` remains for the other, non-schema write-backs (for example
 restoring the built-in `model_mappings` when the file has none).
@@ -208,9 +183,6 @@ Every config field has a `GHC_PROXY_*` override:
 | `GHC_PROXY_RATE_LIMIT_WAIT` | Wait instead of rejecting when limited (`true`/`1`) |
 | `GHC_PROXY_MANUAL_APPROVE` | Require manual approval per request (`true`/`1`) |
 | `GHC_PROXY_API_KEY` | Require this key on LLM endpoints (empty = disabled) |
-| `GHC_PROXY_GITHUB_MODELS_ENABLED` | Route `publisher/model` ids to GitHub Models (`true`/`1`) |
-| `GHC_PROXY_GITHUB_MODELS_ORG` | Attribute GitHub Models inference to an organization |
-| `GHC_PROXY_GITHUB_MODELS_TOKEN` | Dedicated token for GitHub Models (`models: read` permission) |
 
 Token-related variables (`COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN`) are
 covered in [Getting Started](getting-started.md#authentication).

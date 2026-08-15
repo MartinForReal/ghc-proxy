@@ -357,11 +357,6 @@ counts, estimated cost, and prompt-cache hit rate.
 
 ## Notable behaviors
 
-- **GitHub Models routing** — when enabled (default), requests whose translated
-  model id uses the `publisher/model` form (e.g. `openai/gpt-4o`) are routed to
-  the [GitHub Models](https://models.github.ai) inference API instead of Copilot,
-  authenticated with a token that has the `models: read` permission.
-  See [Configuration](configuration.md#github-models).
 - **Model translation** — model names are rewritten per your
   [mappings](configuration.md#model-mappings) before being forwarded.
 - **1M context** — for Anthropic-native requests, the proxy forwards the

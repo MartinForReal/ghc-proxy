@@ -49,11 +49,6 @@ file.
   as `response_format`. `topK` and `safetySettings` have no counterpart and are
   dropped, which the dashboard states rather than leaving you to assume they
   took effect.
-- **GitHub Models inference** — requests whose model id uses the
-  `publisher/model` form (e.g. `openai/gpt-4o`) are transparently routed to the
-  [GitHub Models](https://models.github.ai) API instead of Copilot, authenticated
-  with a token that has the `models: read` permission. Enabled by
-  default; the catalog is merged into `/v1/models`.
 - **Optional API-key authentication** on the LLM endpoints
   (`Authorization: Bearer`, `x-api-key`, or `x-goog-api-key`), disabled by
   default and compared in constant time.
@@ -134,11 +129,7 @@ The GitHub token is exchanged for a short-lived **Copilot token** via
 `https://api.github.com/copilot_internal/v2/token`, which is refreshed
 automatically before it expires.
 
-The interactive Device Flow requests the `read:user copilot` scopes. GitHub
-Models is **not** covered by the Device Flow token (`models` is not a valid
-classic OAuth scope). To use the [GitHub Models](#github-models) inference API,
-supply a dedicated token with the `models: read` permission (a fine-grained PAT)
-via `github_models.token`.
+The interactive Device Flow requests the `read:user copilot` scopes.
 
 ## Endpoint Authentication
 
@@ -180,7 +171,7 @@ Config file: `~/.ghc-tunnel/config.yaml` (`%APPDATA%/ghc-tunnel/config.yaml`
 on Windows). It is generated on first run or with `--config`.
 
 ```yaml
-config_version: 4
+config_version: 6
 address: 127.0.0.1
 port: 8314
 debug: false
@@ -192,14 +183,10 @@ auto_upgrade: true                  # self-update on startup; false to disable
 model_mappings:
   exact:
     opus: claude-opus-5
-    sonnet: claude-opus-5
+    sonnet: claude-sonnet-5
     haiku: claude-haiku-4.5
   prefix:
-    claude-sonnet-4-: claude-opus-5
-github_models:
-  enabled: true                     # route publisher/model ids to GitHub Models
-  # org: my-org                     # attribute inference to an organization
-  # token: ghp_xxx                  # dedicated token (models: read permission)
+    claude-sonnet-4-: claude-sonnet-5
 system_prompt_remove: []
 system_prompt_add: []
 tool_result_suffix_remove: []
@@ -210,52 +197,6 @@ upstream_read_timeout_seconds: 900   # max silence from upstream; 0 disables
 # x-goog-api-key). Omit or leave empty to disable authentication.
 # api_key: my-secret-key
 ```
-
-## GitHub Models
-
-Besides Copilot, GitHub offers a separate model **inference** service —
-[GitHub Models](https://models.github.ai) — exposing OpenAI-compatible endpoints
-for models from OpenAI, Meta, Mistral, xAI, DeepSeek, and others. This proxy
-routes to it transparently.
-
-**Routing.** GitHub Models identifies models by a `publisher/model` id (e.g.
-`openai/gpt-4o`, `meta/llama-4-maverick`). When `github_models.enabled` is true
-(the default), any request whose *translated* model id contains a `/` is sent to
-GitHub Models instead of Copilot. Because Copilot model ids never contain a `/`,
-the two never collide, and existing model mappings are unaffected. This works on
-`/v1/chat/completions`, `/v1/messages` (translated), and the Gemini endpoints.
-
-```bash
-curl http://127.0.0.1:8314/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model": "openai/gpt-4o", "messages": [{"role": "user", "content": "Hi!"}]}'
-```
-
-**Authentication.** GitHub Models uses the raw GitHub token (not the Copilot
-token) via `Authorization: Bearer`. The token must carry the **`models: read`**
-permission (a fine-grained PAT). The token minted by the Device Flow does **not**
-have this permission (`models` is not a valid classic OAuth scope), so set a
-dedicated token via `github_models.token` or the
-`GHC_PROXY_GITHUB_MODELS_TOKEN` environment variable. Tokens without the
-permission get an `Unauthorized` response from GitHub.
-
-**Configuration.**
-
-```yaml
-github_models:
-  enabled: true          # set false to always use Copilot
-  org: my-org            # optional: attribute inference to an organization
-  token: ghp_xxx         # optional: dedicated token (models: read permission)
-```
-
-| Environment variable | Effect |
-|----------------------|--------|
-| `GHC_PROXY_GITHUB_MODELS_ENABLED` | Enable/disable routing (`true`/`1`) |
-| `GHC_PROXY_GITHUB_MODELS_ORG` | Attribute inference to an organization |
-| `GHC_PROXY_GITHUB_MODELS_TOKEN` | Dedicated token for GitHub Models |
-
-The GitHub Models catalog is merged into `GET /v1/models` so those ids show up in
-the dashboard and model listings.
 
 ## API Endpoints
 
@@ -271,6 +212,9 @@ the dashboard and model listings.
 | `POST /v1beta/models/{model}:generateContent` | Gemini generate content |
 | `POST /v1beta/models/{model}:streamGenerateContent` | Gemini streaming (SSE) |
 | `POST /v1beta/models/{model}:countTokens` | Gemini token counting |
+| `POST /v1/embeddings` | Embeddings (also `/embeddings`) |
+| `GET /v1/models/full/` | Raw upstream model catalog with capabilities |
+| `GET /usage` | Copilot plan and quota usage (also `check-usage`) |
 | `GET /health` | Liveness/readiness probe (`?strict=true` for 503 when not ready) |
 | `GET /openapi.json` | OpenAPI v3 specification |
 | `GET /` | Web dashboard — overview |
@@ -282,6 +226,9 @@ the dashboard and model listings.
 | `POST /api/config/debug` | Turn body capture on or off (`{"debug": true}`) |
 | `GET /api/stats` | Running totals, including what Copilot billed |
 | `GET /api/cache` | Prompt-cache statistics, overall and per model |
+| `GET /api/requests` | Recent requests (JSON) |
+| `GET /api/audit` | Filtered audit records |
+| `GET /api/audit/summary` | Aggregated audit summary |
 | `GET /api/models` | All supported models (used by the dashboard) |
 
 The `/api/config/` routes are guarded by the API key when one is configured;
@@ -335,6 +282,7 @@ cargo clippy     # lint
 | File | Responsibility |
 |------|----------------|
 | `src/main.rs` | CLI parsing and server startup |
+| `src/lib.rs` | Library crate root re-exporting the modules below |
 | `src/setup.rs` | Interactive first-run setup wizard |
 | `src/config.rs` | Config dir, YAML config, defaults, model-mapping defaults |
 | `src/auth.rs` | GitHub token resolution (env/file/Device Flow), Copilot token exchange |
