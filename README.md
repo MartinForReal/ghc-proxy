@@ -129,6 +129,9 @@ The GitHub token is exchanged for a short-lived **Copilot token** via
 `https://api.github.com/copilot_internal/v2/token`, which is refreshed
 automatically before it expires.
 
+All inference requests use GitHub Copilot. The retired GitHub Models inference
+service is no longer supported.
+
 The interactive Device Flow requests the `read:user copilot` scopes.
 
 ## Endpoint Authentication

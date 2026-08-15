@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.4.4] - 2026-08-15
+
 ### Fixed
 - **`sonnet` now maps to Sonnet, not Opus.** The default model mappings folded
   every Claude spelling — Sonnet included — into the newest Opus. That is
