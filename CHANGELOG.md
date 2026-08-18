@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.4.5] - 2026-08-18
+
+### Fixed
+- **The dashboard now shows Copilot quota before the first proxy request.** It
+  renders the union of the response-header snapshot and `GET /usage`, so a new
+  or idle process no longer hides an account quota that is already available.
+- **Enterprise token-billed quota now follows the GitHub account meter.** For
+  those seats the upstream fields are counterintuitive: `credits_used` carries
+  the available AI-unit balance while `remaining` and `percent_remaining`
+  describe the consumed side. The dashboard now reports the correct amount and
+  percentage left without changing the interpretation for ordinary plans.
+
+### Documentation
+- Documented the `/usage` response fields, their units, and the enterprise
+  token-billed field direction.
+
 ## [1.4.4] - 2026-08-15
 
 ### Fixed

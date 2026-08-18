@@ -217,7 +217,7 @@ upstream_read_timeout_seconds: 900   # max silence from upstream; 0 disables
 | `POST /v1beta/models/{model}:countTokens` | Gemini token counting |
 | `POST /v1/embeddings` | Embeddings (also `/embeddings`) |
 | `GET /v1/models/full/` | Raw upstream model catalog with capabilities |
-| `GET /usage` | Copilot plan and quota usage (also `check-usage`) |
+| `GET /usage` | Copilot plan and quota usage in account billing units (also `check-usage`; see [API Reference](docs/api.md#usage-and-quota)) |
 | `GET /health` | Liveness/readiness probe (`?strict=true` for 503 when not ready) |
 | `GET /openapi.json` | OpenAPI v3 specification |
 | `GET /` | Web dashboard — overview |
