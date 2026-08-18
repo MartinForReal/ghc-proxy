@@ -202,7 +202,7 @@ curl http://127.0.0.1:8314/health
 {
   "status": "ok",
   "ready": true,
-  "version": "1.4.4",
+  "version": "1.4.5",
   "uptime_seconds": 128,
   "copilot_token": { "present": true, "expires_in_seconds": 1487 },
   "models_loaded": 77,
@@ -218,9 +218,49 @@ to get `503 Service Unavailable` instead when the proxy is not ready.
 
 The `quota` object holds the most recent per-SKU allowance reported by the
 upstream. Copilot attaches it to every response, so it is current without any
-extra API call — but it stays empty until the first request has been proxied.
-The same figures are exported on `/metrics` as `ghc_proxy_quota_*` gauges
-labelled by `sku`.
+extra API call, but the health payload stays empty until the first request has
+been proxied. The overview dashboard also loads `/usage`, so its quota panel
+works immediately on a new or idle process. The same figures are exported on
+`/metrics` as `ghc_proxy_quota_*` gauges labelled by `sku`.
+
+## Usage and quota
+
+`GET /usage` contacts Copilot's account endpoint and returns the plan, account,
+reset date, and one entry per quota SKU. It does not depend on requests recorded
+by this proxy.
+
+```json
+{
+  "plan": "enterprise",
+  "login": "example",
+  "token_based_billing": true,
+  "quota_reset_date": "2026-09-01T00:00:00Z",
+  "quotas": {
+    "premium_interactions": {
+      "unlimited": false,
+      "entitlement": 10000000,
+      "remaining": 9229138,
+      "percent_remaining": 92.2,
+      "credits_used": 770861
+    }
+  }
+}
+```
+
+For a token-billed `premium_interactions` SKU, `entitlement`, `remaining`, and
+`credits_used` are measured in **AI units**. An AI unit is an account billing
+unit, not a token, request, premium interaction, or currency amount; the model,
+token mix, cache use, and billing rates determine how many units a call costs.
+`percent_remaining` is a percentage rather than an AI-unit count.
+
+Enterprise token-billed seats expose counterintuitive upstream names:
+`credits_used` is the available balance, while `remaining` and
+`percent_remaining` describe the consumed side. The example therefore means
+770,861 of 10,000,000 AI units remain (about 7.7%) and 9,229,138 have been
+consumed. The dashboard corrects this direction only for
+`enterprise + token_based_billing`; ordinary plans retain the upstream field
+direction. `raw` preserves the complete upstream payload for callers that need
+fields omitted from the compact `quotas` object.
 
 ## Retrieve a model
 
