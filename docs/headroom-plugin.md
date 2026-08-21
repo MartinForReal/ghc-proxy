@@ -69,7 +69,7 @@ partial installation that appears healthy but still depends on port 8314.
 
 ## Install
 
-Each ghc-proxy GitHub Release includes a universal
+New ghc-proxy releases produced by the current workflow include a universal
 `headroom_ghc_plugin-*-py3-none-any.whl` asset. Download that wheel and install
 it, or install directly from a checkout of this repository:
 
