@@ -6,7 +6,7 @@ title: Claude Code & Codex
 
 [Home](index.md) · [Getting Started](getting-started.md) ·
 [Configuration](configuration.md) · [API Reference](api.md) ·
-**Claude Code & Codex**
+**Claude Code & Codex** · [Headroom Plugin](headroom-plugin.md)
 
 ---
 

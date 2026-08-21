@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "headroom-ghc-plugin"
+version = "0.1.1"
+description = "In-process GitHub Copilot transport compatibility for Headroom"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = [
+  "headroom-ai>=0.36.2,<0.37",
+  "PyYAML>=6.0",
+]
+
+[project.entry-points."headroom.proxy_extension"]
+ghc = "headroom_ghc_plugin:install"
+
+[tool.setuptools.packages.find]
+where = ["src"]

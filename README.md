@@ -9,6 +9,8 @@ This is a Rust backend port of the
 
 📖 **Documentation:** <https://martinforreal.github.io/ghc-proxy/>
 
+🧩 **Single-port Headroom deployment:** [run Copilot transport inside Headroom](https://martinforreal.github.io/ghc-proxy/headroom-plugin.html)
+
 ## Quick Start
 
 ```bash

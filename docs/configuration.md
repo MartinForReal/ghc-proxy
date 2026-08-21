@@ -6,7 +6,7 @@ title: Configuration
 
 [Home](index.md) · [Getting Started](getting-started.md) ·
 **Configuration** · [API Reference](api.md) ·
-[Claude Code & Codex](claude-code.md)
+[Claude Code & Codex](claude-code.md) · [Headroom Plugin](headroom-plugin.md)
 
 ---
 

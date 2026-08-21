@@ -6,7 +6,7 @@ title: Getting Started
 
 [Home](index.md) · **Getting Started** ·
 [Configuration](configuration.md) · [API Reference](api.md) ·
-[Claude Code & Codex](claude-code.md)
+[Claude Code & Codex](claude-code.md) · [Headroom Plugin](headroom-plugin.md)
 
 ---
 
@@ -121,5 +121,6 @@ persisted `machine_id.txt` used for client disguise.
 - Tune behavior in the [Configuration](configuration.md) reference.
 - Explore the [API Reference](api.md) and client examples.
 - Wire up [Claude Code & Codex](claude-code.md).
+- Run Copilot inside Headroom with the [single-port plugin](headroom-plugin.md).
 - Watch what it costs: the overview at `/` leads with the AI units Copilot
   billed, and `/api/cache` breaks prompt-cache effectiveness down per model.

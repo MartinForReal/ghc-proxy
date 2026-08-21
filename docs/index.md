@@ -11,7 +11,8 @@ OpenAI/Anthropic SDKs, and more — can talk to GitHub Copilot models.
 
 > **Documentation:** [Getting Started](getting-started.md) ·
 > [Configuration](configuration.md) · [API Reference](api.md) ·
-> [Claude Code & Codex](claude-code.md)
+> [Claude Code & Codex](claude-code.md) ·
+> [Headroom Plugin](headroom-plugin.md)
 
 ---
 
@@ -47,6 +48,9 @@ so OpenAI- and Anthropic-native clients work unmodified.
 - **Three-page dashboard** — an overview at `/` led by what Copilot actually billed, a request browser at `/requests` that renders each exchange as a conversation, and metrics at `/metrics/dashboard`.
 - **Spend and cache analytics** — billed AI units read from `copilot_usage` rather than estimated, and per-model prompt-cache statistics at `/api/cache`.
 - **Body capture toggled at runtime** via `POST /api/config/debug`, so you can start recording bodies without a restart.
+- **Optional single-port Headroom integration** — reuse Headroom's native
+  Copilot transport while preserving ghc-proxy aliases and authoritative AI
+  Credit reporting, without a listener on port 8314.
 
 ## Quick start
 
