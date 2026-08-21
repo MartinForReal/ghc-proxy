@@ -69,11 +69,14 @@ partial installation that appears healthy but still depends on port 8314.
 
 ## Install
 
-From a checkout of this repository:
+Each ghc-proxy GitHub Release includes a universal
+`headroom_ghc_plugin-*-py3-none-any.whl` asset. Download that wheel and install
+it, or install directly from a checkout of this repository:
 
 ```bash
 python -m pip install "headroom-ai[proxy,code,ml,memory,relevance]>=0.36.2,<0.37"
-python -m pip install ./plugins/headroom-ghc
+python -m pip install ./headroom_ghc_plugin-0.1.1-py3-none-any.whl
+# Source checkout alternative: python -m pip install ./plugins/headroom-ghc
 python -m headroom.cli copilot-auth login
 ```
 

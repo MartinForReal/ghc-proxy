@@ -9,7 +9,7 @@ description = "In-process GitHub Copilot transport compatibility for Headroom"
 requires-python = ">=3.10"
 license = "MIT"
 dependencies = [
-  "headroom-ai>=0.36.2,<0.37",
+  "headroom-ai[proxy]>=0.36.2,<0.37",
   "PyYAML>=6.0",
 ]
 

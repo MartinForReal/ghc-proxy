@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- GitHub releases now include the universal `headroom-ghc-plugin` wheel. CI
+  installs and tests the plugin against its declared Headroom proxy dependency,
+  and the release workflow validates its metadata and extension entry point
+  before publishing any assets.
+
 ## [1.4.5] - 2026-08-18
 
 ### Fixed

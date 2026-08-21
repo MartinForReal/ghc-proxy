@@ -144,9 +144,48 @@ jobs:
           path: ${{ env.ASSET }}
           if-no-files-found: error
 
+  plugin:
+    name: Build Headroom plugin
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: plugins/headroom-ghc/pyproject.toml
+
+      - name: Install plugin and test dependencies
+        run: |
+          python -m pip install --upgrade pip build "setuptools>=77,<82"
+          python -m pip install ./plugins/headroom-ghc
+          python -m pip check
+
+      - name: Test plugin
+        run: python -m unittest discover -s plugins/headroom-ghc/tests -v
+
+      - name: Build plugin wheel
+        run: python -m build --wheel --no-isolation --outdir dist plugins/headroom-ghc
+
+      - name: Validate plugin wheel
+        run: python plugins/headroom-ghc/tests/verify_wheel.py dist/headroom_ghc_plugin-*.whl
+
+      - name: Upload plugin artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: headroom-ghc-plugin
+          path: dist/headroom_ghc_plugin-*.whl
+          if-no-files-found: error
+
   release:
     name: Publish release
-    needs: build
+    needs: [build, plugin]
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
