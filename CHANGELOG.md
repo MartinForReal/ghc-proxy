@@ -4,11 +4,28 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-08-21
+
 ### Added
+- **Optional single-port Headroom integration.** The new
+  `headroom-ghc-plugin` runs GitHub Copilot traffic through Headroom's native
+  transport, so OpenAI and Anthropic clients can share port 8787 without a
+  standalone ghc-proxy process listening on port 8314.
+- The compatibility extension preserves exact and longest-prefix model aliases,
+  injects Copilot authentication for generic Anthropic clients, exposes
+  loopback-only quota/cache/health endpoints, and records GitHub's authoritative
+  `copilot_usage.total_nano_aiu` billing value.
+- Windows migration and rollback scripts snapshot the existing dual-service
+  host, provision the single Headroom service, validate health/quota/models,
+  and automatically restore the previous architecture on failure.
 - GitHub releases now include the universal `headroom-ghc-plugin` wheel. CI
   installs and tests the plugin against its declared Headroom proxy dependency,
   and the release workflow validates its metadata and extension entry point
   before publishing any assets.
+
+### Documentation
+- Added a GitHub Pages guide covering installation, configuration, client
+  endpoints, protocol differences, observability, migration, and rollback.
 
 ## [1.4.5] - 2026-08-18
 
