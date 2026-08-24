@@ -10,8 +10,8 @@ $UserHome = 'C:\Users\shafan'
 $Repo = Join-Path $UserHome 'ghc-proxy'
 $ServicesDir = Join-Path $UserHome '.headroom\services'
 $Python = Join-Path $UserHome 'headroom\Scripts\python.exe'
-$HeadroomWheel = Join-Path $Repo 'target\headroom-upgrade-0.36.2\headroom_ai-0.36.2-cp310-abi3-win_amd64.whl'
-$PluginWheel = Join-Path $Repo 'target\headroom-upgrade-0.36.2\headroom_ghc_plugin-0.1.1-py3-none-any.whl'
+$HeadroomWheel = Join-Path $Repo 'target\headroom-upgrade-0.36.5\headroom_ai-0.36.5-cp310-abi3-win_amd64.whl'
+$PluginWheel = Join-Path $Repo 'target\headroom-upgrade-0.36.5\headroom_ghc_plugin-0.1.1-py3-none-any.whl'
 $Installer = Join-Path $ServicesDir 'install-proxy-services.ps1'
 $RollbackScript = Join-Path $Repo 'scripts\rollback-headroom-ghc-plugin.ps1'
 $CurrentPublish = Join-Path $ServicesDir 'ProxyServiceHost\bin\Release\net10.0\win-x64\publish'
@@ -76,7 +76,7 @@ try {
         (Get-Service -Name headroom-default).WaitForStatus('Stopped', [TimeSpan]::FromSeconds(20))
     }
 
-    Write-MigrationLog 'Installing Headroom 0.36.2 from the verified local wheel'
+    Write-MigrationLog 'Installing Headroom 0.36.5 from the verified local wheel'
     & $Python -m pip install --upgrade --no-deps $HeadroomWheel 2>&1 |
         Tee-Object -FilePath $Log -Append
     Assert-LastExitCode 'Headroom installation'
@@ -90,7 +90,7 @@ try {
     & $Python -m pip check 2>&1 | Tee-Object -FilePath $Log -Append
     Assert-LastExitCode 'pip check'
 
-    & $Python -c "import headroom, importlib.metadata as m; assert headroom.__version__ == '0.36.2'; assert m.version('headroom-ghc-plugin') == '0.1.1'; assert any(e.name == 'ghc' for e in m.entry_points(group='headroom.proxy_extension'))"
+    & $Python -c "import headroom, importlib.metadata as m; assert headroom.__version__ == '0.36.5'; assert m.version('headroom-ghc-plugin') == '0.1.1'; assert any(e.name == 'ghc' for e in m.entry_points(group='headroom.proxy_extension'))"
     Assert-LastExitCode 'Package verification'
 
     Write-MigrationLog 'Re-provisioning the single Headroom Windows service'
@@ -101,7 +101,7 @@ try {
     $plugin = Invoke-RestMethod -Uri 'http://127.0.0.1:8787/api/ghc/health' -TimeoutSec 20
     $usage = Invoke-RestMethod -Uri 'http://127.0.0.1:8787/api/usage' -TimeoutSec 20
     $models = Invoke-RestMethod -Uri 'http://127.0.0.1:8787/v1/models' -TimeoutSec 30
-    if (-not $health.ready -or $health.version -ne '0.36.2' -or -not $plugin.ready) {
+    if (-not $health.ready -or $health.version -ne '0.36.5' -or -not $plugin.ready) {
         throw 'Post-migration health validation failed.'
     }
     if ($plugin.version -ne '0.1.1' -or $plugin.openai_target -match '8314' -or $plugin.anthropic_target -match '8314') {

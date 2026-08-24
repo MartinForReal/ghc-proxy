@@ -55,7 +55,8 @@ Claude Code / Codex / SDK
 ## Requirements
 
 - Python 3.10 or newer.
-- Headroom 0.36.2 (the extension pins the supported line to 0.36.x).
+- Headroom 0.36.5 (the extension supports the 0.36.x line; 0.36.5 is the
+  currently tested version).
 - A reusable GitHub Copilot OAuth credential saved by
   `headroom copilot-auth login`.
 - Both `OPENAI_TARGET_API_URL` and `ANTHROPIC_TARGET_API_URL` set to
@@ -167,11 +168,11 @@ Use Headroom `/stats` for compression and provider-cache metrics. Use
 
 The repository includes migration helpers for the existing supervised Windows
 service layout. Build the extension wheel first, place the verified Headroom
-wheel under `target/headroom-upgrade-0.36.2`, then run the migration from an
+wheel under `target/headroom-upgrade-0.36.5`, then run the migration from an
 elevated PowerShell:
 
 ```powershell
-python -m pip wheel --no-deps --wheel-dir target/headroom-upgrade-0.36.2 plugins/headroom-ghc
+python -m pip wheel --no-deps --wheel-dir target/headroom-upgrade-0.36.5 plugins/headroom-ghc
 & .\scripts\migrate-headroom-ghc-plugin.ps1
 ```
 
