@@ -34,7 +34,7 @@ from urllib.parse import urlparse
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-PLUGIN_VERSION = "0.1.1"
+PLUGIN_VERSION = "0.1.2"
 _NANO_AIU_PER_CREDIT = 1_000_000_000
 _CAPTURE_LIMIT = 8 * 1024 * 1024
 _PROJECT_PREFIX = re.compile(r"^/p/[^/]+(?P<path>/.*)$")
@@ -352,7 +352,11 @@ class GhcCompatibilityMiddleware:
         )
         copied = dict(scope)
         copied["headers"] = [
-            (str(name).encode("latin-1"), str(value).encode("latin-1"))
+            # ASGI requires lower-case header names. Starlette's Headers
+            # iterator preserves the raw spelling but __getitem__ lower-cases
+            # lookups, so mixed-case names such as Editor-Version make
+            # dict(request.headers) raise KeyError inside Headroom.
+            (str(name).lower().encode("latin-1"), str(value).encode("latin-1"))
             for name, value in resolved.items()
         ]
         return copied

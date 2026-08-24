@@ -119,6 +119,7 @@ class MiddlewareTests(unittest.TestCase):
         seen: dict = {}
 
         async def downstream(scope, receive, send) -> None:
+            seen["raw_header_names"] = [name for name, _value in scope["headers"]]
             seen["headers"] = {
                 name.decode("latin-1").lower(): value.decode("latin-1")
                 for name, value in scope["headers"]
@@ -166,6 +167,7 @@ class MiddlewareTests(unittest.TestCase):
             asyncio.run(middleware(scope, receive, send))
 
         self.assertEqual(seen["headers"]["authorization"], "Bearer tid_injected")
+        self.assertTrue(all(name == name.lower() for name in seen["raw_header_names"]))
 
     def test_http_alias_and_usage_observation(self) -> None:
         seen: dict = {}

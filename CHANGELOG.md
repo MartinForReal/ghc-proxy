@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.5.1] - 2026-08-24
+
+### Fixed
+- The Headroom compatibility extension now lower-cases injected ASGI header
+  names. Mixed-case Copilot identity headers made Starlette raise `KeyError`
+  while materializing `dict(request.headers)` in the full OpenAI pipeline.
+
 ## [1.5.0] - 2026-08-21
 
 ### Added
