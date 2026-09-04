@@ -34,7 +34,7 @@ from urllib.parse import urlparse
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-PLUGIN_VERSION = "0.1.2"
+PLUGIN_VERSION = "0.1.3"
 _NANO_AIU_PER_CREDIT = 1_000_000_000
 _CAPTURE_LIMIT = 8 * 1024 * 1024
 _PROJECT_PREFIX = re.compile(r"^/p/[^/]+(?P<path>/.*)$")
@@ -393,7 +393,10 @@ class GhcCompatibilityMiddleware:
                 if not delivered:
                     delivered = True
                     return {"type": "http.request", "body": rewritten, "more_body": False}
-                return {"type": "http.disconnect"}
+                # Once the buffered body has been replayed, keep listening to
+                # the real client connection. Synthesizing http.disconnect here
+                # makes Starlette cancel StreamingResponse as soon as it starts.
+                return await receive()
 
             next_receive = replay
 

@@ -76,7 +76,7 @@ it, or install directly from a checkout of this repository:
 
 ```bash
 python -m pip install "headroom-ai[proxy,code,ml,memory,relevance]>=0.36.2,<0.37"
-python -m pip install ./headroom_ghc_plugin-0.1.2-py3-none-any.whl
+python -m pip install ./headroom_ghc_plugin-0.1.3-py3-none-any.whl
 # Source checkout alternative: python -m pip install ./plugins/headroom-ghc
 python -m headroom.cli copilot-auth login
 ```

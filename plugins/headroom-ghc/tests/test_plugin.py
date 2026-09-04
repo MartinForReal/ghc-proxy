@@ -115,6 +115,68 @@ class UsageTests(unittest.TestCase):
 
 
 class MiddlewareTests(unittest.TestCase):
+    def test_http_replay_waits_for_real_client_disconnect(self) -> None:
+        receive_calls = 0
+        release_disconnect = asyncio.Event()
+
+        async def downstream(_scope, receive, send) -> None:
+            body = await receive()
+            self.assertEqual(body["type"], "http.request")
+
+            disconnect = asyncio.create_task(receive())
+            await asyncio.sleep(0)
+            self.assertFalse(disconnect.done())
+
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 200,
+                    "headers": [(b"content-type", b"text/event-stream")],
+                }
+            )
+            await send(
+                {
+                    "type": "http.response.body",
+                    "body": b'data: {"type":"response.completed"}\n\n',
+                    "more_body": False,
+                }
+            )
+            release_disconnect.set()
+            self.assertEqual((await disconnect)["type"], "http.disconnect")
+
+        async def receive() -> dict:
+            nonlocal receive_calls
+            receive_calls += 1
+            if receive_calls == 1:
+                return {
+                    "type": "http.request",
+                    "body": b'{"model":"gpt-5.6-sol","stream":true}',
+                    "more_body": False,
+                }
+            await release_disconnect.wait()
+            return {"type": "http.disconnect"}
+
+        async def send(_message: dict) -> None:
+            return None
+
+        middleware = GhcCompatibilityMiddleware(
+            downstream,
+            mappings=ModelMappings(),
+            recorder=UsageRecorder(),
+        )
+        scope = {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/responses",
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"authorization", b"Bearer tid_test-only"),
+            ],
+        }
+        asyncio.run(middleware(scope, receive, send))
+
+        self.assertEqual(receive_calls, 2)
+
     def test_http_injects_copilot_auth_when_client_omits_it(self) -> None:
         seen: dict = {}
 

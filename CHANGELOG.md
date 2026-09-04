@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.5.2] - 2026-09-04
+
+### Fixed
+- The Headroom compatibility extension no longer synthesizes
+  `http.disconnect` immediately after replaying a buffered request body.
+  Starlette treated that message as a real client departure and cancelled
+  Responses API streams before `response.completed`, leaving Codex with an
+  intermittently empty or truncated HTTP 200 response.
+
 ## [1.5.1] - 2026-08-24
 
 ### Fixed

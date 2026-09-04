@@ -11,7 +11,7 @@ $Repo = Join-Path $UserHome 'ghc-proxy'
 $ServicesDir = Join-Path $UserHome '.headroom\services'
 $Python = Join-Path $UserHome 'headroom\Scripts\python.exe'
 $HeadroomWheel = Join-Path $Repo 'target\headroom-upgrade-0.36.5\headroom_ai-0.36.5-cp310-abi3-win_amd64.whl'
-$PluginWheel = Join-Path $Repo 'target\headroom-upgrade-0.36.5\headroom_ghc_plugin-0.1.2-py3-none-any.whl'
+$PluginWheel = Join-Path $Repo 'target\headroom-upgrade-0.36.5\headroom_ghc_plugin-0.1.3-py3-none-any.whl'
 $Installer = Join-Path $ServicesDir 'install-proxy-services.ps1'
 $RollbackScript = Join-Path $Repo 'scripts\rollback-headroom-ghc-plugin.ps1'
 $CurrentPublish = Join-Path $ServicesDir 'ProxyServiceHost\bin\Release\net10.0\win-x64\publish'
@@ -81,7 +81,7 @@ try {
         Tee-Object -FilePath $Log -Append
     Assert-LastExitCode 'Headroom installation'
 
-    Write-MigrationLog 'Installing ghc extension 0.1.2 from the local wheel'
+    Write-MigrationLog 'Installing ghc extension 0.1.3 from the local wheel'
     & $Python -m pip install --force-reinstall --no-deps $PluginWheel 2>&1 |
         Tee-Object -FilePath $Log -Append
     Assert-LastExitCode 'Plugin installation'
@@ -90,7 +90,7 @@ try {
     & $Python -m pip check 2>&1 | Tee-Object -FilePath $Log -Append
     Assert-LastExitCode 'pip check'
 
-    & $Python -c "import headroom, importlib.metadata as m; assert headroom.__version__ == '0.36.5'; assert m.version('headroom-ghc-plugin') == '0.1.2'; assert any(e.name == 'ghc' for e in m.entry_points(group='headroom.proxy_extension'))"
+    & $Python -c "import headroom, importlib.metadata as m; assert headroom.__version__ == '0.36.5'; assert m.version('headroom-ghc-plugin') == '0.1.3'; assert any(e.name == 'ghc' for e in m.entry_points(group='headroom.proxy_extension'))"
     Assert-LastExitCode 'Package verification'
 
     Write-MigrationLog 'Re-provisioning the single Headroom Windows service'
@@ -104,7 +104,7 @@ try {
     if (-not $health.ready -or $health.version -ne '0.36.5' -or -not $plugin.ready) {
         throw 'Post-migration health validation failed.'
     }
-    if ($plugin.version -ne '0.1.2' -or $plugin.openai_target -match '8314' -or $plugin.anthropic_target -match '8314') {
+    if ($plugin.version -ne '0.1.3' -or $plugin.openai_target -match '8314' -or $plugin.anthropic_target -match '8314') {
         throw 'The in-process plugin version or upstream target is incorrect.'
     }
     if (-not $usage.token_based_billing -or $models.data.Count -lt 1) {
