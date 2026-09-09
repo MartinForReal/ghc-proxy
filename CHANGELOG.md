@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.5.3] - 2026-09-09
+
+### Changed
+- The `headroom-ghc-plugin` package now uses the same version as its containing
+  ghc-proxy release. Wheel validation and the release workflow enforce that
+  the plugin version, Cargo package version, and release tag stay in lockstep.
+
 ## [1.5.2] - 2026-09-04
 
 ### Fixed

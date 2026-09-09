@@ -20,7 +20,7 @@ env:
 
 jobs:
   verify:
-    name: Verify tag matches Cargo.toml
+    name: Verify tag matches package versions
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -32,15 +32,17 @@ jobs:
       # the built-in auto-upgrade re-download the same release on every start,
       # because `current_version` never catches up with the tag. Fail loudly
       # instead of publishing that.
-      - name: Compare tag with package version
+      - name: Compare tag with package versions
         shell: bash
         run: |
           tag="${{ github.event.inputs.tag || github.ref_name }}"
           crate_version=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
-          echo "tag=$tag crate_version=$crate_version"
-          if [ "$tag" != "v$crate_version" ]; then
-            echo "::error::Tag $tag does not match Cargo.toml version $crate_version." \
-                 "Bump Cargo.toml (and Cargo.lock) before tagging."
+          plugin_version=$(grep -m1 '^version = ' plugins/headroom-ghc/pyproject.toml | cut -d'"' -f2)
+          echo "tag=$tag crate_version=$crate_version plugin_version=$plugin_version"
+          if [ "$tag" != "v$crate_version" ] || [ "$tag" != "v$plugin_version" ]; then
+            echo "::error::Tag $tag does not match Cargo.toml version $crate_version" \
+                 "and plugin version $plugin_version. Bump both package versions" \
+                 "(and Cargo.lock) before tagging."
             exit 1
           fi
 

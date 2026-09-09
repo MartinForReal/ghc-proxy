@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "headroom-ghc-plugin"
-version = "0.1.3"
+version = "1.5.3"
 description = "In-process GitHub Copilot transport compatibility for Headroom"
 requires-python = ">=3.10"
 license = "MIT"

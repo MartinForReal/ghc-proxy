@@ -26,14 +26,16 @@ def main() -> int:
         source = archive.read("headroom_ghc_plugin/__init__.py").decode()
         entry_points = archive.read(entry_points_name).decode()
 
-    project_path = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    plugin_root = Path(__file__).resolve().parents[1]
+    project_path = plugin_root / "pyproject.toml"
     project = tomllib.loads(project_path.read_text(encoding="utf-8"))["project"]
+    cargo = tomllib.loads((plugin_root.parents[1] / "Cargo.toml").read_text(encoding="utf-8"))
     marker = re.search(r'^PLUGIN_VERSION\s*=\s*"([^"]+)"\s*$', source, re.MULTILINE)
     if marker is None:
         raise AssertionError("PLUGIN_VERSION is missing from the packaged module")
 
     assert metadata["Name"] == "headroom-ghc-plugin"
-    assert metadata["Version"] == project["version"] == marker.group(1)
+    assert metadata["Version"] == project["version"] == marker.group(1) == cargo["package"]["version"]
     assert "headroom.proxy_extension" in entry_points
     requirements = metadata.get_all("Requires-Dist") or []
     assert any("headroom-ai[proxy]" in item for item in requirements), requirements
