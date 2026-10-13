@@ -38,7 +38,13 @@ def main() -> int:
     assert metadata["Version"] == project["version"] == marker.group(1) == cargo["package"]["version"]
     assert "headroom.proxy_extension" in entry_points
     requirements = metadata.get_all("Requires-Dist") or []
-    assert any("headroom-ai[proxy]" in item for item in requirements), requirements
+    headroom_requirement = next(
+        (item for item in requirements if "headroom-ai[proxy]" in item),
+        None,
+    )
+    assert headroom_requirement is not None, requirements
+    assert ">=0.36.2" in headroom_requirement, headroom_requirement
+    assert "<0.41" in headroom_requirement, headroom_requirement
     assert any(item.startswith("PyYAML") for item in requirements), requirements
 
     print(f"validated {wheel.name}")

@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.5.4] - 2026-10-13
+
+### Changed
+- Refreshed the Rust dependency set, including `dirs` 7 and its transitive
+  lockfile updates.
+- Expanded the `headroom-ghc-plugin` compatibility range through Headroom
+  0.40.x after unit and live-service validation on 0.40.0. The Windows
+  migration helper now targets the verified Headroom 0.40.0 wheel.
+
+### Fixed
+- The Headroom plugin now adapts Copilot's raw model catalog for OpenAI and
+  ChatGPT/Codex clients. Requests carrying `client_version` receive the Codex
+  `models` schema, while ordinary `/v1/models` entries expose top-level context
+  limits. This makes `gpt-6.1-sol` discoverable with its 1,050,000-token window.
+
 ## [1.5.3] - 2026-09-09
 
 ### Changed

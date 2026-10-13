@@ -29,12 +29,12 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterable, Mapping
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-PLUGIN_VERSION = "1.5.3"
+PLUGIN_VERSION = "1.5.4"
 _NANO_AIU_PER_CREDIT = 1_000_000_000
 _CAPTURE_LIMIT = 8 * 1024 * 1024
 _PROJECT_PREFIX = re.compile(r"^/p/[^/]+(?P<path>/.*)$")
@@ -51,6 +51,7 @@ _MODEL_BODY_PATHS = frozenset(
     }
 )
 _SKIP_OBSERVATION_PREFIXES = ("/api/ghc", "/api/usage", "/api/cache", "/usage")
+_MODEL_CATALOG_PATHS = frozenset({"/v1/models", "/models"})
 _TOKEN_ENV_VARS = (
     "GITHUB_COPILOT_GITHUB_TOKEN",
     "GITHUB_COPILOT_TOKEN",
@@ -316,6 +317,178 @@ def _replace_content_length(scope: dict[str, Any], length: int) -> dict[str, Any
     return copied
 
 
+def _replace_response_content_length(message: dict[str, Any], length: int) -> dict[str, Any]:
+    copied = dict(message)
+    headers = [
+        (name, value)
+        for name, value in message.get("headers", [])
+        if name.lower() != b"content-length"
+    ]
+    headers.append((b"content-length", str(length).encode("ascii")))
+    copied["headers"] = headers
+    return copied
+
+
+def _catalog_limits(model: Mapping[str, Any]) -> Mapping[str, Any]:
+    capabilities = model.get("capabilities")
+    if not isinstance(capabilities, Mapping):
+        return {}
+    limits = capabilities.get("limits")
+    return limits if isinstance(limits, Mapping) else {}
+
+
+def _catalog_u64(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _catalog_bool(value: Any) -> bool:
+    return value if isinstance(value, bool) else False
+
+
+def _openai_model_catalog(payload: Mapping[str, Any]) -> dict[str, Any]:
+    raw_models = payload.get("data")
+    if not isinstance(raw_models, list):
+        return dict(payload)
+
+    models: list[Any] = []
+    for raw_model in raw_models:
+        if not isinstance(raw_model, Mapping):
+            models.append(raw_model)
+            continue
+        model = dict(raw_model)
+        limits = _catalog_limits(raw_model)
+        context_window = _catalog_u64(limits.get("max_context_window_tokens"))
+        max_output_tokens = _catalog_u64(limits.get("max_output_tokens"))
+        model_id = str(raw_model.get("id") or "")
+
+        model.setdefault("object", "model")
+        model.setdefault("type", "model")
+        model.setdefault("created", 0)
+        model.setdefault("created_at", "1970-01-01T00:00:00.000Z")
+        model.setdefault("owned_by", raw_model.get("vendor") or "unknown")
+        model.setdefault("display_name", raw_model.get("name") or model_id)
+        model["context_window"] = context_window
+        model["max_context_window"] = context_window
+        model["supports_1m_context"] = bool(
+            context_window is not None and context_window > 200_000
+        )
+        model["max_output_tokens"] = max_output_tokens
+        models.append(model)
+
+    result = dict(payload)
+    result["object"] = "list"
+    result["data"] = models
+    result.setdefault("has_more", False)
+    return result
+
+
+def _codex_model_catalog(payload: Mapping[str, Any]) -> dict[str, Any]:
+    raw_models = payload.get("data")
+    if not isinstance(raw_models, list):
+        return dict(payload)
+
+    models: list[dict[str, Any]] = []
+    for priority, raw_model in enumerate(raw_models):
+        if not isinstance(raw_model, Mapping):
+            continue
+        endpoints = raw_model.get("supported_endpoints")
+        if not isinstance(endpoints, list) or "/responses" not in endpoints:
+            continue
+        slug = raw_model.get("id")
+        if not isinstance(slug, str) or not slug:
+            continue
+
+        limits = _catalog_limits(raw_model)
+        context_window = _catalog_u64(limits.get("max_context_window_tokens"))
+        if context_window is None:
+            continue
+        capabilities = raw_model.get("capabilities")
+        supports = capabilities.get("supports") if isinstance(capabilities, Mapping) else None
+        supports = supports if isinstance(supports, Mapping) else {}
+        raw_efforts = supports.get("reasoning_effort")
+        efforts = [effort for effort in raw_efforts if isinstance(effort, str)] if isinstance(raw_efforts, list) else []
+        reasoning_levels = [
+            {"effort": effort, "description": f"Use {effort} reasoning effort"}
+            for effort in efforts
+        ]
+        default_reasoning = "medium" if "medium" in efforts else (efforts[0] if efforts else None)
+        vision = _catalog_bool(supports.get("vision"))
+        policy = raw_model.get("policy")
+        description = policy.get("terms") if isinstance(policy, Mapping) else None
+
+        models.append(
+            {
+                "slug": slug,
+                "display_name": raw_model.get("name") or slug,
+                "description": description,
+                "default_reasoning_level": default_reasoning,
+                "supported_reasoning_levels": reasoning_levels,
+                "shell_type": "shell_command",
+                "visibility": (
+                    "list" if _catalog_bool(raw_model.get("model_picker_enabled")) else "hide"
+                ),
+                "supported_in_api": True,
+                "priority": priority,
+                "base_instructions": (
+                    "You are Codex, a coding agent. Follow the user's instructions, "
+                    "use the provided tools when appropriate, and continue until the task is complete."
+                ),
+                "include_skills_usage_instructions": True,
+                "include_plugin_usage_instructions": True,
+                "include_apps_usage_instructions": True,
+                "supports_reasoning_summary_parameter": bool(reasoning_levels),
+                "default_reasoning_summary": "auto",
+                "support_verbosity": slug.startswith("gpt-5"),
+                "default_verbosity": "low" if slug.startswith("gpt-5") else None,
+                "apply_patch_tool_type": "freeform",
+                "web_search_tool_type": "text_and_image" if vision else "text",
+                "truncation_policy": {"mode": "tokens", "limit": 10_000},
+                "supports_parallel_tool_calls": _catalog_bool(
+                    supports.get("parallel_tool_calls")
+                ),
+                "supports_image_detail_original": vision,
+                "context_window": context_window,
+                "max_context_window": context_window,
+                "effective_context_window_percent": 95,
+                "experimental_supported_tools": [],
+                "input_modalities": ["text", "image"] if vision else ["text"],
+                "supports_search_tool": True,
+                "use_responses_lite": False,
+            }
+        )
+    return {"models": models}
+
+
+def adapt_model_catalog(payload: Any, *, codex: bool) -> Any:
+    """Expose Copilot catalog metadata in the schema expected by the client."""
+
+    if not isinstance(payload, Mapping) or not isinstance(payload.get("data"), list):
+        return payload
+    return _codex_model_catalog(payload) if codex else _openai_model_catalog(payload)
+
+
+def _rewrite_model_catalog_body(body: bytes, *, codex: bool) -> tuple[bytes, bool]:
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return body, False
+    adapted = adapt_model_catalog(payload, codex=codex)
+    if adapted is payload:
+        return body, False
+    return json.dumps(adapted, separators=(",", ":"), ensure_ascii=False).encode("utf-8"), True
+
+
+def _is_codex_catalog_request(scope: Mapping[str, Any]) -> bool:
+    raw_query = scope.get("query_string", b"")
+    if isinstance(raw_query, bytes):
+        query = raw_query.decode("latin-1", errors="replace")
+    else:
+        query = str(raw_query or "")
+    return "client_version" in parse_qs(query, keep_blank_values=True)
+
+
 class GhcCompatibilityMiddleware:
     """Model aliasing plus non-invasive Copilot billing observation."""
 
@@ -403,8 +576,14 @@ class GhcCompatibilityMiddleware:
         accumulator = CopilotUsageAccumulator()
         status_code = 0
         observe = not logical.startswith(_SKIP_OBSERVATION_PREFIXES)
+        adapt_catalog = scope.get("method") == "GET" and logical in _MODEL_CATALOG_PATHS
+        codex_catalog = adapt_catalog and _is_codex_catalog_request(scope)
+        catalog_start: dict[str, Any] | None = None
+        catalog_messages: list[dict[str, Any]] = []
+        catalog_size = 0
+        catalog_passthrough = False
 
-        async def observe_send(message: dict[str, Any]) -> None:
+        async def forward(message: dict[str, Any]) -> None:
             nonlocal status_code
             kind = message.get("type")
             if observe and kind == "http.response.start":
@@ -417,6 +596,57 @@ class GhcCompatibilityMiddleware:
                 if not message.get("more_body", False) and 200 <= status_code < 400:
                     self.recorder.record(effective_model or original_model, accumulator)
             await send(message)
+
+        async def observe_send(message: dict[str, Any]) -> None:
+            nonlocal catalog_passthrough, catalog_size, catalog_start
+            if not adapt_catalog or catalog_passthrough:
+                await forward(message)
+                return
+
+            kind = message.get("type")
+            if kind == "http.response.start":
+                catalog_start = dict(message)
+                return
+            if kind != "http.response.body":
+                if catalog_start is not None:
+                    await forward(catalog_start)
+                    catalog_start = None
+                await forward(message)
+                return
+
+            buffered = dict(message)
+            catalog_messages.append(buffered)
+            catalog_size += len(buffered.get("body", b""))
+            if catalog_size > _CAPTURE_LIMIT:
+                if catalog_start is not None:
+                    await forward(catalog_start)
+                    catalog_start = None
+                for pending in catalog_messages:
+                    await forward(pending)
+                catalog_messages.clear()
+                catalog_passthrough = True
+                return
+            if buffered.get("more_body", False):
+                return
+
+            body = b"".join(pending.get("body", b"") for pending in catalog_messages)
+            outgoing = dict(buffered)
+            outgoing["body"] = body
+            outgoing["more_body"] = False
+            response_status = _safe_int(catalog_start.get("status")) if catalog_start else 0
+            if 200 <= response_status < 300:
+                rewritten, changed = _rewrite_model_catalog_body(body, codex=codex_catalog)
+                if changed:
+                    outgoing["body"] = rewritten
+                    if catalog_start is not None:
+                        catalog_start = _replace_response_content_length(
+                            catalog_start, len(rewritten)
+                        )
+            if catalog_start is not None:
+                await forward(catalog_start)
+                catalog_start = None
+            await forward(outgoing)
+            catalog_messages.clear()
 
         await self.app(next_scope, next_receive, observe_send)
 
@@ -569,7 +799,7 @@ def _bridge_saved_oauth() -> str:
 
 
 def install(app: Any, config: Any) -> None:
-    """Install the extension into a Headroom 0.36.x FastAPI application."""
+    """Install the extension into a supported Headroom FastAPI application."""
 
     proxy = getattr(getattr(app, "state", None), "proxy", None)
     if proxy is None:
@@ -647,6 +877,7 @@ def install(app: Any, config: Any) -> None:
 
 
 __all__ = [
+    "adapt_model_catalog",
     "CopilotUsageAccumulator",
     "GhcCompatibilityMiddleware",
     "ModelMappings",

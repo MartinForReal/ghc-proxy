@@ -4,12 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "headroom-ghc-plugin"
-version = "1.5.3"
+version = "1.5.4"
 description = "In-process GitHub Copilot transport compatibility for Headroom"
 requires-python = ">=3.10"
 license = "MIT"
 dependencies = [
-  "headroom-ai[proxy]>=0.36.2,<0.37",
+  "headroom-ai[proxy]>=0.36.2,<0.41",
   "PyYAML>=6.0",
 ]
 

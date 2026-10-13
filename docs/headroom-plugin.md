@@ -11,16 +11,16 @@ permalink: /headroom-plugin.html
 
 ---
 
-Headroom 0.36 already contains GitHub Copilot token exchange and transport
-support. The optional `plugins/headroom-ghc` package is therefore a
+Supported Headroom releases already contain GitHub Copilot token exchange and
+transport support. The optional `plugins/headroom-ghc` package is therefore a
 **compatibility extension**, not a second Copilot implementation. It
 consolidates routing into the Headroom process while preserving the aliases and
 billing surfaces existing ghc-proxy clients use. Headroom becomes the only HTTP
 server; the standalone Rust executable is not loaded and port 8314 is closed.
 
 This is an integration replacement, not an FFI wrapper around the Axum server.
-Headroom 0.36.x already implements Copilot token exchange, OpenAI
-Chat/Responses, Responses WebSocket, Anthropic Messages, model metadata,
+Headroom releases from 0.36.2 through 0.40.x implement Copilot token exchange,
+OpenAI Chat/Responses, Responses WebSocket, Anthropic Messages, model metadata,
 embeddings, inline completions, retries, compression, and memory. The extension
 adds the compatibility pieces needed by an existing ghc-proxy installation:
 
@@ -55,8 +55,7 @@ Claude Code / Codex / SDK
 ## Requirements
 
 - Python 3.10 or newer.
-- Headroom 0.36.5 (the extension supports the 0.36.x line; 0.36.5 is the
-  currently tested version).
+- Headroom 0.36.2 through 0.40.x; 0.40.0 is the currently tested version.
 - A reusable GitHub Copilot OAuth credential saved by
   `headroom copilot-auth login`.
 - Both `OPENAI_TARGET_API_URL` and `ANTHROPIC_TARGET_API_URL` set to
@@ -75,8 +74,8 @@ New ghc-proxy releases produced by the current workflow include a universal
 it, or install directly from a checkout of this repository:
 
 ```bash
-python -m pip install "headroom-ai[proxy,code,ml,memory,relevance]>=0.36.2,<0.37"
-python -m pip install ./headroom_ghc_plugin-1.5.3-py3-none-any.whl
+python -m pip install "headroom-ai[proxy,code,ml,memory,relevance]>=0.36.2,<0.41"
+python -m pip install ./headroom_ghc_plugin-1.5.4-py3-none-any.whl
 # Source checkout alternative: python -m pip install ./plugins/headroom-ghc
 python -m headroom.cli copilot-auth login
 ```
@@ -158,7 +157,8 @@ Expected results:
   `standalone_port: null`;
 - `/api/usage` reports the Copilot plan, token-based billing flag, quotas, and
   AI Credits observed during this Headroom process;
-- `/v1/models` returns the live Copilot catalog.
+- `/v1/models` returns the live Copilot catalog with top-level context limits;
+  requests carrying `client_version` receive the ChatGPT/Codex `models` schema.
 
 The compatibility endpoints are loopback-only and never return OAuth tokens.
 Use Headroom `/stats` for compression and provider-cache metrics. Use
@@ -168,11 +168,11 @@ Use Headroom `/stats` for compression and provider-cache metrics. Use
 
 The repository includes migration helpers for the existing supervised Windows
 service layout. Build the extension wheel first, place the verified Headroom
-wheel under `target/headroom-upgrade-0.36.5`, then run the migration from an
+wheel under `target/headroom-upgrade-0.40.0`, then run the migration from an
 elevated PowerShell:
 
 ```powershell
-python -m pip wheel --no-deps --wheel-dir target/headroom-upgrade-0.36.5 plugins/headroom-ghc
+python -m pip wheel --no-deps --wheel-dir target/headroom-upgrade-0.40.0 plugins/headroom-ghc
 & .\scripts\migrate-headroom-ghc-plugin.ps1
 ```
 

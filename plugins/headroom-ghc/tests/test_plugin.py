@@ -13,10 +13,44 @@ from headroom_ghc_plugin import (
     GhcCompatibilityMiddleware,
     ModelMappings,
     UsageRecorder,
+    adapt_model_catalog,
     load_model_mappings,
     rewrite_json_body,
     summarize_quota,
 )
+
+
+def model_catalog() -> dict:
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": "gpt-6.1-sol",
+                "name": "GPT-6.1 Sol",
+                "vendor": "OpenAI",
+                "model_picker_enabled": True,
+                "supported_endpoints": ["/responses", "ws:/responses"],
+                "capabilities": {
+                    "limits": {
+                        "max_context_window_tokens": 1_050_000,
+                        "max_output_tokens": 128_000,
+                    },
+                    "supports": {
+                        "parallel_tool_calls": True,
+                        "reasoning_effort": ["none", "medium", "high"],
+                        "vision": True,
+                    },
+                },
+            },
+            {
+                "id": "chat-only",
+                "supported_endpoints": ["/chat/completions"],
+                "capabilities": {
+                    "limits": {"max_context_window_tokens": 128_000}
+                },
+            },
+        ],
+    }
 
 
 class ModelMappingTests(unittest.TestCase):
@@ -55,6 +89,36 @@ class ModelMappingTests(unittest.TestCase):
         self.assertEqual(original, "sonnet")
         self.assertEqual(translated, "claude-sonnet-5")
         self.assertEqual(json.loads(body)["model"], "claude-sonnet-5")
+
+
+class ModelCatalogTests(unittest.TestCase):
+    def test_openai_catalog_promotes_context_limits(self) -> None:
+        result = adapt_model_catalog(model_catalog(), codex=False)
+        model = result["data"][0]
+        self.assertEqual(model["id"], "gpt-6.1-sol")
+        self.assertEqual(model["context_window"], 1_050_000)
+        self.assertEqual(model["max_context_window"], 1_050_000)
+        self.assertEqual(model["max_output_tokens"], 128_000)
+        self.assertTrue(model["supports_1m_context"])
+        self.assertIn("capabilities", model)
+
+    def test_codex_catalog_uses_copilot_context_window(self) -> None:
+        result = adapt_model_catalog(model_catalog(), codex=True)
+        self.assertEqual(len(result["models"]), 1)
+        model = result["models"][0]
+        self.assertEqual(model["slug"], "gpt-6.1-sol")
+        self.assertEqual(model["display_name"], "GPT-6.1 Sol")
+        self.assertEqual(model["context_window"], 1_050_000)
+        self.assertEqual(model["max_context_window"], 1_050_000)
+        self.assertEqual(model["visibility"], "list")
+
+    def test_catalog_rejects_non_json_integer_limits(self) -> None:
+        catalog = model_catalog()
+        catalog["data"][0]["capabilities"]["limits"]["max_context_window_tokens"] = True
+        result = adapt_model_catalog(catalog, codex=False)
+        self.assertIsNone(result["data"][0]["context_window"])
+        self.assertFalse(result["data"][0]["supports_1m_context"])
+        self.assertEqual(adapt_model_catalog(catalog, codex=True)["models"], [])
 
 
 class UsageTests(unittest.TestCase):
@@ -115,6 +179,68 @@ class UsageTests(unittest.TestCase):
 
 
 class MiddlewareTests(unittest.TestCase):
+    def test_client_version_rewrites_catalog_and_content_length(self) -> None:
+        raw = json.dumps(model_catalog()).encode()
+
+        async def downstream(_scope, _receive, send) -> None:
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 200,
+                    "headers": [
+                        (b"content-type", b"application/json"),
+                        (b"content-length", str(len(raw)).encode()),
+                    ],
+                }
+            )
+            midpoint = len(raw) // 2
+            await send(
+                {
+                    "type": "http.response.body",
+                    "body": raw[:midpoint],
+                    "more_body": True,
+                }
+            )
+            await send(
+                {
+                    "type": "http.response.body",
+                    "body": raw[midpoint:],
+                    "more_body": False,
+                }
+            )
+
+        middleware = GhcCompatibilityMiddleware(
+            downstream,
+            mappings=ModelMappings(),
+            recorder=UsageRecorder(),
+        )
+        sent: list[dict] = []
+
+        async def receive() -> dict:
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(message: dict) -> None:
+            sent.append(message)
+
+        scope = {
+            "type": "http",
+            "method": "GET",
+            "path": "/v1/models",
+            "query_string": b"client_version=1.0.0",
+            "headers": [],
+        }
+        asyncio.run(middleware(scope, receive, send))
+
+        self.assertEqual([message["type"] for message in sent], [
+            "http.response.start",
+            "http.response.body",
+        ])
+        body = sent[1]["body"]
+        result = json.loads(body)
+        self.assertEqual(result["models"][0]["slug"], "gpt-6.1-sol")
+        self.assertEqual(result["models"][0]["context_window"], 1_050_000)
+        self.assertEqual(dict(sent[0]["headers"])[b"content-length"], str(len(body)).encode())
+
     def test_http_replay_waits_for_real_client_disconnect(self) -> None:
         receive_calls = 0
         release_disconnect = asyncio.Event()

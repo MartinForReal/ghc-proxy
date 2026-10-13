@@ -814,7 +814,7 @@ dependencies = [
 
 [[package]]
 name = "ghc-proxy"
-version = "1.5.3"
+version = "1.5.4"
 dependencies = [
  "async-stream",
  "axum",

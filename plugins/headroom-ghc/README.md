@@ -3,8 +3,9 @@
 Runs GitHub Copilot subscription inference through Headroom's native transport,
 without a standalone `ghc-proxy` listener.
 
-The extension is intentionally small. Headroom 0.36.x owns HTTP/SSE/WebSocket
-forwarding and Copilot token refresh. This package adds compatibility behavior:
+The extension is intentionally small. Supported Headroom releases own
+HTTP/SSE/WebSocket forwarding and Copilot token refresh. This package adds
+compatibility behavior:
 
 - model aliases loaded from `%APPDATA%/ghc-tunnel/config.yaml`;
 - saved Headroom Copilot OAuth bridging for quota tracking;
