@@ -6,7 +6,7 @@ mod request_json;
 use crate::anthropic::{self, AnthropicStreamState};
 use crate::gemini;
 use crate::responses as codex;
-use crate::state::SharedState;
+use crate::state::{CopilotUrl, SharedState};
 use crate::store::RequestRecord;
 use crate::translate;
 use crate::util;
@@ -1258,7 +1258,7 @@ async fn responses(State(state): State<SharedState>, body: Bytes) -> Response {
     set_initiator(&mut headers, agent);
 
     let req_size = body.len();
-    let url = format!("{}/responses", state.copilot_base_url());
+    let url = state.copilot_url("/responses");
     let is_stream = req.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
     let payload = serde_json::to_vec(&req).unwrap_or_default();
     log_debug_request(&state, "/v1/responses", &req);
@@ -1919,7 +1919,7 @@ async fn messages_direct(
     .await;
     set_initiator(&mut headers, agent);
 
-    let url = format!("{}/v1/messages", state.copilot_base_url());
+    let url = state.copilot_url("/v1/messages");
     let is_stream = req.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
 
     let mut current = req.clone();
@@ -1934,9 +1934,8 @@ async fn messages_direct(
         log_debug_request(&state, "/v1/messages", &sanitized);
 
         if is_stream {
-            let upstream = state
-                .http
-                .post(&url)
+            let upstream = url
+                .post(&state.http)
                 .headers(headers.clone())
                 .body(payload)
                 .send()
@@ -2164,7 +2163,7 @@ async fn messages_translated(
                 })
             })
             .unwrap_or(false);
-        let url = format!("{}/chat/completions", state.copilot_base_url());
+        let url = state.copilot_url("/chat/completions");
         let mut headers = state.copilot_headers(vision).await;
         set_initiator(&mut headers, agent);
         let payload = serde_json::to_vec(&openai_req).unwrap_or_default();
@@ -2338,7 +2337,7 @@ async fn count_tokens(
             translate::split_context_1m(&original_model).1,
         )
         .await;
-        let url = format!("{}/v1/messages/count_tokens", state.copilot_base_url());
+        let url = state.copilot_url("/v1/messages/count_tokens");
         // Counting writes no cache entry, so the ttl is irrelevant here.
         let payload = serde_json::to_vec(&anthropic::sanitize_anthropic_request(&req, false))
             .unwrap_or_default();
@@ -2559,7 +2558,7 @@ fn collect_text_for_count(openai_req: &Value) -> String {
 #[allow(clippy::too_many_arguments)]
 async fn stream_gemini(
     state: SharedState,
-    url: &str,
+    url: &CopilotUrl,
     headers: HeaderMap,
     payload: Vec<u8>,
     original_model: String,
@@ -2570,9 +2569,8 @@ async fn stream_gemini(
     let req_body = state
         .is_debug()
         .then(|| String::from_utf8_lossy(&payload).into_owned());
-    let upstream = state
-        .http
-        .post(url)
+    let upstream = url
+        .post(&state.http)
         .headers(headers)
         .body(payload)
         .send()
@@ -2723,7 +2721,7 @@ async fn embeddings(State(state): State<SharedState>, body: Bytes) -> Response {
         .to_string();
     let req_size = body.len();
     let headers = state.copilot_headers(false).await;
-    let url = format!("{}/embeddings", state.copilot_base_url());
+    let url = state.copilot_url("/embeddings");
     let payload = serde_json::to_vec(&req).unwrap_or_default();
     log_debug_request(&state, "/v1/embeddings", &req);
 
@@ -2944,7 +2942,7 @@ fn anthropic_error(status: StatusCode, msg: String) -> Response {
 #[allow(clippy::too_many_arguments)]
 async fn stream_openai(
     state: SharedState,
-    url: &str,
+    url: &CopilotUrl,
     headers: HeaderMap,
     mut req: Value,
     endpoint: &'static str,
@@ -2957,9 +2955,8 @@ async fn stream_openai(
     let mut payload = serde_json::to_vec(&req).unwrap_or_default();
     let mut retried_param = false;
     let upstream = loop {
-        let upstream = state
-            .http
-            .post(url)
+        let upstream = url
+            .post(&state.http)
             .headers(headers.clone())
             .body(payload.clone())
             .send()
@@ -3132,7 +3129,7 @@ async fn stream_openai(
 #[allow(clippy::too_many_arguments)]
 async fn stream_responses(
     state: SharedState,
-    url: &str,
+    url: &CopilotUrl,
     headers: HeaderMap,
     payload: Vec<u8>,
     req: Value,
@@ -3142,9 +3139,8 @@ async fn stream_responses(
     start: Instant,
 ) -> Response {
     let req_body = capture_json(&state, &req);
-    let upstream = state
-        .http
-        .post(url)
+    let upstream = url
+        .post(&state.http)
         .headers(headers)
         .body(payload)
         .send()
@@ -3413,7 +3409,7 @@ async fn stream_anthropic_direct(
 #[allow(clippy::too_many_arguments)]
 async fn stream_anthropic_translated(
     state: SharedState,
-    url: &str,
+    url: &CopilotUrl,
     headers: HeaderMap,
     payload: Vec<u8>,
     original_model: String,
@@ -3425,9 +3421,8 @@ async fn stream_anthropic_translated(
     let req_body = state
         .is_debug()
         .then(|| String::from_utf8_lossy(&payload).into_owned());
-    let upstream = state
-        .http
-        .post(url)
+    let upstream = url
+        .post(&state.http)
         .headers(headers)
         .body(payload)
         .send()

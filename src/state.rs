@@ -152,6 +152,23 @@ fn now_secs() -> u64 {
 /// under the ~60s idle cutoff typical of load balancers and NAT tables.
 const UPSTREAM_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
 
+/// A credentialed HTTP destination. Construct only from a fixed Copilot origin;
+/// set_path cannot replace its scheme or authority.
+pub struct CopilotUrl(reqwest::Url);
+
+impl CopilotUrl {
+    fn new(config: &Config, path: &str) -> Self {
+        let mut url = reqwest::Url::parse(config.copilot_base_url())
+            .expect("Copilot origins are fixed HTTPS URLs");
+        url.set_path(path);
+        Self(url)
+    }
+
+    pub(crate) fn post(&self, client: &reqwest::Client) -> reqwest::RequestBuilder {
+        client.post(self.0.clone())
+    }
+}
+
 /// How long to serve local token estimates after the upstream counting endpoint
 /// reports a rate limit.
 const COUNTING_COOLDOWN: Duration = Duration::from_secs(60);
@@ -189,6 +206,8 @@ impl AppState {
         // partway through the answer.
         let builder = reqwest::Client::builder()
             .https_only(true)
+            // A credentialed request must not be replayed at a redirected origin.
+            .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(30))
             .pool_idle_timeout(Duration::from_secs(90))
             .tcp_keepalive(UPSTREAM_KEEPALIVE_INTERVAL)
@@ -347,6 +366,10 @@ impl AppState {
         self.config.read().unwrap().copilot_base_url()
     }
 
+    pub(crate) fn copilot_url(&self, path: &str) -> CopilotUrl {
+        CopilotUrl::new(&self.config.read().unwrap(), path)
+    }
+
     pub fn config_path(&self) -> String {
         config::config_path().display().to_string()
     }
@@ -447,8 +470,8 @@ impl AppState {
     }
 
     /// Resolves the Copilot chat-completions URL and headers.
-    pub async fn chat_upstream(&self, vision: bool) -> (String, HeaderMap) {
-        let url = format!("{}/chat/completions", self.copilot_base_url());
+    pub async fn chat_upstream(&self, vision: bool) -> (CopilotUrl, HeaderMap) {
+        let url = self.copilot_url("/chat/completions");
         (url, self.copilot_headers(vision).await)
     }
 
@@ -504,11 +527,11 @@ impl AppState {
     /// Fetches the list of available models from upstream and caches it.
     pub async fn load_models(&self) -> Result<(), String> {
         self.ensure_copilot_token().await?;
-        let url = format!("{}/models", self.copilot_base_url());
+        let url = self.copilot_url("/models");
         let headers = self.copilot_headers(false).await;
         let resp = self
             .http
-            .get(&url)
+            .get(url.0)
             .headers(headers)
             .send()
             .await
@@ -1023,6 +1046,22 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.is_builder());
+    }
+
+    #[test]
+    fn endpoint_paths_cannot_replace_the_credential_destination() {
+        let cfg = Config::default();
+        for path in [
+            "/v1/messages",
+            "//example.invalid/resource",
+            "http://example.invalid",
+        ] {
+            let endpoint = CopilotUrl::new(&cfg, path);
+            assert_eq!(
+                endpoint.0.origin().ascii_serialization(),
+                cfg.copilot_base_url()
+            );
+        }
     }
 
     #[test]
