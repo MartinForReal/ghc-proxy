@@ -152,20 +152,48 @@ fn now_secs() -> u64 {
 /// under the ~60s idle cutoff typical of load balancers and NAT tables.
 const UPSTREAM_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
 
-/// A credentialed HTTP destination. Construct only from a fixed Copilot origin;
-/// set_path cannot replace its scheme or authority.
-pub struct CopilotUrl(reqwest::Url);
+/// Credentialed requests only target entries in this closed set. No request
+/// field, API key or config string is used to serialize any part of the URL.
+pub(crate) enum CopilotEndpoint {
+    Models,
+    ChatCompletions,
+    Responses,
+    Messages,
+    CountTokens,
+    Embeddings,
+}
+
+pub struct CopilotUrl(&'static str);
 
 impl CopilotUrl {
-    fn new(config: &Config, path: &str) -> Self {
-        let mut url = reqwest::Url::parse(config.copilot_base_url())
-            .expect("Copilot origins are fixed HTTPS URLs");
-        url.set_path(path);
-        Self(url)
+    fn new(tier: config::AccountType, endpoint: CopilotEndpoint) -> Self {
+        macro_rules! urls {
+            ($path:literal) => {
+                [
+                    concat!("https://api.githubcopilot.com", $path),
+                    concat!("https://api.business.githubcopilot.com", $path),
+                    concat!("https://api.enterprise.githubcopilot.com", $path),
+                ]
+            };
+        }
+        let urls = match endpoint {
+            CopilotEndpoint::Models => urls!("/models"),
+            CopilotEndpoint::ChatCompletions => urls!("/chat/completions"),
+            CopilotEndpoint::Responses => urls!("/responses"),
+            CopilotEndpoint::Messages => urls!("/v1/messages"),
+            CopilotEndpoint::CountTokens => urls!("/v1/messages/count_tokens"),
+            CopilotEndpoint::Embeddings => urls!("/embeddings"),
+        };
+        let index = match tier {
+            config::AccountType::Individual => 0,
+            config::AccountType::Business => 1,
+            config::AccountType::Enterprise => 2,
+        };
+        Self(urls[index])
     }
 
     pub(crate) fn post(&self, client: &reqwest::Client) -> reqwest::RequestBuilder {
-        client.post(self.0.clone())
+        client.post(self.0)
     }
 }
 
@@ -366,8 +394,8 @@ impl AppState {
         self.config.read().unwrap().copilot_base_url()
     }
 
-    pub(crate) fn copilot_url(&self, path: &str) -> CopilotUrl {
-        CopilotUrl::new(&self.config.read().unwrap(), path)
+    pub(crate) fn copilot_url(&self, endpoint: CopilotEndpoint) -> CopilotUrl {
+        CopilotUrl::new(self.config.read().unwrap().account_type, endpoint)
     }
 
     pub fn config_path(&self) -> String {
@@ -471,7 +499,7 @@ impl AppState {
 
     /// Resolves the Copilot chat-completions URL and headers.
     pub async fn chat_upstream(&self, vision: bool) -> (CopilotUrl, HeaderMap) {
-        let url = self.copilot_url("/chat/completions");
+        let url = self.copilot_url(CopilotEndpoint::ChatCompletions);
         (url, self.copilot_headers(vision).await)
     }
 
@@ -527,7 +555,7 @@ impl AppState {
     /// Fetches the list of available models from upstream and caches it.
     pub async fn load_models(&self) -> Result<(), String> {
         self.ensure_copilot_token().await?;
-        let url = self.copilot_url("/models");
+        let url = self.copilot_url(CopilotEndpoint::Models);
         let headers = self.copilot_headers(false).await;
         let resp = self
             .http
@@ -1049,18 +1077,34 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_paths_cannot_replace_the_credential_destination() {
-        let cfg = Config::default();
-        for path in [
-            "/v1/messages",
-            "//example.invalid/resource",
-            "http://example.invalid",
-        ] {
-            let endpoint = CopilotUrl::new(&cfg, path);
-            assert_eq!(
-                endpoint.0.origin().ascii_serialization(),
-                cfg.copilot_base_url()
-            );
+    fn credentialed_requests_only_use_the_public_origin_and_route() {
+        use config::AccountType::{Business, Enterprise, Individual};
+        for tier in [Individual, Business, Enterprise] {
+            let cfg = Config {
+                account_type: tier,
+                api_key: Some("local-test-key".into()),
+                ..Config::default()
+            };
+            let state = AppState::new(cfg, "github-test-key".into());
+            for (endpoint, path) in [
+                (CopilotEndpoint::Models, "/models"),
+                (CopilotEndpoint::ChatCompletions, "/chat/completions"),
+                (CopilotEndpoint::Responses, "/responses"),
+                (CopilotEndpoint::Messages, "/v1/messages"),
+                (CopilotEndpoint::CountTokens, "/v1/messages/count_tokens"),
+                (CopilotEndpoint::Embeddings, "/embeddings"),
+            ] {
+                let request = state
+                    .copilot_url(endpoint)
+                    .post(&state.http)
+                    .bearer_auth("copilot-test-key")
+                    .build()
+                    .unwrap();
+                assert_eq!(
+                    request.url().as_str(),
+                    format!("{}{path}", state.copilot_base_url())
+                );
+            }
         }
     }
 

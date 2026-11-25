@@ -6,7 +6,7 @@ mod request_json;
 use crate::anthropic::{self, AnthropicStreamState};
 use crate::gemini;
 use crate::responses as codex;
-use crate::state::{CopilotUrl, SharedState};
+use crate::state::{CopilotEndpoint, CopilotUrl, SharedState};
 use crate::store::RequestRecord;
 use crate::translate;
 use crate::util;
@@ -1258,7 +1258,7 @@ async fn responses(State(state): State<SharedState>, body: Bytes) -> Response {
     set_initiator(&mut headers, agent);
 
     let req_size = body.len();
-    let url = state.copilot_url("/responses");
+    let url = state.copilot_url(CopilotEndpoint::Responses);
     let is_stream = req.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
     let payload = serde_json::to_vec(&req).unwrap_or_default();
     log_debug_request(&state, "/v1/responses", &req);
@@ -1919,7 +1919,7 @@ async fn messages_direct(
     .await;
     set_initiator(&mut headers, agent);
 
-    let url = state.copilot_url("/v1/messages");
+    let url = state.copilot_url(CopilotEndpoint::Messages);
     let is_stream = req.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
 
     let mut current = req.clone();
@@ -2163,7 +2163,7 @@ async fn messages_translated(
                 })
             })
             .unwrap_or(false);
-        let url = state.copilot_url("/chat/completions");
+        let url = state.copilot_url(CopilotEndpoint::ChatCompletions);
         let mut headers = state.copilot_headers(vision).await;
         set_initiator(&mut headers, agent);
         let payload = serde_json::to_vec(&openai_req).unwrap_or_default();
@@ -2337,7 +2337,7 @@ async fn count_tokens(
             translate::split_context_1m(&original_model).1,
         )
         .await;
-        let url = state.copilot_url("/v1/messages/count_tokens");
+        let url = state.copilot_url(CopilotEndpoint::CountTokens);
         // Counting writes no cache entry, so the ttl is irrelevant here.
         let payload = serde_json::to_vec(&anthropic::sanitize_anthropic_request(&req, false))
             .unwrap_or_default();
@@ -2721,7 +2721,7 @@ async fn embeddings(State(state): State<SharedState>, body: Bytes) -> Response {
         .to_string();
     let req_size = body.len();
     let headers = state.copilot_headers(false).await;
-    let url = state.copilot_url("/embeddings");
+    let url = state.copilot_url(CopilotEndpoint::Embeddings);
     let payload = serde_json::to_vec(&req).unwrap_or_default();
     log_debug_request(&state, "/v1/embeddings", &req);
 
