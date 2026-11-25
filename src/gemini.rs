@@ -216,7 +216,9 @@ pub fn gemini_to_openai(req: &Value, model: &str, stream: bool) -> Value {
             .and_then(Value::as_str);
         if mime == Some("application/json") {
             let schema = gc
-                .get("responseSchema")
+                .get("responseJsonSchema")
+                .or_else(|| gc.get("response_json_schema"))
+                .or_else(|| gc.get("responseSchema"))
                 .or_else(|| gc.get("response_schema"));
             out.insert(
                 "response_format".into(),
@@ -243,7 +245,10 @@ pub fn gemini_to_openai(req: &Value, model: &str, stream: bool) -> Value {
                 "function": {
                     "name": decl.get("name").cloned().unwrap_or(Value::Null),
                     "description": decl.get("description").cloned().unwrap_or(Value::Null),
-                    "parameters": decl.get("parameters").cloned().unwrap_or(json!({"type": "object"}))
+                    "parameters": decl.get("parametersJsonSchema")
+                        .or_else(|| decl.get("parameters_json_schema"))
+                        .or_else(|| decl.get("parameters"))
+                        .cloned().unwrap_or_else(|| json!({"type": "object"}))
                 }
             }));
         }
@@ -261,6 +266,7 @@ pub fn map_finish_reason(reason: Option<&str>) -> &'static str {
         Some("stop") | Some("tool_calls") => "STOP",
         Some("length") => "MAX_TOKENS",
         Some("content_filter") => "SAFETY",
+        Some("OTHER") => "OTHER",
         _ => "STOP",
     }
 }
@@ -298,10 +304,9 @@ fn usage_to_gemini(usage: &Value) -> Value {
 /// Converts an OpenAI chat-completion response into a Gemini
 /// `generateContent` response.
 pub fn openai_to_gemini(resp: &Value) -> Value {
-    let mut parts: Vec<Value> = Vec::new();
-    let mut finish: Option<String> = None;
-
-    for choice in arr(resp, "choices") {
+    let mut candidates = Vec::new();
+    for (position, choice) in arr(resp, "choices").into_iter().enumerate() {
+        let mut parts: Vec<Value> = Vec::new();
         if let Some(message) = choice.get("message") {
             if let Some(text) = message.get("content").and_then(|c| c.as_str()) {
                 if !text.is_empty() {
@@ -326,21 +331,58 @@ pub fn openai_to_gemini(resp: &Value) -> Value {
                 }
             }
         }
-        if let Some(fr) = choice.get("finish_reason").and_then(|f| f.as_str()) {
-            finish = Some(fr.to_string());
-        }
+        candidates.push(json!({
+            "content": {"role": "model", "parts": parts},
+            "finishReason": map_finish_reason(choice["finish_reason"].as_str()),
+            "index": choice["index"].as_u64().unwrap_or(position as u64)
+        }));
     }
 
     let usage = resp.get("usage").cloned().unwrap_or(json!({}));
     json!({
-        "candidates": [{
-            "content": {"role": "model", "parts": parts},
-            "finishReason": map_finish_reason(finish.as_deref()),
-            "index": 0
-        }],
+        "candidates": candidates,
         "usageMetadata": usage_to_gemini(&usage),
         "modelVersion": resp.get("model").cloned().unwrap_or(Value::Null)
     })
+}
+
+/// Upstream can interleave choices or send usage separately after they finish.
+#[derive(Default)]
+pub(crate) struct StreamCandidates {
+    finishes: std::collections::BTreeMap<u64, Option<String>>,
+}
+
+impl StreamCandidates {
+    pub(crate) fn observe(&mut self, chunk: &Value, model: &Value) -> Option<Value> {
+        let mut deltas = Vec::new();
+        for (position, choice) in chunk["choices"].as_array()?.iter().enumerate() {
+            let index = choice["index"].as_u64().unwrap_or(position as u64);
+            let finish = self.finishes.entry(index).or_default();
+            if let Some(reason) = choice["finish_reason"].as_str() {
+                *finish = Some(reason.to_owned());
+            }
+            if let Some(text) = choice["delta"]["content"]
+                .as_str()
+                .filter(|t| !t.is_empty())
+            {
+                deltas.push(
+                    json!({"index":index,"content":{"role":"model","parts":[{"text":text}]}}),
+                );
+            }
+        }
+        (!deltas.is_empty()).then(|| json!({"candidates":deltas,"modelVersion":model}))
+    }
+
+    pub(crate) fn finish(mut self, interrupted: bool, usage: &Value, model: &Value) -> Value {
+        if self.finishes.is_empty() {
+            self.finishes.insert(0, None);
+        }
+        let candidates: Vec<_> = self.finishes.into_iter().map(|(index, reason)| {
+            let reason = reason.as_deref().or(interrupted.then_some("OTHER"));
+            json!({"index":index,"content":{"role":"model","parts":[]},"finishReason":map_finish_reason(reason)})
+        }).collect();
+        json!({"candidates":candidates,"usageMetadata":usage_to_gemini(usage),"modelVersion":model})
+    }
 }
 
 /// Builds a single Gemini streaming chunk from a text delta.
@@ -492,6 +534,62 @@ mod tests {
         let out = gemini_to_openai(&req, "m", false);
         assert_eq!(out["tools"][0]["type"], "function");
         assert_eq!(out["tools"][0]["function"]["name"], "get_weather");
+    }
+
+    #[test]
+    fn sdk_json_schemas_survive_translation() {
+        let schema =
+            json!({"type":"object","properties":{"label":{"type":"string"}},"required":["label"]});
+        let out = gemini_to_openai(
+            &json!({
+                "generationConfig":{"responseMimeType":"application/json","responseJsonSchema":schema},
+                "tools":[{"functionDeclarations":[{"name":"label","parametersJsonSchema":schema}]}]
+            }),
+            "m",
+            false,
+        );
+        assert_eq!(out["response_format"]["json_schema"]["schema"], schema);
+        assert_eq!(out["tools"][0]["function"]["parameters"], schema);
+    }
+
+    #[test]
+    fn multiple_choices_remain_independent_in_json_and_streams() {
+        let out = openai_to_gemini(&json!({"choices":[
+            {"index":1,"message":{"content":"second"},"finish_reason":"length"},
+            {"index":0,"message":{"content":"first"},"finish_reason":"stop"}
+        ]}));
+        let candidates = out["candidates"].as_array().unwrap();
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0]["index"], 1);
+        assert_eq!(
+            candidates[0]["content"]["parts"],
+            json!([{"text":"second"}])
+        );
+        assert_eq!(candidates[0]["finishReason"], "MAX_TOKENS");
+        assert_eq!(candidates[1]["content"]["parts"], json!([{"text":"first"}]));
+
+        let mut stream = StreamCandidates::default();
+        let model = json!("m");
+        let event = stream
+            .observe(
+                &json!({"choices":[
+                    {"index":1,"delta":{"content":"second"},"finish_reason":"length"},
+                    {"index":0,"delta":{"content":"first"}}
+                ]}),
+                &model,
+            )
+            .unwrap();
+        assert_eq!(event["candidates"][0]["index"], 1);
+        assert_eq!(
+            event["candidates"][1]["content"]["parts"][0]["text"],
+            "first"
+        );
+        assert!(stream.observe(&json!({"choices":[]}), &model).is_none());
+        let end = stream.finish(true, &json!({"total_tokens":5}), &model);
+        assert_eq!(end["candidates"][0]["index"], 0);
+        assert_eq!(end["candidates"][0]["finishReason"], "OTHER");
+        assert_eq!(end["candidates"][1]["finishReason"], "MAX_TOKENS");
+        assert_eq!(end["usageMetadata"]["totalTokenCount"], 5);
     }
 
     #[test]

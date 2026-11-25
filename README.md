@@ -47,11 +47,11 @@ file.
   query so per-model context windows come from the live Copilot catalog.
 - **Anthropic-compatible** `/v1/messages` endpoint (direct passthrough when the
   upstream model supports it, otherwise translated through chat completions).
-- **Gemini-compatible** `/v1beta/models/{model}:generateContent`,
+- **Gemini-compatible** `/v1/models/{model}:generateContent`,
   `:streamGenerateContent`, and `:countTokens` endpoints (translated through chat
-  completions). `generationConfig` parameters with an OpenAI counterpart are
+  completions; `/v1beta` is also supported). `generationConfig` parameters with an OpenAI counterpart are
   carried across — `temperature`, `topP`, `maxOutputTokens`, `stopSequences`,
-  `candidateCount`, `seed`, the penalties, and `responseMimeType`/`responseSchema`
+  `candidateCount`, `seed`, the penalties, and `responseMimeType` with `responseJsonSchema` or `responseSchema`
   as `response_format`. `topK` and `safetySettings` have no counterpart and are
   dropped, which the dashboard states rather than leaving you to assume they
   took effect.
@@ -244,6 +244,10 @@ The `/api/config/` routes are guarded by the API key when one is configured;
 the read-only dashboard endpoints stay open.
 
 ## Example Usage
+
+To use the proxy from a GitHub Copilot SDK v2 application, see the
+[Python client setup](docs/api.md#github-copilot-sdk-v2). The Rust server
+does not need the SDK installed.
 
 ### OpenAI SDK
 
