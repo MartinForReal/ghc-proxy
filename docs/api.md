@@ -17,8 +17,10 @@ require a key on the LLM endpoints; see [Authentication](#authentication) below.
 
 ## Endpoints
 
-Inference HTTP requests accept JSON objects up to 32 MiB. Malformed or
-non-object JSON receives HTTP 400; oversized requests receive HTTP 413.
+Inference HTTP requests accept JSON objects up to 32 MiB. There is a shared
+limit of 262,144 field values and array elements across the request, including
+nested objects and arrays. Invalid JSON, non-object requests, or requests over
+the value limit receive HTTP 400; exceeding the byte limit returns HTTP 413.
 
 | Method & path | Description |
 |---------------|-------------|

@@ -1,6 +1,8 @@
 //! HTTP server: route definitions and request handlers for the OpenAI- and
 //! Anthropic-compatible proxy endpoints, plus the analytics dashboard API.
 
+mod request_json;
+
 use crate::anthropic::{self, AnthropicStreamState};
 use crate::gemini;
 use crate::responses as codex;
@@ -265,16 +267,12 @@ fn parse_body(body: &Bytes) -> Result<Value, Response> {
             "Request exceeds 32 MiB".into(),
         ));
     }
-    // All inference APIs take objects. Deserialize data only, retaining
-    // provider-specific fields and serde_json's default nesting limit.
-    serde_json::from_slice::<serde_json::Map<String, Value>>(body)
-        .map(Value::Object)
-        .map_err(|_| {
-            error_response(
-                StatusCode::BAD_REQUEST,
-                "Expected a valid JSON object".into(),
-            )
-        })
+    request_json::parse_object(body).map_err(|_| {
+        error_response(
+            StatusCode::BAD_REQUEST,
+            "Expected a JSON object within the request complexity limit".into(),
+        )
+    })
 }
 
 fn error_response(status: StatusCode, msg: String) -> Response {
@@ -2295,13 +2293,13 @@ async fn count_tokens(
     client_headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let mut req = match parse_body(&body) {
+        Ok(v) => v,
+        Err(response) => return response,
+    };
     if state.ensure_copilot_token().await.is_err() {
         return Json(json!({"input_tokens": 1})).into_response();
     }
-    let mut req = match parse_body(&body) {
-        Ok(v) => v,
-        Err(_) => return Json(json!({"input_tokens": 1})).into_response(),
-    };
     let original_model = req
         .get("model")
         .and_then(|m| m.as_str())
