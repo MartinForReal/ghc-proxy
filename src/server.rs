@@ -3669,7 +3669,7 @@ where
                                 yield Ok(Bytes::from(whole));
                             }
                         }
-                        Some(Err(e)) => yield Err(e),
+                        Some(Err(never)) => match never {},
                         None => break,
                     }
                 }
