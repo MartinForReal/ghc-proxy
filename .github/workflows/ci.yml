@@ -16,7 +16,7 @@ env:
 jobs:
   dashboard:
     name: Dashboard (Playwright)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04 # Supported by the pinned Playwright browser dependencies.
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
