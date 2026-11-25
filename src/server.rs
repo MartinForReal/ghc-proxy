@@ -25,6 +25,8 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+const MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
+
 /// Builds the application router with all routes mounted.
 pub fn router(state: SharedState) -> Router {
     Router::new()
@@ -64,7 +66,7 @@ pub fn router(state: SharedState) -> Router {
             state.clone(),
             auth_middleware,
         ))
-        .layer(DefaultBodyLimit::max(20 * 1024 * 1024 * 1024)) // 20 GB limit
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(state)
 }
 
@@ -257,13 +259,22 @@ fn capture_str(state: &SharedState, body: &str) -> Option<String> {
 
 #[allow(clippy::result_large_err)]
 fn parse_body(body: &Bytes) -> Result<Value, Response> {
-    serde_json::from_slice::<Value>(body).map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": format!("Invalid JSON body: {e}")})),
-        )
-            .into_response()
-    })
+    if body.len() > MAX_REQUEST_BODY_BYTES {
+        return Err(error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Request exceeds 32 MiB".into(),
+        ));
+    }
+    // All inference APIs take objects. Deserialize data only, retaining
+    // provider-specific fields and serde_json's default nesting limit.
+    serde_json::from_slice::<serde_json::Map<String, Value>>(body)
+        .map(Value::Object)
+        .map_err(|_| {
+            error_response(
+                StatusCode::BAD_REQUEST,
+                "Expected a valid JSON object".into(),
+            )
+        })
 }
 
 fn error_response(status: StatusCode, msg: String) -> Response {
@@ -4457,6 +4468,27 @@ async fn api_audit_summary(State(state): State<SharedState>) -> Response {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn inference_bodies_must_be_bounded_json_objects() {
+        assert_eq!(
+            parse_body(&Bytes::from_static(br#" {"extra":true} "#)).unwrap()["extra"],
+            true
+        );
+        for input in [b"[]".as_slice(), b"null", b"{", b"{} {}"] {
+            assert_eq!(
+                parse_body(&Bytes::from_static(input)).unwrap_err().status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
+        let mut body = vec![b' '; MAX_REQUEST_BODY_BYTES];
+        body[..2].copy_from_slice(b"{}");
+        body.push(b' ');
+        assert_eq!(
+            parse_body(&Bytes::from(body)).unwrap_err().status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+    }
+
     #[test]
     fn output_tokens_stay_provisional_until_message_delta() {
         let mut st = super::DirectStreamState::default();

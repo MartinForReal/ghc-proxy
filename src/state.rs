@@ -164,6 +164,14 @@ fn now_millis() -> u128 {
         .unwrap_or(0)
 }
 
+fn with_read_timeout(builder: reqwest::ClientBuilder, seconds: u64) -> reqwest::ClientBuilder {
+    if seconds == 0 {
+        builder
+    } else {
+        builder.read_timeout(Duration::from_secs(seconds))
+    }
+}
+
 impl AppState {
     pub fn new(config: Config, github_token: String) -> Self {
         // No global request timeout: SSE responses are long-lived streams, and
@@ -179,18 +187,17 @@ impl AppState {
         // that window, and an idle connection is what load balancers, NATs and
         // corporate middleboxes reap -- which surfaces as a truncated body
         // partway through the answer.
-        let mut builder = reqwest::Client::builder()
+        let builder = reqwest::Client::builder()
+            .https_only(true)
             .connect_timeout(Duration::from_secs(30))
             .pool_idle_timeout(Duration::from_secs(90))
             .tcp_keepalive(UPSTREAM_KEEPALIVE_INTERVAL)
             .http2_keep_alive_interval(UPSTREAM_KEEPALIVE_INTERVAL)
             .http2_keep_alive_timeout(Duration::from_secs(20))
             .http2_keep_alive_while_idle(true);
-        if config.upstream_read_timeout_seconds > 0 {
-            builder =
-                builder.read_timeout(Duration::from_secs(config.upstream_read_timeout_seconds));
-        }
-        let http = builder.build().expect("failed to build HTTP client");
+        let http = with_read_timeout(builder, config.upstream_read_timeout_seconds)
+            .build()
+            .expect("failed to build HTTP client");
         AppState {
             http,
             config: StdRwLock::new(config),
@@ -336,7 +343,7 @@ impl AppState {
             .cloned()
     }
 
-    pub fn copilot_base_url(&self) -> String {
+    pub fn copilot_base_url(&self) -> &'static str {
         self.config.read().unwrap().copilot_base_url()
     }
 
@@ -452,14 +459,12 @@ impl AppState {
     /// and `endpoints.api` is the only host involved. Discovered by probing;
     /// GitHub publishes no documentation for the inference API.
     pub async fn ws_responses_upstream(&self) -> (String, HeaderMap) {
-        let base = self.copilot_base_url();
-        let ws = match base.split_once("://") {
-            Some(("https", rest)) => format!("wss://{rest}"),
-            Some(("http", rest)) => format!("ws://{rest}"),
-            _ => base.clone(),
-        };
+        let host = self
+            .copilot_base_url()
+            .strip_prefix("https://")
+            .expect("Copilot endpoints are fixed HTTPS origins");
         (
-            format!("{}/responses", ws.trim_end_matches('/')),
+            format!("wss://{host}/responses"),
             self.copilot_headers(false).await,
         )
     }
@@ -974,13 +979,10 @@ mod tests {
     #[tokio::test]
     async fn read_timeout_surfaces_a_stalled_upstream_as_an_error() {
         let url = stalling_upstream().await;
-        let cfg = Config {
-            upstream_read_timeout_seconds: 1,
-            ..Default::default()
-        };
-        let state = AppState::new(cfg, "token".into());
-
-        let resp = state.http.get(&url).send().await.expect("headers arrive");
+        let client = with_read_timeout(reqwest::Client::builder(), 1)
+            .build()
+            .unwrap();
+        let resp = client.get(&url).send().await.expect("headers arrive");
         assert!(resp.status().is_success());
 
         let mut stream = resp.bytes_stream();
@@ -1001,16 +1003,26 @@ mod tests {
     #[tokio::test]
     async fn read_timeout_can_be_disabled() {
         let url = stalling_upstream().await;
-        let cfg = Config {
-            upstream_read_timeout_seconds: 0,
-            ..Default::default()
-        };
-        let state = AppState::new(cfg, "token".into());
-        let resp = state.http.get(&url).send().await.expect("headers arrive");
+        let client = with_read_timeout(reqwest::Client::builder(), 0)
+            .build()
+            .unwrap();
+        let resp = client.get(&url).send().await.expect("headers arrive");
         let mut stream = resp.bytes_stream();
         let _ = stream.next().await;
         let outcome = tokio::time::timeout(Duration::from_secs(3), stream.next()).await;
         assert!(outcome.is_err(), "expected the stream to still be hanging");
+    }
+
+    #[tokio::test]
+    async fn upstream_transport_rejects_plain_http_before_connecting() {
+        let state = AppState::new(Config::default(), "test-only".into());
+        let err = state
+            .http
+            .get("http://127.0.0.1:1/")
+            .send()
+            .await
+            .unwrap_err();
+        assert!(err.is_builder());
     }
 
     #[test]

@@ -60,6 +60,39 @@ pub const DEFAULT_ADDRESS: &str = "127.0.0.1";
 /// Default listen port.
 pub const DEFAULT_PORT: u16 = 8314;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(from = "String", rename_all = "lowercase")]
+pub enum AccountType {
+    #[default]
+    Individual,
+    Business,
+    Enterprise,
+}
+
+impl From<String> for AccountType {
+    fn from(value: String) -> Self {
+        match value.as_str() {
+            "individual" => Self::Individual,
+            "business" => Self::Business,
+            "enterprise" => Self::Enterprise,
+            _ => {
+                tracing::warn!("Unknown account_type; using the individual Copilot endpoint");
+                Self::Individual
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for AccountType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Individual => "individual",
+            Self::Business => "business",
+            Self::Enterprise => "enterprise",
+        })
+    }
+}
+
 /// Model name mapping table (exact + prefix).
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ModelMappings {
@@ -80,8 +113,8 @@ pub struct Config {
     pub port: u16,
     #[serde(default)]
     pub debug: bool,
-    #[serde(default = "default_account_type")]
-    pub account_type: String,
+    #[serde(default)]
+    pub account_type: AccountType,
     #[serde(default = "default_vscode_version")]
     pub vscode_version: String,
     #[serde(default = "default_api_version")]
@@ -174,9 +207,6 @@ fn default_port() -> u16 {
 fn default_true() -> bool {
     true
 }
-fn default_account_type() -> String {
-    "individual".to_string()
-}
 fn default_vscode_version() -> String {
     VSCODE_VERSION.to_string()
 }
@@ -210,7 +240,7 @@ impl Default for Config {
             address: default_address(),
             port: default_port(),
             debug: false,
-            account_type: default_account_type(),
+            account_type: AccountType::default(),
             vscode_version: default_vscode_version(),
             api_version: default_api_version(),
             copilot_version: default_copilot_version(),
@@ -235,11 +265,11 @@ impl Default for Config {
 
 impl Config {
     /// Upstream Copilot API base URL, derived from the configured account type.
-    pub fn copilot_base_url(&self) -> String {
-        if self.account_type == "individual" {
-            "https://api.githubcopilot.com".to_string()
-        } else {
-            format!("https://api.{}.githubcopilot.com", self.account_type)
+    pub fn copilot_base_url(&self) -> &'static str {
+        match self.account_type {
+            AccountType::Individual => "https://api.githubcopilot.com",
+            AccountType::Business => "https://api.business.githubcopilot.com",
+            AccountType::Enterprise => "https://api.enterprise.githubcopilot.com",
         }
     }
 
@@ -621,11 +651,8 @@ pub fn load_config_with_options(write_back_on_migration: bool) -> Config {
         tracing::info!("✓ Overriding debug from GHC_PROXY_DEBUG: {}", cfg.debug);
     }
     if let Ok(val) = std::env::var("GHC_PROXY_ACCOUNT_TYPE") {
-        tracing::info!(
-            "✓ Overriding account_type from GHC_PROXY_ACCOUNT_TYPE: {}",
-            val
-        );
-        cfg.account_type = val;
+        cfg.account_type = val.into();
+        tracing::info!("✓ Overriding account_type from GHC_PROXY_ACCOUNT_TYPE");
     }
     if let Ok(val) = std::env::var("GHC_PROXY_VSCODE_VERSION") {
         tracing::info!(
@@ -868,6 +895,22 @@ fn migrate_config(cfg: &mut Config) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn account_types_select_fixed_origins_without_discarding_other_settings() {
+        for (tier, origin) in [
+            ("individual", "https://api.githubcopilot.com"),
+            ("business", "https://api.business.githubcopilot.com"),
+            ("enterprise", "https://api.enterprise.githubcopilot.com"),
+            ("unknown", "https://api.githubcopilot.com"),
+        ] {
+            let cfg: Config =
+                serde_norway::from_str(&format!("account_type: {tier}\napi_key: test-only\n"))
+                    .unwrap();
+            assert_eq!(cfg.copilot_base_url(), origin);
+            assert_eq!(cfg.api_key.as_deref(), Some("test-only"));
+        }
+    }
 
     #[test]
     fn auto_upgrade_is_on_by_default_including_for_legacy_configs() {

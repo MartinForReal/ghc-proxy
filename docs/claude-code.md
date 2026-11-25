@@ -97,12 +97,11 @@ A `model` already in the file is treated as a deliberate choice and kept; the
 recommended default is only written when the config has none.
 
 The provider uses command-backed authentication through `ghc-proxy codex-auth-token`.
-Besides supplying the current local `api_key` (or a harmless
-placeholder when authentication is disabled), this tells Codex to refresh the
-provider's model catalog. No OpenAI account or exported environment variable is
-required. When an `api_key` is active during setup, its resolved value is also
-written as `x-api-key`; this keeps environment-only proxy launches working when
-ChatGPT Desktop does not inherit the server's shell environment.
+The helper returns a non-secret placeholder so Codex refreshes the provider's
+model catalog; it never prints the proxy API key. When authentication is
+enabled, setup writes the resolved key as the provider's `x-api-key` header.
+Re-run Codex setup after enabling or rotating the key, including when upgrading
+a configuration that relied on the command alone. Keep the Codex config private.
 
 Codex requests `GET /v1/models?client_version=...`; the proxy recognizes that
 query and returns Codex-native model metadata with `context_window` and

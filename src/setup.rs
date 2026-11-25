@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use dialoguer::theme::ColorfulTheme;
 use dialoguer::{Confirm, FuzzySelect, Input, Select};
-use ghc_proxy::config::{self, Config, ModelMappings};
+use ghc_proxy::config::{self, AccountType, Config, ModelMappings};
 use ghc_proxy::{auth, state::AppState};
 
 /// The result of a completed wizard run.
@@ -125,7 +125,7 @@ fn cancelled() -> Option<Outcome> {
 struct ServerSettings {
     address: String,
     port: u16,
-    account_type: String,
+    account_type: AccountType,
 }
 
 fn prompt_server_settings(defaults: &Config) -> dialoguer::Result<ServerSettings> {
@@ -142,7 +142,11 @@ fn prompt_server_settings(defaults: &Config) -> dialoguer::Result<ServerSettings
         .default(defaults.port)
         .interact_text()?;
 
-    let types = ["individual", "business", "enterprise"];
+    let types = [
+        AccountType::Individual,
+        AccountType::Business,
+        AccountType::Enterprise,
+    ];
     let current = types
         .iter()
         .position(|t| *t == defaults.account_type)
@@ -156,7 +160,7 @@ fn prompt_server_settings(defaults: &Config) -> dialoguer::Result<ServerSettings
     Ok(ServerSettings {
         address,
         port,
-        account_type: types[idx].to_string(),
+        account_type: types[idx],
     })
 }
 

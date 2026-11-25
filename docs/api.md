@@ -17,6 +17,9 @@ require a key on the LLM endpoints; see [Authentication](#authentication) below.
 
 ## Endpoints
 
+Inference HTTP requests accept JSON objects up to 32 MiB. Malformed or
+non-object JSON receives HTTP 400; oversized requests receive HTTP 413.
+
 | Method & path | Description |
 |---------------|-------------|
 | `POST /v1/chat/completions` | OpenAI chat completions (also `/chat/completions`) |

@@ -88,7 +88,8 @@ rewritten to follow them: see [Schema upgrades](#schema-upgrades).
 
 ### Account type
 
-Controls the upstream base URL only:
+Selects one of three fixed HTTPS origins. An unrecognized tier logs a warning
+and uses `individual`; it cannot supply a custom upstream host.
 
 | `account_type` | Upstream base URL |
 |----------------|-------------------|
