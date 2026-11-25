@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-11-25
+
+### Changed
+- The Gemini API now accepts both `/v1` and `/v1beta`, preserves JSON schemas
+  for structured responses and function parameters, and keeps multiple
+  candidates separate in JSON and streaming responses.
+- Added setup instructions for the optional Microsoft Copilot SDK 2.0.2 client.
+
+### Security
+- Restricted credentialed upstream HTTP calls to fixed Copilot HTTPS endpoints
+  and bounded inference request sizes and JSON complexity.
+- Updated `rustls` and `zip` to patched versions. The Codex catalog helper no
+  longer prints the proxy API key; rerun Codex setup after rotating the key.
+
 ## [1.5.4] - 2026-10-13
 
 ### Changed
