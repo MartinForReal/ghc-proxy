@@ -1,5 +1,9 @@
 # ghc-proxy
 
+![ghc-proxy dashboard showing token consumption, remaining quota, and request traffic](docs/assets/dashboard.png)
+
+*Dashboard overview with example traffic.*
+
 A **GitHub Copilot API proxy** written in Rust. It exposes standard **OpenAI**
 and **Anthropic** compatible HTTP endpoints so any tool (Claude Code, the Codex
 CLI, OpenAI/Anthropic SDKs, etc.) can talk to GitHub Copilot models.
@@ -281,6 +285,19 @@ cargo build      # compile
 cargo test       # run unit + integration tests
 cargo clippy     # lint
 ```
+
+To test the dashboard in Chromium, run the following from the repository root
+in a Python virtual environment. Playwright loads the shipped HTML and CSS
+with example API responses; no running proxy or GitHub token is needed.
+
+```bash
+python -m pip install -r tests/dashboard/requirements.txt
+python -m playwright install chromium
+python tests/dashboard/smoke.py
+```
+
+Add `--screenshot` to the last command to refresh the dashboard image above.
+GitHub Actions runs the same smoke test on pull requests and pushes to `main`.
 
 ## Project Layout
 
