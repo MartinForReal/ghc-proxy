@@ -1,0 +1,2 @@
+# Optional Python client for the Copilot SDK example in docs/api.md.
+microsoft-copilot-sdk==2.0.2

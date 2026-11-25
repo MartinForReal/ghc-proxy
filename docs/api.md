@@ -52,6 +52,9 @@ the value limit receive HTTP 400; exceeding the byte limit returns HTTP 413.
 | `GET /openapi.json` | OpenAPI v3 specification of the LLM endpoints |
 | `GET /v1/responses` (Upgrade) | Responses API over WebSocket |
 
+All three Gemini POST actions also accept `/v1/models/{model}:…`. A GET to
+`/v1/models/{model}` still returns OpenAI model metadata.
+
 ## Responses over WebSocket
 
 Several models advertise `ws:/responses` in `supported_endpoints` alongside
@@ -304,6 +307,34 @@ resp = client.chat.completions.create(
 print(resp.choices[0].message.content)
 ```
 
+## GitHub Copilot SDK v2
+
+For a Python client, install the [pinned optional dependency](../examples/copilot-sdk/requirements.txt)
+in a fresh virtual environment: `python -m pip install microsoft-copilot-sdk==2.0.2`.
+This replaces the deprecated `github-copilot-sdk` distribution; do not install
+both in the same environment. It is not a dependency of the Rust server.
+
+In your SDK v2 `create_session` call, keep your application's permission handler
+and pass these provider settings. Set `model` to an ID from the proxy's
+`GET /v1/models` that supports `/chat/completions`:
+
+```python
+github = {"capi": {"enabled": False}}
+inference = {
+    "default_provider": "local",
+    "providers": [{
+        "name": "local",
+        "type": "openai",
+        "wire_api": "completions",
+        "base_url": "http://127.0.0.1:8314/v1",
+        "api_key": "not-needed",  # Supply your local proxy key if configured.
+    }],
+}
+```
+
+This configures the SDK runtime's inference provider, not the runtime
+connection itself. See the [upstream BYOK guide](https://github.com/microsoft/copilot-sdk/blob/main/docs/auth/byok.md).
+
 ## Anthropic SDK
 
 ```python
@@ -325,7 +356,7 @@ them through chat completions transparently.
 ## Gemini
 
 ```bash
-curl "http://127.0.0.1:8314/v1beta/models/gemini-2.5-pro:generateContent" \
+curl "http://127.0.0.1:8314/v1/models/gemini-2.5-pro:generateContent" \
   -H "Content-Type: application/json" \
   -d '{"contents": [{"role": "user", "parts": [{"text": "Hello!"}]}]}'
 ```
@@ -333,7 +364,10 @@ curl "http://127.0.0.1:8314/v1beta/models/gemini-2.5-pro:generateContent" \
 The model is taken from the URL path and translated per your
 [mappings](configuration.md#model-mappings). Gemini requests are translated
 through chat completions, so any Copilot model works. Streaming uses the
-`:streamGenerateContent` action and emits `data:` SSE lines.
+`:streamGenerateContent` action and emits `data:` SSE lines. Multiple candidates
+retain their indexes in both JSON and SSE. `generationConfig.responseJsonSchema`
+with `responseMimeType: application/json` and function declarations'
+`parametersJsonSchema` are forwarded as JSON Schemas.
 
 ## Authentication
 

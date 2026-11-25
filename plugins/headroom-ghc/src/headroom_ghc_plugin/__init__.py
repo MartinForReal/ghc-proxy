@@ -34,7 +34,7 @@ from urllib.parse import parse_qs, urlparse
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-PLUGIN_VERSION = "1.5.4"
+PLUGIN_VERSION = "1.6.0"
 _NANO_AIU_PER_CREDIT = 1_000_000_000
 _CAPTURE_LIMIT = 8 * 1024 * 1024
 _PROJECT_PREFIX = re.compile(r"^/p/[^/]+(?P<path>/.*)$")

@@ -36,7 +36,10 @@ pub fn router(state: SharedState) -> Router {
         .route("/models", get(get_models))
         .route("/v1/models/full/", get(get_models_full))
         .route("/models/full/", get(get_models_full))
-        .route("/v1/models/{model_id}", get(get_model))
+        .route(
+            "/v1/models/{model_id}",
+            get(get_model).post(gemini_generate),
+        )
         .route("/models/{model_id}", get(get_model))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/chat/completions", post(chat_completions))
@@ -2407,10 +2410,31 @@ fn gemini_error(status: StatusCode, msg: String) -> Response {
 async fn gemini_generate(
     State(state): State<SharedState>,
     Path(model_action): Path<String>,
+    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
     body: Bytes,
 ) -> Response {
     let start = Instant::now();
+    if uri.path().starts_with("/v1/") && !model_action.contains(':') {
+        return (
+            StatusCode::METHOD_NOT_ALLOWED,
+            [(axum::http::header::ALLOW, "GET, HEAD")],
+        )
+            .into_response();
+    }
     let (raw_model, action) = split_model_action(&model_action);
+    if raw_model.is_empty()
+        || !matches!(
+            action.as_str(),
+            "generateContent"
+                | "generatecontent"
+                | "streamGenerateContent"
+                | "streamgeneratecontent"
+                | "countTokens"
+                | "counttokens"
+        )
+    {
+        return gemini_error(StatusCode::NOT_FOUND, "Unknown Gemini model action".into());
+    }
 
     let req = match parse_body(&body) {
         Ok(v) => v,
@@ -2609,7 +2633,7 @@ async fn stream_gemini(
             let mut billed: Option<u64> = None;
             let mut cache_saved: Option<i64> = None;
         let mut resp_size = 0usize;
-        let mut finish: Option<String> = None;
+        let mut candidates = gemini::StreamCandidates::default();
         let mut debug_raw: Vec<u8> = Vec::new();
         let mut interrupted: Option<String> = None;
         let mut idle = util::IdleTracker::new(std::time::Instant::now());
@@ -2632,18 +2656,10 @@ async fn stream_gemini(
                             cache_saved = util::cache_saving_nano_aiu(&v, &usage).or(cache_saved);
                         }
                     }
-                    if let Some(choice) = v.get("choices").and_then(|c| c.as_array()).and_then(|a| a.first()) {
-                        if let Some(text) = choice.get("delta").and_then(|d| d.get("content")).and_then(|c| c.as_str()) {
-                            if !text.is_empty() {
-                                let ev = gemini::gemini_stream_text_chunk(text, &model_json);
-                                let payload = format!("data: {}\n\n", serde_json::to_string(&ev).unwrap_or_default());
-                                resp_size += payload.len();
-                                yield Ok::<Bytes, std::convert::Infallible>(Bytes::from(payload));
-                            }
-                        }
-                        if let Some(fr) = choice.get("finish_reason").and_then(|f| f.as_str()) {
-                            finish = Some(fr.to_string());
-                        }
+                    if let Some(ev) = candidates.observe(&v, &model_json) {
+                        let payload = format!("data: {ev}\n\n");
+                        resp_size += payload.len();
+                        yield Ok::<Bytes, std::convert::Infallible>(Bytes::from(payload));
                     }
                 }
             }
@@ -2653,10 +2669,9 @@ async fn stream_gemini(
         // than treating a partial answer as a finished one.
         if let Some(ref reason) = interrupted {
             tracing::warn!("[/v1beta/models] upstream stream interrupted: {reason}");
-            finish = Some("OTHER".to_string());
         }
         let usage_json = json!({"prompt_tokens": usage.input_tokens, "completion_tokens": usage.output_tokens});
-        let ev = gemini::gemini_stream_final_chunk(finish.as_deref(), &usage_json, &model_json);
+        let ev = candidates.finish(interrupted.is_some(), &usage_json, &model_json);
         let payload = format!("data: {}\n\n", serde_json::to_string(&ev).unwrap_or_default());
         resp_size += payload.len();
         yield Ok(Bytes::from(payload));
@@ -3729,7 +3744,7 @@ async fn stylesheet() -> Response {
 /// LLM endpoints (OpenAI, Anthropic, and Gemini surfaces). Mirrors the
 /// discovery endpoint exposed by agent-maestro so the same tooling works here.
 async fn openapi_spec() -> Response {
-    let spec = json!({
+    let mut spec = json!({
         "openapi": "3.0.3",
         "info": {
             "title": "ghc-proxy",
@@ -3832,6 +3847,10 @@ async fn openapi_spec() -> Response {
             }
         }
     });
+    for action in ["generateContent", "streamGenerateContent", "countTokens"] {
+        let operation = spec["paths"][format!("/v1beta/models/{{model}}:{action}")].clone();
+        spec["paths"][format!("/v1/models/{{model}}:{action}")] = operation;
+    }
     Json(spec).into_response()
 }
 
@@ -4636,6 +4655,71 @@ mod tests {
             crate::config::Config::default(),
             "test-token".into(),
         ))
+    }
+
+    #[tokio::test]
+    async fn gemini_v1_and_v1beta_coexist_with_openai_model_lookup() {
+        use tower::ServiceExt;
+        let state = test_state();
+        {
+            let mut auth = state.tokens.lock().await;
+            auth.copilot_token = Some("fixture".into());
+            auth.expires_at = u64::MAX;
+        }
+        *state.models.write().await = Some(json!({"data":[{"id":"fixture","object":"model"}]}));
+        *state.models_loaded_at.lock().await = Some(Instant::now());
+        let app = router(state);
+        for path in [
+            "/v1/models/fixture:countTokens",
+            "/v1beta/models/fixture:countTokens",
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::post(path)
+                        .body(Body::from(r#"{"contents":[{"parts":[{"text":"hello"}]}]}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+            assert!(
+                serde_json::from_slice::<Value>(&body).unwrap()["totalTokens"]
+                    .as_u64()
+                    .unwrap()
+                    > 0
+            );
+        }
+        let lookup = app
+            .clone()
+            .oneshot(
+                Request::get("/v1/models/fixture")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(lookup.status(), StatusCode::OK);
+        let bare = app
+            .clone()
+            .oneshot(
+                Request::post("/v1/models/fixture")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bare.status(), StatusCode::METHOD_NOT_ALLOWED);
+        let invalid = app
+            .oneshot(
+                Request::post("/v1/models/fixture:unknown")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::NOT_FOUND);
     }
 
     #[test]
