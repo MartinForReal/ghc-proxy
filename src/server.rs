@@ -1,10 +1,12 @@
 //! HTTP server: route definitions and request handlers for the OpenAI- and
 //! Anthropic-compatible proxy endpoints, plus the analytics dashboard API.
 
+mod request_json;
+
 use crate::anthropic::{self, AnthropicStreamState};
 use crate::gemini;
 use crate::responses as codex;
-use crate::state::SharedState;
+use crate::state::{CopilotEndpoint, CopilotUrl, SharedState};
 use crate::store::RequestRecord;
 use crate::translate;
 use crate::util;
@@ -24,6 +26,8 @@ use axum::{
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
+
+const MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
 
 /// Builds the application router with all routes mounted.
 pub fn router(state: SharedState) -> Router {
@@ -64,7 +68,7 @@ pub fn router(state: SharedState) -> Router {
             state.clone(),
             auth_middleware,
         ))
-        .layer(DefaultBodyLimit::max(20 * 1024 * 1024 * 1024)) // 20 GB limit
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(state)
 }
 
@@ -257,12 +261,17 @@ fn capture_str(state: &SharedState, body: &str) -> Option<String> {
 
 #[allow(clippy::result_large_err)]
 fn parse_body(body: &Bytes) -> Result<Value, Response> {
-    serde_json::from_slice::<Value>(body).map_err(|e| {
-        (
+    if body.len() > MAX_REQUEST_BODY_BYTES {
+        return Err(error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Request exceeds 32 MiB".into(),
+        ));
+    }
+    request_json::parse_object(body).map_err(|_| {
+        error_response(
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": format!("Invalid JSON body: {e}")})),
+            "Expected a JSON object within the request complexity limit".into(),
         )
-            .into_response()
     })
 }
 
@@ -1249,7 +1258,7 @@ async fn responses(State(state): State<SharedState>, body: Bytes) -> Response {
     set_initiator(&mut headers, agent);
 
     let req_size = body.len();
-    let url = format!("{}/responses", state.copilot_base_url());
+    let url = state.copilot_url(CopilotEndpoint::Responses);
     let is_stream = req.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
     let payload = serde_json::to_vec(&req).unwrap_or_default();
     log_debug_request(&state, "/v1/responses", &req);
@@ -1910,7 +1919,7 @@ async fn messages_direct(
     .await;
     set_initiator(&mut headers, agent);
 
-    let url = format!("{}/v1/messages", state.copilot_base_url());
+    let url = state.copilot_url(CopilotEndpoint::Messages);
     let is_stream = req.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
 
     let mut current = req.clone();
@@ -1925,9 +1934,8 @@ async fn messages_direct(
         log_debug_request(&state, "/v1/messages", &sanitized);
 
         if is_stream {
-            let upstream = state
-                .http
-                .post(&url)
+            let upstream = url
+                .post(&state.http)
                 .headers(headers.clone())
                 .body(payload)
                 .send()
@@ -2155,7 +2163,7 @@ async fn messages_translated(
                 })
             })
             .unwrap_or(false);
-        let url = format!("{}/chat/completions", state.copilot_base_url());
+        let url = state.copilot_url(CopilotEndpoint::ChatCompletions);
         let mut headers = state.copilot_headers(vision).await;
         set_initiator(&mut headers, agent);
         let payload = serde_json::to_vec(&openai_req).unwrap_or_default();
@@ -2284,13 +2292,13 @@ async fn count_tokens(
     client_headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let mut req = match parse_body(&body) {
+        Ok(v) => v,
+        Err(response) => return response,
+    };
     if state.ensure_copilot_token().await.is_err() {
         return Json(json!({"input_tokens": 1})).into_response();
     }
-    let mut req = match parse_body(&body) {
-        Ok(v) => v,
-        Err(_) => return Json(json!({"input_tokens": 1})).into_response(),
-    };
     let original_model = req
         .get("model")
         .and_then(|m| m.as_str())
@@ -2329,7 +2337,7 @@ async fn count_tokens(
             translate::split_context_1m(&original_model).1,
         )
         .await;
-        let url = format!("{}/v1/messages/count_tokens", state.copilot_base_url());
+        let url = state.copilot_url(CopilotEndpoint::CountTokens);
         // Counting writes no cache entry, so the ttl is irrelevant here.
         let payload = serde_json::to_vec(&anthropic::sanitize_anthropic_request(&req, false))
             .unwrap_or_default();
@@ -2550,7 +2558,7 @@ fn collect_text_for_count(openai_req: &Value) -> String {
 #[allow(clippy::too_many_arguments)]
 async fn stream_gemini(
     state: SharedState,
-    url: &str,
+    url: &CopilotUrl,
     headers: HeaderMap,
     payload: Vec<u8>,
     original_model: String,
@@ -2561,9 +2569,8 @@ async fn stream_gemini(
     let req_body = state
         .is_debug()
         .then(|| String::from_utf8_lossy(&payload).into_owned());
-    let upstream = state
-        .http
-        .post(url)
+    let upstream = url
+        .post(&state.http)
         .headers(headers)
         .body(payload)
         .send()
@@ -2714,7 +2721,7 @@ async fn embeddings(State(state): State<SharedState>, body: Bytes) -> Response {
         .to_string();
     let req_size = body.len();
     let headers = state.copilot_headers(false).await;
-    let url = format!("{}/embeddings", state.copilot_base_url());
+    let url = state.copilot_url(CopilotEndpoint::Embeddings);
     let payload = serde_json::to_vec(&req).unwrap_or_default();
     log_debug_request(&state, "/v1/embeddings", &req);
 
@@ -2935,7 +2942,7 @@ fn anthropic_error(status: StatusCode, msg: String) -> Response {
 #[allow(clippy::too_many_arguments)]
 async fn stream_openai(
     state: SharedState,
-    url: &str,
+    url: &CopilotUrl,
     headers: HeaderMap,
     mut req: Value,
     endpoint: &'static str,
@@ -2948,9 +2955,8 @@ async fn stream_openai(
     let mut payload = serde_json::to_vec(&req).unwrap_or_default();
     let mut retried_param = false;
     let upstream = loop {
-        let upstream = state
-            .http
-            .post(url)
+        let upstream = url
+            .post(&state.http)
             .headers(headers.clone())
             .body(payload.clone())
             .send()
@@ -3123,7 +3129,7 @@ async fn stream_openai(
 #[allow(clippy::too_many_arguments)]
 async fn stream_responses(
     state: SharedState,
-    url: &str,
+    url: &CopilotUrl,
     headers: HeaderMap,
     payload: Vec<u8>,
     req: Value,
@@ -3133,9 +3139,8 @@ async fn stream_responses(
     start: Instant,
 ) -> Response {
     let req_body = capture_json(&state, &req);
-    let upstream = state
-        .http
-        .post(url)
+    let upstream = url
+        .post(&state.http)
         .headers(headers)
         .body(payload)
         .send()
@@ -3404,7 +3409,7 @@ async fn stream_anthropic_direct(
 #[allow(clippy::too_many_arguments)]
 async fn stream_anthropic_translated(
     state: SharedState,
-    url: &str,
+    url: &CopilotUrl,
     headers: HeaderMap,
     payload: Vec<u8>,
     original_model: String,
@@ -3416,9 +3421,8 @@ async fn stream_anthropic_translated(
     let req_body = state
         .is_debug()
         .then(|| String::from_utf8_lossy(&payload).into_owned());
-    let upstream = state
-        .http
-        .post(url)
+    let upstream = url
+        .post(&state.http)
         .headers(headers)
         .body(payload)
         .send()
@@ -4457,6 +4461,27 @@ async fn api_audit_summary(State(state): State<SharedState>) -> Response {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn inference_bodies_must_be_bounded_json_objects() {
+        assert_eq!(
+            parse_body(&Bytes::from_static(br#" {"extra":true} "#)).unwrap()["extra"],
+            true
+        );
+        for input in [b"[]".as_slice(), b"null", b"{", b"{} {}"] {
+            assert_eq!(
+                parse_body(&Bytes::from_static(input)).unwrap_err().status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
+        let mut body = vec![b' '; MAX_REQUEST_BODY_BYTES];
+        body[..2].copy_from_slice(b"{}");
+        body.push(b' ');
+        assert_eq!(
+            parse_body(&Bytes::from(body)).unwrap_err().status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+    }
+
     #[test]
     fn output_tokens_stay_provisional_until_message_delta() {
         let mut st = super::DirectStreamState::default();

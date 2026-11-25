@@ -71,6 +71,7 @@ def handshake(host: str, path: str, token: str, extra: dict[str, str]) -> tuple[
     raw = f"GET {path} HTTP/1.1\r\n" + "".join(f"{k}: {v}\r\n" for k, v in headers.items()) + "\r\n"
 
     ctx = ssl.create_default_context()
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     with socket.create_connection((host, 443), timeout=20) as sock:
         with ctx.wrap_socket(sock, server_hostname=host) as tls:
             tls.sendall(raw.encode())

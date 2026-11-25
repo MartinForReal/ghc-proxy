@@ -268,7 +268,7 @@ fn configure_claude_code(cfg: &ghc_proxy::config::Config) -> std::io::Result<std
 const CODEX_DEFAULT_MODEL: &str = "gpt-5.5";
 /// Internal provider id written into the Codex config for this proxy.
 const CODEX_PROVIDER_ID: &str = "ghc-proxy";
-/// Harmless bearer value used when the local proxy has authentication disabled.
+/// Non-secret bearer placeholder; configured proxy keys travel in `x-api-key`.
 const CODEX_AUTH_TOKEN_FALLBACK: &str = "ghc-proxy";
 
 /// Merges a `[model_providers.ghc-proxy]` block plus top-level `model` and
@@ -537,7 +537,6 @@ fn print_setup_guide(
     println!("  address:        {}", cfg.address);
     println!("  port:           {}", cfg.port);
     println!("  debug:          {}", cfg.debug);
-    println!("  account_type:   {}", cfg.account_type);
     println!(
         "  model mappings: {} exact, {} prefix",
         cfg.model_mappings.exact.len(),
@@ -721,14 +720,9 @@ async fn main() {
         return;
     }
     if cli.codex_auth_token {
-        let cfg = config::load_config();
-        println!(
-            "{}",
-            cfg.api_key
-                .as_deref()
-                .filter(|key| !key.is_empty())
-                .unwrap_or(CODEX_AUTH_TOKEN_FALLBACK)
-        );
+        // Codex uses command auth to refresh its catalog. The actual proxy
+        // credential is already supplied by the provider's x-api-key header.
+        println!("{CODEX_AUTH_TOKEN_FALLBACK}");
         return;
     }
     if cli.config {
@@ -804,7 +798,7 @@ async fn main() {
             cfg.debug = debug_mode;
         }
         if let Some(account_type) = cli.account_type.take() {
-            cfg.account_type = account_type;
+            cfg.account_type = account_type.into();
         }
 
         // In a terminal, walk the user through an interactive wizard; otherwise
@@ -886,8 +880,8 @@ async fn main() {
         cfg.debug = debug_mode;
     }
     if let Some(account_type) = cli.account_type {
-        tracing::info!("✓ Overriding account_type from CLI: {}", account_type);
-        cfg.account_type = account_type;
+        cfg.account_type = account_type.into();
+        tracing::info!("✓ Overriding account_type from CLI");
     }
     if cli.show_token {
         cfg.show_token = true;

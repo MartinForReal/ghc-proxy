@@ -1,7 +1,7 @@
 //! Miscellaneous helpers: orphaned tool-result detection/removal, SSE line
 //! buffering, and an HTTP request retry wrapper with exponential backoff.
 
-use crate::state::AppState;
+use crate::state::{AppState, CopilotUrl};
 use serde_json::Value;
 use std::time::Duration;
 
@@ -297,13 +297,12 @@ pub fn is_retryable_error(status: u16) -> bool {
 /// fallback would have given immediately.
 pub async fn post_once(
     state: &AppState,
-    url: &str,
+    url: &CopilotUrl,
     headers: reqwest::header::HeaderMap,
     body: Vec<u8>,
 ) -> Option<reqwest::Response> {
-    let resp = state
-        .http
-        .post(url)
+    let resp = url
+        .post(&state.http)
         .headers(headers)
         .body(body)
         .send()
@@ -315,7 +314,7 @@ pub async fn post_once(
 
 pub async fn post_with_retry(
     state: &AppState,
-    url: &str,
+    url: &CopilotUrl,
     headers: reqwest::header::HeaderMap,
     body: Vec<u8>,
     endpoint: &str,
@@ -323,9 +322,8 @@ pub async fn post_with_retry(
     let max = state.max_connection_retries();
     let mut attempt = 0u32;
     loop {
-        let result = state
-            .http
-            .post(url)
+        let result = url
+            .post(&state.http)
             .headers(headers.clone())
             .body(body.clone())
             .send()

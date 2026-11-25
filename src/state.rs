@@ -152,6 +152,51 @@ fn now_secs() -> u64 {
 /// under the ~60s idle cutoff typical of load balancers and NAT tables.
 const UPSTREAM_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
 
+/// Credentialed requests only target entries in this closed set. No request
+/// field, API key or config string is used to serialize any part of the URL.
+pub(crate) enum CopilotEndpoint {
+    Models,
+    ChatCompletions,
+    Responses,
+    Messages,
+    CountTokens,
+    Embeddings,
+}
+
+pub struct CopilotUrl(&'static str);
+
+impl CopilotUrl {
+    fn new(tier: config::AccountType, endpoint: CopilotEndpoint) -> Self {
+        macro_rules! urls {
+            ($path:literal) => {
+                [
+                    concat!("https://api.githubcopilot.com", $path),
+                    concat!("https://api.business.githubcopilot.com", $path),
+                    concat!("https://api.enterprise.githubcopilot.com", $path),
+                ]
+            };
+        }
+        let urls = match endpoint {
+            CopilotEndpoint::Models => urls!("/models"),
+            CopilotEndpoint::ChatCompletions => urls!("/chat/completions"),
+            CopilotEndpoint::Responses => urls!("/responses"),
+            CopilotEndpoint::Messages => urls!("/v1/messages"),
+            CopilotEndpoint::CountTokens => urls!("/v1/messages/count_tokens"),
+            CopilotEndpoint::Embeddings => urls!("/embeddings"),
+        };
+        let index = match tier {
+            config::AccountType::Individual => 0,
+            config::AccountType::Business => 1,
+            config::AccountType::Enterprise => 2,
+        };
+        Self(urls[index])
+    }
+
+    pub(crate) fn post(&self, client: &reqwest::Client) -> reqwest::RequestBuilder {
+        client.post(self.0)
+    }
+}
+
 /// How long to serve local token estimates after the upstream counting endpoint
 /// reports a rate limit.
 const COUNTING_COOLDOWN: Duration = Duration::from_secs(60);
@@ -162,6 +207,14 @@ fn now_millis() -> u128 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0)
+}
+
+fn with_read_timeout(builder: reqwest::ClientBuilder, seconds: u64) -> reqwest::ClientBuilder {
+    if seconds == 0 {
+        builder
+    } else {
+        builder.read_timeout(Duration::from_secs(seconds))
+    }
 }
 
 impl AppState {
@@ -179,18 +232,19 @@ impl AppState {
         // that window, and an idle connection is what load balancers, NATs and
         // corporate middleboxes reap -- which surfaces as a truncated body
         // partway through the answer.
-        let mut builder = reqwest::Client::builder()
+        let builder = reqwest::Client::builder()
+            .https_only(true)
+            // A credentialed request must not be replayed at a redirected origin.
+            .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(30))
             .pool_idle_timeout(Duration::from_secs(90))
             .tcp_keepalive(UPSTREAM_KEEPALIVE_INTERVAL)
             .http2_keep_alive_interval(UPSTREAM_KEEPALIVE_INTERVAL)
             .http2_keep_alive_timeout(Duration::from_secs(20))
             .http2_keep_alive_while_idle(true);
-        if config.upstream_read_timeout_seconds > 0 {
-            builder =
-                builder.read_timeout(Duration::from_secs(config.upstream_read_timeout_seconds));
-        }
-        let http = builder.build().expect("failed to build HTTP client");
+        let http = with_read_timeout(builder, config.upstream_read_timeout_seconds)
+            .build()
+            .expect("failed to build HTTP client");
         AppState {
             http,
             config: StdRwLock::new(config),
@@ -336,8 +390,12 @@ impl AppState {
             .cloned()
     }
 
-    pub fn copilot_base_url(&self) -> String {
+    pub fn copilot_base_url(&self) -> &'static str {
         self.config.read().unwrap().copilot_base_url()
+    }
+
+    pub(crate) fn copilot_url(&self, endpoint: CopilotEndpoint) -> CopilotUrl {
+        CopilotUrl::new(self.config.read().unwrap().account_type, endpoint)
     }
 
     pub fn config_path(&self) -> String {
@@ -440,8 +498,8 @@ impl AppState {
     }
 
     /// Resolves the Copilot chat-completions URL and headers.
-    pub async fn chat_upstream(&self, vision: bool) -> (String, HeaderMap) {
-        let url = format!("{}/chat/completions", self.copilot_base_url());
+    pub async fn chat_upstream(&self, vision: bool) -> (CopilotUrl, HeaderMap) {
+        let url = self.copilot_url(CopilotEndpoint::ChatCompletions);
         (url, self.copilot_headers(vision).await)
     }
 
@@ -452,14 +510,12 @@ impl AppState {
     /// and `endpoints.api` is the only host involved. Discovered by probing;
     /// GitHub publishes no documentation for the inference API.
     pub async fn ws_responses_upstream(&self) -> (String, HeaderMap) {
-        let base = self.copilot_base_url();
-        let ws = match base.split_once("://") {
-            Some(("https", rest)) => format!("wss://{rest}"),
-            Some(("http", rest)) => format!("ws://{rest}"),
-            _ => base.clone(),
-        };
+        let host = self
+            .copilot_base_url()
+            .strip_prefix("https://")
+            .expect("Copilot endpoints are fixed HTTPS origins");
         (
-            format!("{}/responses", ws.trim_end_matches('/')),
+            format!("wss://{host}/responses"),
             self.copilot_headers(false).await,
         )
     }
@@ -499,11 +555,11 @@ impl AppState {
     /// Fetches the list of available models from upstream and caches it.
     pub async fn load_models(&self) -> Result<(), String> {
         self.ensure_copilot_token().await?;
-        let url = format!("{}/models", self.copilot_base_url());
+        let url = self.copilot_url(CopilotEndpoint::Models);
         let headers = self.copilot_headers(false).await;
         let resp = self
             .http
-            .get(&url)
+            .get(url.0)
             .headers(headers)
             .send()
             .await
@@ -974,13 +1030,10 @@ mod tests {
     #[tokio::test]
     async fn read_timeout_surfaces_a_stalled_upstream_as_an_error() {
         let url = stalling_upstream().await;
-        let cfg = Config {
-            upstream_read_timeout_seconds: 1,
-            ..Default::default()
-        };
-        let state = AppState::new(cfg, "token".into());
-
-        let resp = state.http.get(&url).send().await.expect("headers arrive");
+        let client = with_read_timeout(reqwest::Client::builder(), 1)
+            .build()
+            .unwrap();
+        let resp = client.get(&url).send().await.expect("headers arrive");
         assert!(resp.status().is_success());
 
         let mut stream = resp.bytes_stream();
@@ -1001,16 +1054,58 @@ mod tests {
     #[tokio::test]
     async fn read_timeout_can_be_disabled() {
         let url = stalling_upstream().await;
-        let cfg = Config {
-            upstream_read_timeout_seconds: 0,
-            ..Default::default()
-        };
-        let state = AppState::new(cfg, "token".into());
-        let resp = state.http.get(&url).send().await.expect("headers arrive");
+        let client = with_read_timeout(reqwest::Client::builder(), 0)
+            .build()
+            .unwrap();
+        let resp = client.get(&url).send().await.expect("headers arrive");
         let mut stream = resp.bytes_stream();
         let _ = stream.next().await;
         let outcome = tokio::time::timeout(Duration::from_secs(3), stream.next()).await;
         assert!(outcome.is_err(), "expected the stream to still be hanging");
+    }
+
+    #[tokio::test]
+    async fn upstream_transport_rejects_plain_http_before_connecting() {
+        let state = AppState::new(Config::default(), "test-only".into());
+        let err = state
+            .http
+            .get("http://127.0.0.1:1/")
+            .send()
+            .await
+            .unwrap_err();
+        assert!(err.is_builder());
+    }
+
+    #[test]
+    fn credentialed_requests_only_use_the_public_origin_and_route() {
+        use config::AccountType::{Business, Enterprise, Individual};
+        for tier in [Individual, Business, Enterprise] {
+            let cfg = Config {
+                account_type: tier,
+                api_key: Some("local-test-key".into()),
+                ..Config::default()
+            };
+            let state = AppState::new(cfg, "github-test-key".into());
+            for (endpoint, path) in [
+                (CopilotEndpoint::Models, "/models"),
+                (CopilotEndpoint::ChatCompletions, "/chat/completions"),
+                (CopilotEndpoint::Responses, "/responses"),
+                (CopilotEndpoint::Messages, "/v1/messages"),
+                (CopilotEndpoint::CountTokens, "/v1/messages/count_tokens"),
+                (CopilotEndpoint::Embeddings, "/embeddings"),
+            ] {
+                let request = state
+                    .copilot_url(endpoint)
+                    .post(&state.http)
+                    .bearer_auth("copilot-test-key")
+                    .build()
+                    .unwrap();
+                assert_eq!(
+                    request.url().as_str(),
+                    format!("{}{path}", state.copilot_base_url())
+                );
+            }
+        }
     }
 
     #[test]
